@@ -1036,19 +1036,19 @@ class Panel(ttk.Frame):
         super().__init__(master)
         self.hub = hub
 
-    def make_log(self, parent: tk.Misc, *, height: int = 10, wrap: str = "word"):
+    def make_log(self, parent: tk.Misc, *, height: int = 10, wrap: str = "word",
+                 label: str = "Лог"):
         frame = ttk.Frame(parent)
         head = ttk.Frame(frame)
         head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, px(4)))
-        ttk.Label(head, text="Лог — выдели мышью и Ctrl+C", style="Muted.TLabel").pack(
-            side="left"
-        )
+        ttk.Label(head, text="Лог — выдели мышью, Ctrl+C или «Копировать всё»",
+                  style="Muted.TLabel").pack(side="left")
         text = dark_text(frame, height=height, wrap=wrap)
         text.tag_configure("error", foreground="#ff6b6b")
         text.tag_configure("ok", foreground=OK)
-        copy_btn = flat_button(head, "Копировать", lambda: None, kind="ghost")
+        copy_btn = flat_button(head, "Копировать всё", lambda: None, kind="ghost")
         copy_btn.pack(side="right")
-        copy_btn.configure(command=lambda: self.copy_log(text, copy_btn))
+        copy_btn.configure(command=lambda: self.copy_log(text, copy_btn, label=label))
         flat_button(head, "Очистить", lambda: text.delete("1.0", "end"),
                     kind="ghost").pack(side="right", padx=(0, px(6)))
         scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
@@ -1057,11 +1057,12 @@ class Panel(ttk.Frame):
         scroll.grid(row=1, column=1, sticky="ns")
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
-        self._make_copyable(text)
+        self.attach_copy(text, label=label, readonly=True)
         return frame, text
 
-    def _make_copyable(self, text: tk.Text) -> None:
-        """Лог только для чтения, но текст можно выделять и копировать."""
+    def attach_copy(self, text: tk.Text, *, label: str = "текст",
+                    readonly: bool = False, clear: bool = True) -> None:
+        """Делает любой текстовый блок копируемым: Ctrl+C, Ctrl+A, правый клик."""
 
         def block_keys(event):
             if event.state & 0x4 and event.keysym.lower() in ("c", "a", "insert"):
@@ -1077,45 +1078,53 @@ class Panel(ttk.Frame):
                 chunk = text.get("sel.first", "sel.last")
             except tk.TclError:
                 chunk = text.get("1.0", "end-1c")
-            self.copy_text(chunk)
+            self.copy_text(chunk, label=label)
             return "break"
 
         def select_all(_event=None):
             text.tag_add("sel", "1.0", "end-1c")
             return "break"
 
-        text.bind("<Key>", block_keys)
+        if readonly:
+            text.bind("<Key>", block_keys)
         text.bind("<Control-c>", copy_selection)
         text.bind("<Control-C>", copy_selection)
         text.bind("<Control-a>", select_all)
+        text.bind("<Control-A>", select_all)
 
         menu = tk.Menu(text, tearoff=0)
-        menu.add_command(label="Копировать", command=copy_selection)
-        menu.add_command(label="Копировать всё",
-                         command=lambda: self.copy_text(text.get("1.0", "end-1c")))
-        menu.add_separator()
-        menu.add_command(label="Очистить", command=lambda: text.delete("1.0", "end"))
+        menu.add_command(label="Копировать выделенное", command=copy_selection)
+        menu.add_command(
+            label="Копировать всё",
+            command=lambda: self.copy_text(text.get("1.0", "end-1c"), label=label),
+        )
+        if clear:
+            menu.add_separator()
+            menu.add_command(label="Очистить", command=lambda: text.delete("1.0", "end"))
         text.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
 
-    def copy_log(self, text: tk.Text, button: tk.Button) -> None:
+    def copy_log(self, text: tk.Text, button: tk.Button, *, label: str = "Лог") -> None:
         try:
             chunk = text.get("sel.first", "sel.last")
         except tk.TclError:
             chunk = text.get("1.0", "end-1c")
-        self.copy_text(chunk)
-        button.configure(text="✅ Скопировано!")
-        self.after(1600, lambda: button.configure(text="Копировать"))
+        self.copy_text(chunk, label=label)
+        original = button.cget("text")
+        button.configure(text="✅ Скопировано")
+        self.after(1800, lambda: button.configure(text=original))
 
-    def copy_text(self, chunk: str) -> None:
+    def copy_text(self, chunk: str, *, label: str = "лог") -> None:
         """Кладёт текст в буфер обмена и явно показывает результат."""
         if not chunk.strip():
-            self.hub.set_status("Копировать нечего — лог пуст")
+            self.hub.set_status("Копировать нечего — пусто")
+            self.hub.toast("Копировать нечего — блок пуст", kind="warn")
             return
         self.clipboard_clear()
         self.clipboard_append(chunk)
         self.update()          # без update() Windows не фиксирует буфер сразу
         lines = chunk.count("\n") + (0 if chunk.endswith("\n") else 1)
         self.hub.set_status(f"📋 скопировано: {lines} строк, {len(chunk)} символов")
+        self.hub.toast(f"📋 {label}: скопировано {lines} стр., {len(chunk)} симв.")
 
     @staticmethod
     def append_log(text: tk.Text, line: str, tag: str | None = None) -> None:
@@ -1750,20 +1759,28 @@ class CleanPanel(Panel):
 
         wrap = ttk.Frame(self)
         wrap.pack(fill="both", expand=True)
+        bar = ttk.Frame(wrap)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, px(4)))
+        ttk.Label(bar, text="Список — выдели мышью, Ctrl+C или «Копировать всё»",
+                  style="Muted.TLabel").pack(side="left")
+        copy_btn = flat_button(bar, "Копировать всё", lambda: None, kind="ghost")
+        copy_btn.pack(side="right")
+        copy_btn.configure(command=lambda: self.copy_log(self.list, copy_btn, label="Список"))
         self.list = dark_text(wrap, height=14, wrap="none")
         scroll_y = ttk.Scrollbar(wrap, orient="vertical", command=self.list.yview)
         scroll_x = ttk.Scrollbar(wrap, orient="horizontal", command=self.list.xview)
         self.list.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
-        self.list.grid(row=0, column=0, sticky="nsew")
-        scroll_y.grid(row=0, column=1, sticky="ns")
-        scroll_x.grid(row=1, column=0, sticky="ew")
-        wrap.rowconfigure(0, weight=1)
+        self.list.grid(row=1, column=0, sticky="nsew")
+        scroll_y.grid(row=1, column=1, sticky="ns")
+        scroll_x.grid(row=2, column=0, sticky="ew")
+        wrap.rowconfigure(1, weight=1)
         wrap.columnconfigure(0, weight=1)
         self.list.tag_configure("file", foreground="#9aa4b2")
         self.list.tag_configure("dir", foreground="#7aa2ff")
         self.list.tag_configure("error", foreground="#ff6b6b")
         self.list.tag_configure("head", foreground=FG, font=("Consolas", 9, "bold"))
         self.list.tag_configure("hint", foreground=MUTED)
+        self.attach_copy(self.list, label="Список", readonly=True)
         self._write("Список пуст. Выберите папку и нажмите «Проверить».\n", "hint")
 
     # -- помощники --------------------------------------------------------- #
@@ -2326,7 +2343,7 @@ class CleanupPanel(Panel):
 # --------------------------------------------------------------------------- #
 #  GitHub: движок (gh + git) и Bypass: HTTP-клиент
 # --------------------------------------------------------------------------- #
-GITHUB_DEFAULT_ROOT = r"C:\Users\admin\WorkBuddy AI"
+GITHUB_DEFAULT_ROOT = str(Path.home())
 BYPASS_DEFAULT_ROOT = r"C:\Users\admin\WorkBuddy AI\2026-10-17-10-12-49\bypass-manager"
 BYPASS_URL = "http://127.0.0.1:8790"
 
@@ -2583,24 +2600,67 @@ def git_remote_url(folder: str) -> str:
     return out if rc == 0 else ""
 
 
-def scan_local_repos(root: str, max_depth: int = 4) -> dict[str, str]:
-    """repo_name (в нижнем регистре) -> локальная папка."""
-    found: dict[str, str] = {}
-    start = Path(root)
-    if not start.is_dir():
-        return found
-    skip = {".git", "node_modules", "__pycache__", ".venv", "venv", ".workbuddy-ai"}
-    stack: list[tuple[Path, int]] = [(start, 0)]
+LOCAL_SCAN_SKIP = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", ".workbuddy-ai",
+    "AppData", "Windows", "Program Files", "Program Files (x86)", "$Recycle.Bin",
+    "System Volume Information", "site-packages", "dist-info", ".cache",
+}
+
+
+def local_scan_roots(primary: str = "") -> list[str]:
+    """Где искать локальные репозитории: выбранная папка + обычные места Windows."""
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    def add(path) -> None:
+        if not path:
+            return
+        try:
+            folder = Path(path)
+            if not folder.is_dir():
+                return
+            text = os.path.normpath(str(folder))
+        except (OSError, ValueError):
+            return
+        key = text.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(text)
+
+    home = Path.home()
+    add(primary)
+    add(APP_DIR.parent)
+    add(home / "Documents")
+    add(home / "Desktop")
+    add(home / "Downloads")
+    add(home)
+    return roots
+
+
+def scan_local_repos(roots, max_depth: int = 4) -> list[dict]:
+    """Список локальных git-папок: path, name, remote (имя репозитория из origin)."""
+    if isinstance(roots, str):
+        roots = [roots]
+    found: list[dict] = []
+    seen: set[str] = set()
+    stack: list[tuple[Path, int]] = [(Path(root), 0) for root in roots]
     while stack:
         folder, depth = stack.pop()
+        key = os.path.normcase(str(folder))
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             has_git = (folder / ".git").exists()
         except OSError:
             has_git = False
         if has_git:
-            name = repo_name_from_url(git_remote_url(str(folder)))
-            if name:
-                found.setdefault(name.lower(), str(folder))
+            found.append({
+                "path": str(folder),
+                "name": folder.name,
+                "remote": repo_name_from_url(git_remote_url(str(folder))),
+            })
         if depth >= max_depth:
             continue
         try:
@@ -2609,8 +2669,11 @@ def scan_local_repos(root: str, max_depth: int = 4) -> dict[str, str]:
             continue
         for entry in entries:
             try:
-                if entry.is_dir(follow_symlinks=False) and entry.name not in skip:
-                    stack.append((Path(entry.path), depth + 1))
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if entry.name in LOCAL_SCAN_SKIP or entry.name.startswith("."):
+                    continue
+                stack.append((Path(entry.path), depth + 1))
             except OSError:
                 continue
     return found
@@ -2635,6 +2698,48 @@ def sanitize_repo_name(name: str) -> str:
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
     return cleaned.strip("-._") or "repo"
+
+
+def match_key(text: str) -> str:
+    """Ключ сравнения имён: «тулы» и «tuly» дают одно и то же."""
+    text = "".join(_TRANSLIT.get(ch.lower(), ch) for ch in (text or ""))
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def match_local_repos(repos: list[dict], local_items: list[dict]) -> tuple[dict[str, str], list[dict]]:
+    """Сопоставляет репозитории GitHub с папками на ПК.
+
+    Сначала по origin-ссылке (надёжно), затем по имени папки с учётом
+    транслитерации: репозиторий tuly ↔ папка «тулы».
+    """
+    matches: dict[str, str] = {}
+    used: set[str] = set()
+    for repo in repos:
+        key = match_key(repo.get("name", ""))
+        if not key:
+            continue
+        for item in local_items:
+            if item["path"] in used:
+                continue
+            if item.get("remote") and match_key(item["remote"]) == key:
+                matches[repo["full"]] = item["path"]
+                used.add(item["path"])
+                break
+    for repo in repos:
+        if repo["full"] in matches:
+            continue
+        key = match_key(repo.get("name", ""))
+        if not key:
+            continue
+        for item in local_items:
+            if item["path"] in used:
+                continue
+            if match_key(item["name"]) == key:
+                matches[repo["full"]] = item["path"]
+                used.add(item["path"])
+                break
+    rest = [item for item in local_items if item["path"] not in used]
+    return matches, rest
 
 
 def ensure_gitignore(folder: str, log) -> None:
@@ -2867,7 +2972,11 @@ class GitHubPanel(Panel):
         config = config_read().get("github") or {}
         self.root = str(config.get("root") or GITHUB_DEFAULT_ROOT)
         self.repos: list[dict] = []
-        self.local: dict[str, str] = {}
+        self.local_items: list[dict] = []
+        self.matches: dict[str, str] = {}
+        self.local_only: list[dict] = []
+        self.rows: dict[str, dict] = {}
+        self.scan_roots: list[str] = []
         self.login = ""
         self.busy = False
         self.checking = False
@@ -2892,12 +3001,17 @@ class GitHubPanel(Panel):
 
         path_row = ttk.Frame(self)
         path_row.pack(fill="x", pady=(px(10), 0))
-        ttk.Label(path_row, text="Поиск локальных папок:", style="Muted.TLabel").pack(side="left")
+        ttk.Label(path_row, text="Искать локальные папки в:", style="Muted.TLabel").pack(side="left")
         self.root_var = tk.StringVar(value=self.root)
         ttk.Label(path_row, textvariable=self.root_var, style="Muted.TLabel").pack(
             side="left", padx=(px(8), px(8))
         )
         flat_button(path_row, "Изменить…", self.choose_root, kind="ghost").pack(side="left")
+        ttk.Label(
+            self,
+            text="Плюс всегда проверяются Документы, Рабочий стол, Загрузки и домашняя папка.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(px(4), 0))
 
         search_row = ttk.Frame(self)
         search_row.pack(fill="x", pady=(px(10), px(6)))
@@ -2905,20 +3019,28 @@ class GitHubPanel(Panel):
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_args: self._render())
         ttk.Entry(search_row, textvariable=self.search_var).pack(
-            side="left", fill="x", expand=True, padx=(px(8), 0)
+            side="left", fill="x", expand=True, padx=(px(8), px(10))
         )
+        self.only_diff_var = tk.BooleanVar(value=False)
+        dark_check(search_row, "только расхождения", self.only_diff_var,
+                   bg=BG, command=self._render).pack(side="left")
 
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill="both", expand=True)
-        columns = ("name", "access", "local")
+        columns = ("name", "access", "state", "local")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=10,
                                  selectmode="browse")
         self.tree.heading("name", text="Репозиторий")
         self.tree.heading("access", text="Доступ")
-        self.tree.heading("local", text="Локальная папка")
-        self.tree.column("name", width=px(240), anchor="w")
-        self.tree.column("access", width=px(110), anchor="center", stretch=False)
-        self.tree.column("local", width=px(430), anchor="w")
+        self.tree.heading("state", text="Где есть")
+        self.tree.heading("local", text="Папка на ПК")
+        self.tree.column("name", width=px(190), anchor="w")
+        self.tree.column("access", width=px(90), anchor="center", stretch=False)
+        self.tree.column("state", width=px(150), anchor="w", stretch=False)
+        self.tree.column("local", width=px(420), anchor="w", stretch=False)
+        self.tree.tag_configure("both", foreground=FG)
+        self.tree.tag_configure("gh_only", foreground=WARN)
+        self.tree.tag_configure("local_only", foreground=ACCENT)
         scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -2932,19 +3054,25 @@ class GitHubPanel(Panel):
         self.btn_open.pack(side="left")
         self.btn_download = flat_button(actions, "Скачать", self.download, kind="ghost")
         self.btn_download.pack(side="left", padx=(px(8), 0))
+        self.btn_push_sel = flat_button(actions, "Залить эту папку", self.push_selected,
+                                        kind="ghost")
+        self.btn_push_sel.pack(side="left", padx=(px(8), 0))
         self.btn_web = flat_button(actions, "Открыть на GitHub", self.open_web, kind="ghost")
         self.btn_web.pack(side="left", padx=(px(8), 0))
         self.btn_delete = flat_button(actions, "Удалить с GitHub", self.delete_repo, kind="danger")
         self.btn_delete.pack(side="left", padx=(px(8), 0))
+        self.btn_copy = flat_button(actions, "Скопировать список", self.copy_list, kind="ghost")
+        self.btn_copy.pack(side="right")
 
         self.summary_var = tk.StringVar(value="Загружаю список…")
         ttk.Label(self, textvariable=self.summary_var, style="Muted.TLabel").pack(
             anchor="w", pady=(px(10), px(6))
         )
 
-        log_frame, self.log_box = self.make_log(self, height=7)
+        log_frame, self.log_box = self.make_log(self, height=7, label="Лог GitHub")
         log_frame.pack(fill="both", expand=True)
         self.append_log(self.log_box, "Git и GitHub CLI находятся автоматически.")
+
 
     # -- инфраструктура ---------------------------------------------------- #
     def _log_bg(self, text: str) -> None:
@@ -2974,66 +3102,110 @@ class GitHubPanel(Panel):
             ):
                 self.login_browser(confirm=False)
 
-    def _selected_repo(self) -> dict | None:
+    def _selected_row(self) -> dict | None:
         selection = self.tree.selection()
         if not selection:
             return None
-        full = selection[0]
-        for repo in self.repos:
-            if repo["full"] == full:
-                return repo
-        return None
+        return self.rows.get(selection[0])
 
-    def _local_for(self, repo: dict | None) -> str:
-        if not repo:
-            return ""
-        return self.local.get(repo["name"].lower(), "")
+    def _selected_repo(self) -> dict | None:
+        row = self._selected_row()
+        return row["repo"] if row else None
+
+    def _local_for(self, row: dict | None) -> str:
+        return row["local"] if row else ""
+
+    def _display_path(self, local: str) -> str:
+        if not local:
+            return "—"
+        try:
+            return "~\\" + str(Path(local).relative_to(Path.home()))
+        except (ValueError, OSError):
+            return local
 
     def _update_actions(self) -> None:
-        selected = self._selected_repo()
-        local = self._local_for(selected)
+        row = self._selected_row()
+        repo = row["repo"] if row else None
+        local = self._local_for(row)
         state = "disabled" if self.busy else "normal"
         self.btn_refresh.configure(state=state)
         self.btn_push.configure(state=state)
         self.btn_login.configure(state=state)
         self.btn_all.configure(state=state if self.repos else "disabled")
-        self.btn_open.configure(state="normal" if selected and local and not self.busy else "disabled")
+        self.btn_copy.configure(state="normal" if self.rows and not self.busy else "disabled")
+        self.btn_open.configure(state="normal" if local and not self.busy else "disabled")
+        self.btn_push_sel.configure(state="normal" if local and not self.busy else "disabled")
         self.btn_download.configure(
-            state="normal" if selected and not local and not self.busy else "disabled"
+            state="normal" if repo and not local and not self.busy else "disabled"
         )
-        self.btn_web.configure(state="normal" if selected and not self.busy else "disabled")
-        self.btn_delete.configure(state="normal" if selected and not self.busy else "disabled")
+        self.btn_web.configure(state="normal" if repo and not self.busy else "disabled")
+        self.btn_delete.configure(state="normal" if repo and not self.busy else "disabled")
 
     def _render(self) -> None:
         query = self.search_var.get().strip().lower()
-        selected = self._selected_repo()
-        selected_full = selected["full"] if selected else ""
+        only_diff = bool(self.only_diff_var.get())
+        previous = self.tree.selection()
+        previous_iid = previous[0] if previous else ""
         self.tree.delete(*self.tree.get_children())
+        self.rows = {}
+
+        matched = sum(1 for repo in self.repos if repo["full"] in self.matches)
+        gh_only = len(self.repos) - matched
         shown = 0
+
         for repo in self.repos:
-            haystack = f"{repo['name']} {repo['full']}".lower()
+            local = self.matches.get(repo["full"], "")
+            haystack = f"{repo['name']} {repo['full']} {local}".lower()
             if query and query not in haystack:
                 continue
-            local = self.local.get(repo["name"].lower(), "")
-            display = "—"
-            if local:
-                try:
-                    display = str(Path(local).relative_to(self.root))
-                except (ValueError, OSError):
-                    display = local
+            if only_diff and local:
+                continue
+            iid = repo["full"]
+            tag = "both" if local else "gh_only"
             self.tree.insert(
-                "", "end", iid=repo["full"],
-                values=(repo["name"], "приватный" if repo["private"] else "публичный", display),
+                "", "end", iid=iid, tags=(tag,),
+                values=(
+                    repo["name"],
+                    "приватный" if repo["private"] else "публичный",
+                    "● на ПК" if local else "○ только на GitHub",
+                    self._display_path(local),
+                ),
             )
+            self.rows[iid] = {"iid": iid, "repo": repo, "local": local}
             shown += 1
-        if selected_full and self.tree.exists(selected_full):
-            self.tree.selection_set(selected_full)
-        found = sum(1 for repo in self.repos if repo["name"].lower() in self.local)
-        self.summary_var.set(
-            f"Репозиториев: {len(self.repos)} · найдено на ПК: {found}"
-            + (f" · показано: {shown}" if query else "")
+
+        for item in self.local_only:
+            haystack = f"{item['name']} {item['path']}".lower()
+            if query and query not in haystack:
+                continue
+            iid = "local::" + item["path"]
+            self.tree.insert(
+                "", "end", iid=iid, tags=("local_only",),
+                values=(item["name"], "—", "◆ только на ПК", self._display_path(item["path"])),
+            )
+            self.rows[iid] = {"iid": iid, "repo": None, "local": item["path"]}
+            shown += 1
+
+        if previous_iid and self.tree.exists(previous_iid):
+            self.tree.selection_set(previous_iid)
+        summary = (
+            f"На GitHub: {len(self.repos)} · есть на ПК: {matched} · "
+            f"только на GitHub: {gh_only} · папок без GitHub: {len(self.local_only)}"
         )
+        if query or only_diff:
+            summary += f" · показано: {shown}"
+        self.summary_var.set(summary)
         self._update_actions()
+
+    def copy_list(self) -> None:
+        """Копирует таблицу текстом: репозиторий, где есть, путь на ПК."""
+        lines = ["Репозиторий\tДоступ\tГде есть\tПапка на ПК"]
+        for iid in self.tree.get_children():
+            row = self.rows.get(iid) or {}
+            repo = row.get("repo")
+            values = self.tree.item(iid, "values")
+            lines.append("\t".join(str(value) for value in values))
+        self.copy_text("\n".join(lines), label="Список GitHub")
 
     # -- вход через браузер ------------------------------------------------ #
     def login_browser(self, confirm: bool = True) -> None:
@@ -3248,7 +3420,8 @@ class GitHubPanel(Panel):
             self.hub.set_status("GitHub: gh не найден")
             return
         self._start_busy("GitHub: загружаю список…")
-        root = self.root
+        roots = local_scan_roots(self.root)
+        self.scan_roots = roots
 
         def work():
             if not gh_authed():
@@ -3258,7 +3431,7 @@ class GitHubPanel(Panel):
             return {
                 "login": gh_login(),
                 "repos": github_repos(),
-                "local": scan_local_repos(root),
+                "local": scan_local_repos(roots),
             }
 
         self.hub.run_bg(work, self._refresh_done, self._fail)
@@ -3266,12 +3439,35 @@ class GitHubPanel(Panel):
     def _refresh_done(self, data: dict) -> None:
         self.login = data.get("login") or ""
         self.repos = data.get("repos") or []
-        self.local = data.get("local") or {}
+        self.local_items = data.get("local") or []
+        self.matches, self.local_only = match_local_repos(self.repos, self.local_items)
         self.login_var.set(f"@{self.login}" if self.login else "")
         self._finish()
         self._render()
         self.hub.set_status("GitHub: список обновлён")
-        self.append_log(self.log_box, f"Загружено репозиториев: {len(self.repos)}")
+        self._log_report()
+
+    def _log_report(self) -> None:
+        """Короткий отчёт в лог: что есть где — его можно скопировать."""
+        matched = len(self.matches)
+        gh_only = [repo for repo in self.repos if repo["full"] not in self.matches]
+        self.append_log(
+            self.log_box,
+            f"=== Сверка: на GitHub {len(self.repos)}, на ПК {len(self.local_items)}, "
+            f"совпало {matched} ===",
+        )
+        for repo in self.repos:
+            local = self.matches.get(repo["full"], "")
+            if local:
+                self.append_log(self.log_box, f"✔ {repo['name']} → {local}", "ok")
+        for repo in gh_only[:40]:
+            self.append_log(self.log_box, f"✖ нет на ПК: {repo['name']}")
+        if len(gh_only) > 40:
+            self.append_log(self.log_box, f"… ещё {len(gh_only) - 40} репозиториев без папки")
+        for item in self.local_only[:40]:
+            self.append_log(self.log_box, f"◆ нет на GitHub: {item['path']}")
+        if len(self.local_only) > 40:
+            self.append_log(self.log_box, f"… ещё {len(self.local_only) - 40} локальных папок")
 
     # -- заливка ----------------------------------------------------------- #
     def push_folder(self) -> None:
@@ -3282,6 +3478,17 @@ class GitHubPanel(Panel):
         )
         if not folder:
             return
+        self._push(folder)
+
+    def push_selected(self) -> None:
+        row = self._selected_row()
+        folder = self._local_for(row)
+        if not folder or self.busy:
+            messagebox.showinfo("GitHub", "У выбранной строки нет папки на ПК.", parent=self)
+            return
+        self._push(folder)
+
+    def _push(self, folder: str) -> None:
         default = sanitize_repo_name(Path(folder).name)
         name = messagebox.askstring(
             "Новый репозиторий",
@@ -3311,7 +3518,7 @@ class GitHubPanel(Panel):
     def update_all(self) -> None:
         if self.busy:
             return
-        targets = [repo for repo in self.repos if self.local.get(repo["name"].lower())]
+        targets = [repo for repo in self.repos if self.matches.get(repo["full"])]
         if not targets:
             messagebox.showinfo(
                 "GitHub", "Нет репозиториев, у которых есть локальная папка.", parent=self
@@ -3331,7 +3538,7 @@ class GitHubPanel(Panel):
             updated = 0
             failed = 0
             for index, repo in enumerate(targets, 1):
-                folder = self.local[repo["name"].lower()]
+                folder = self.matches[repo["full"]]
                 self._log_bg(f"[{index}/{total}] {repo['name']}")
                 try:
                     ok = update_local_repo(folder, repo["name"], self._log_bg)
@@ -3417,7 +3624,7 @@ class GitHubPanel(Panel):
         self.refresh()
 
     def open_folder(self) -> None:
-        local = self._local_for(self._selected_repo())
+        local = self._local_for(self._selected_row())
         if not local:
             return
         try:
@@ -3996,6 +4203,28 @@ class Hub(tk.Tk):
 
     def set_status(self, text: str) -> None:
         self.status_var.set(text)
+
+    def toast(self, message: str, *, kind: str = "ok", ms: int = 2200) -> None:
+        """Всплывающее подтверждение поверх окна — видно, что действие сработало."""
+        label = getattr(self, "_toast_label", None)
+        if label is None:
+            label = tk.Label(
+                self, bg=CARD, fg=FG, font=("Segoe UI", 10, "bold"),
+                padx=px(18), pady=px(10),
+                highlightthickness=1, highlightbackground=BORDER, bd=0,
+            )
+            self._toast_label = label
+        colors = {"ok": OK, "warn": WARN, "error": DANGER}
+        label.configure(text=message, fg=colors.get(kind, FG))
+        label.place(relx=0.5, rely=1.0, y=-px(46), anchor="s")
+        label.lift()
+        job = getattr(self, "_toast_job", None)
+        if job:
+            try:
+                self.after_cancel(job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._toast_job = self.after(ms, label.place_forget)
 
     # -- права ------------------------------------------------------------- #
     def ensure_admin(self, tab: str) -> bool:

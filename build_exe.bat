@@ -18,9 +18,27 @@ if errorlevel 1 (
     if errorlevel 1 goto no_pyinstaller
 )
 
+if exist "build\out\Tools.exe" del /q "build\out\Tools.exe" >nul 2>&1
+
 echo  Building. This can take a few minutes...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name Tools --distpath . --workpath build --specpath build --exclude-module matplotlib --exclude-module pandas --exclude-module scipy --exclude-module PyQt5 --exclude-module PySide6 tools.pyw
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name Tools --distpath build\out --workpath build --specpath build --exclude-module matplotlib --exclude-module pandas --exclude-module scipy --exclude-module PyQt5 --exclude-module PySide6 tools.pyw
 if errorlevel 1 goto failed
+if not exist "build\out\Tools.exe" goto failed
+
+rem A running exe can be renamed, but not overwritten. Swap it safely.
+set "OLD=Tools_old_%RANDOM%.exe"
+if exist "Tools.exe" (
+    ren "Tools.exe" "%OLD%" >nul 2>&1
+    if exist "Tools.exe" goto close_app
+)
+move /y "build\out\Tools.exe" "Tools.exe" >nul
+if errorlevel 1 goto close_app
+
+rem Remove the previous build; if it is still running, move it out of the way.
+if exist "%OLD%" (
+    del /q "%OLD%" >nul 2>&1
+    if exist "%OLD%" move /y "%OLD%" "%TEMP%\Tools_old_%RANDOM%.exe" >nul 2>&1
+)
 
 echo.
 echo  Done: Tools.exe
@@ -29,6 +47,14 @@ echo  Edit tools.pyw and run this file again to rebuild.
 echo.
 pause
 exit /b 0
+
+:close_app
+echo.
+echo  Tools.exe is in use and could not be replaced.
+echo  Close the app and run this file again.
+echo.
+pause
+exit /b 1
 
 :no_python
 echo.
