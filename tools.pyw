@@ -19,6 +19,7 @@ import json
 import os
 import queue
 import random
+import re
 import shutil
 import stat
 import subprocess
@@ -2266,6 +2267,7 @@ BYPASS_URL = "http://127.0.0.1:8790"
 GITHUB_IGNORE_BLOCK = """\
 # --- добавлено «Мои инструменты» ---
 .workbuddy-ai/
+.github/
 .env
 *.env
 node_modules/
@@ -2377,6 +2379,90 @@ def gh_token() -> str:
         return ""
     rc, out, _ = run_tool([gh, "auth", "token"], timeout=30)
     return out if rc == 0 else ""
+
+
+GH_TOKEN_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "github_pat_")
+
+
+def gh_hosts_paths() -> list[Path]:
+    """Где GitHub CLI хранит токен: %APPDATA% и ~/.config/gh."""
+    paths: list[Path] = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        paths.append(Path(appdata) / "GitHub CLI" / "hosts.yml")
+    paths.append(Path.home() / ".config" / "gh" / "hosts.yml")
+    unique: list[Path] = []
+    for path in paths:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def token_looks_valid(token: str) -> bool:
+    token = token.strip()
+    return len(token) >= 20 and token.startswith(GH_TOKEN_PREFIXES)
+
+
+def mask_token(token: str) -> str:
+    token = (token or "").strip()
+    if not token:
+        return "не найден"
+    if len(token) <= 12:
+        return token[:4] + "…"
+    return f"{token[:6]}…{token[-4:]}"
+
+
+def gh_token_from_hosts() -> str:
+    for path in gh_hosts_paths():
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            key, _, value = line.strip().partition(":")
+            if key == "oauth_token" and value.strip():
+                return value.strip()
+    return gh_token()
+
+
+def gh_save_token(new_token: str) -> list[str]:
+    """Меняет oauth_token в hosts.yml, сохраняя резервную копию .bak."""
+    new_token = new_token.strip()
+    if not token_looks_valid(new_token):
+        raise ValueError(
+            "Не похоже на токен GitHub.\n"
+            "Нужен classic PAT, начинающийся с ghp_ (или github_pat_)."
+        )
+    updated: list[str] = []
+    pattern = re.compile(r"^(\s*)oauth_token:\s*.*$", re.MULTILINE)
+    for path in gh_hosts_paths():
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                text = handle.read()
+        except OSError as exc:
+            raise RuntimeError(f"Не удалось прочитать {path}:\n{exc}")
+        if not pattern.search(text):
+            continue
+        new_text = pattern.sub(
+            lambda match: f"{match.group(1)}oauth_token: {new_token}", text, count=1
+        )
+        backup = path.with_name(path.name + ".bak")
+        try:
+            shutil.copy2(path, backup)
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(new_text)
+        except OSError as exc:
+            raise RuntimeError(f"Не удалось записать {path}:\n{exc}")
+        updated.append(str(path))
+    if not updated:
+        raise RuntimeError(
+            "Не найден hosts.yml GitHub CLI.\n"
+            "Сначала выполните в терминале: gh auth login --web --git-protocol https"
+        )
+    return updated
 
 
 def github_repos() -> list[dict]:
@@ -2723,6 +2809,8 @@ class GitHubPanel(Panel):
         ttk.Label(top, textvariable=self.login_var, style="Muted.TLabel").pack(
             side="right", padx=(0, px(12))
         )
+        self.btn_token = flat_button(top, "🔑 Токен", self.token_dialog, kind="ghost")
+        self.btn_token.pack(side="right", padx=(0, px(8)))
 
         path_row = ttk.Frame(self)
         path_row.pack(fill="x", pady=(px(10), 0))
@@ -2798,6 +2886,13 @@ class GitHubPanel(Panel):
         self.append_log(self.log_box, f"Ошибка: {exc}", "error")
         self.hub.set_status("GitHub: ошибка")
         messagebox.showerror("GitHub", str(exc), parent=self)
+        if "delete_repo" in str(exc).lower():
+            if messagebox.askyesno(
+                "Токен GitHub",
+                "Открыть окно замены токена, чтобы добавить право delete_repo?",
+                parent=self,
+            ):
+                self.token_dialog()
 
     def _selected_repo(self) -> dict | None:
         selection = self.tree.selection()
@@ -2820,6 +2915,7 @@ class GitHubPanel(Panel):
         state = "disabled" if self.busy else "normal"
         self.btn_refresh.configure(state=state)
         self.btn_push.configure(state=state)
+        self.btn_token.configure(state=state)
         self.btn_all.configure(state=state if self.repos else "disabled")
         self.btn_open.configure(state="normal" if selected and local and not self.busy else "disabled")
         self.btn_download.configure(
@@ -2858,6 +2954,125 @@ class GitHubPanel(Panel):
             + (f" · показано: {shown}" if query else "")
         )
         self._update_actions()
+
+    # -- токен ------------------------------------------------------------- #
+    def token_dialog(self) -> None:
+        if self.busy:
+            return
+        try:
+            current = gh_token_from_hosts()
+        except Exception:  # noqa: BLE001
+            current = ""
+
+        initial = ""
+        try:
+            clip = self.clipboard_get().strip()
+            if token_looks_valid(clip):
+                initial = clip
+        except tk.TclError:
+            pass
+
+        win = tk.Toplevel(self)
+        win.withdraw()
+        win.title("Токен GitHub")
+        win.configure(bg=CARD)
+        win.transient(self)
+        win.resizable(False, False)
+
+        body = tk.Frame(win, bg=CARD, padx=px(22), pady=px(18))
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="Токен GitHub", bg=CARD, fg=FG,
+                 font=("Segoe UI", 12, "bold"), anchor="w").pack(fill="x")
+        tk.Label(
+            body,
+            text=("Удаление репозиториев требует права delete_repo. Создайте "
+                  "classic PAT со scope repo и delete_repo, скопируйте его и "
+                  "вставьте здесь — приложение заменит токен в hosts.yml GitHub CLI."),
+            bg=CARD, fg=MUTED, justify="left", anchor="w",
+            wraplength=px(520), font=("Segoe UI", 9),
+        ).pack(fill="x", pady=(px(10), 0))
+
+        tk.Label(body, text=f"Сейчас: {mask_token(current)}", bg=CARD, fg=ACCENT,
+                 anchor="w", font=("Consolas", 9)).pack(fill="x", pady=(px(10), 0))
+
+        link = tk.Label(body, text="Создать токен на GitHub ↗", bg=CARD, fg=ACCENT,
+                        cursor="hand2", font=("Segoe UI", 9, "underline"), anchor="w")
+        link.pack(fill="x", pady=(px(6), 0))
+        link.bind(
+            "<Button-1>",
+            lambda _event: webbrowser.open(
+                "https://github.com/settings/tokens/new?scopes=repo,delete_repo"
+                "&description=Tools%20GitHub"
+            ),
+        )
+
+        value = tk.StringVar(value=initial)
+        entry = ttk.Entry(body, textvariable=value, show="•")
+        entry.pack(fill="x", pady=(px(10), 0), ipady=px(2))
+
+        show_var = tk.BooleanVar(value=not bool(initial))
+
+        def toggle_show() -> None:
+            entry.configure(show="" if show_var.get() else "•")
+
+        dark_check(body, "Показать токен", show_var, bg=CARD,
+                   command=toggle_show).pack(anchor="w", pady=(px(8), 0))
+
+        def close() -> None:
+            win.destroy()
+
+        def save() -> None:
+            token = value.get().strip()
+            if not token_looks_valid(token):
+                messagebox.showerror(
+                    "Токен GitHub",
+                    "Не похоже на токен.\n\nНужен classic PAT, начинающийся с ghp_, "
+                    "со scope repo и delete_repo.",
+                    parent=win,
+                )
+                entry.focus_set()
+                return
+            try:
+                paths = gh_save_token(token)
+            except (ValueError, RuntimeError) as exc:
+                messagebox.showerror("Токен GitHub", str(exc), parent=win)
+                return
+            win.destroy()
+            self.append_log(
+                self.log_box, "Токен GitHub обновлён: " + ", ".join(paths), "ok"
+            )
+            self.hub.set_status("GitHub: токен обновлён")
+            messagebox.showinfo(
+                "Токен GitHub",
+                "Токен заменён в:\n" + "\n".join(paths)
+                + "\n\nРезервная копия: hosts.yml.bak\nОбновляю список…",
+                parent=self,
+            )
+            self.refresh()
+
+        buttons = tk.Frame(body, bg=CARD)
+        buttons.pack(fill="x", pady=(px(18), 0))
+        flat_button(buttons, "Сохранить", save).pack(side="right")
+        flat_button(buttons, "Отмена", close, kind="ghost").pack(
+            side="right", padx=(0, px(8))
+        )
+
+        win.bind("<Return>", lambda _event: save())
+        win.bind("<Escape>", lambda _event: close())
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.update_idletasks()
+        width, height = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 3)
+        win.geometry(f"+{x}+{y}")
+        enable_dark_titlebar(win)
+        win.deiconify()
+        win.grab_set()
+        win.focus_force()
+        entry.focus_set()
+        if initial:
+            entry.select_range(0, "end")
+        win.wait_window()
 
     # -- путь -------------------------------------------------------------- #
     def choose_root(self) -> None:
@@ -3035,8 +3250,9 @@ class GitHubPanel(Panel):
                 if "delete_repo" in message:
                     raise RuntimeError(
                         "У токена нет права delete_repo.\n\n"
-                        "GitHub → Settings → Developer settings → Personal access tokens → "
-                        "ваш токен → галочка delete_repo → Update token."
+                        "Нажмите «🔑 Токен», создайте новый classic PAT со scope "
+                        "repo + delete_repo и вставьте его — приложение само "
+                        "заменит токен в hosts.yml."
                     )
                 raise RuntimeError(message or "не удалось удалить репозиторий")
             return True
