@@ -1038,26 +1038,92 @@ class Panel(ttk.Frame):
 
     def make_log(self, parent: tk.Misc, *, height: int = 10, wrap: str = "word"):
         frame = ttk.Frame(parent)
+        head = ttk.Frame(frame)
+        head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, px(4)))
+        ttk.Label(head, text="Лог — выдели мышью и Ctrl+C", style="Muted.TLabel").pack(
+            side="left"
+        )
         text = dark_text(frame, height=height, wrap=wrap)
         text.tag_configure("error", foreground="#ff6b6b")
         text.tag_configure("ok", foreground=OK)
+        copy_btn = flat_button(head, "Копировать", lambda: None, kind="ghost")
+        copy_btn.pack(side="right")
+        copy_btn.configure(command=lambda: self.copy_log(text, copy_btn))
+        flat_button(head, "Очистить", lambda: text.delete("1.0", "end"),
+                    kind="ghost").pack(side="right", padx=(0, px(6)))
         scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=scroll.set)
-        text.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
-        frame.rowconfigure(0, weight=1)
+        text.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
+        frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
+        self._make_copyable(text)
         return frame, text
+
+    def _make_copyable(self, text: tk.Text) -> None:
+        """Лог только для чтения, но текст можно выделять и копировать."""
+
+        def block_keys(event):
+            if event.state & 0x4 and event.keysym.lower() in ("c", "a", "insert"):
+                return None
+            if event.keysym in ("Left", "Right", "Up", "Down", "Home", "End",
+                                "Prior", "Next", "Shift_L", "Shift_R",
+                                "Control_L", "Control_R", "Tab"):
+                return None
+            return "break"
+
+        def copy_selection(_event=None):
+            try:
+                chunk = text.get("sel.first", "sel.last")
+            except tk.TclError:
+                chunk = text.get("1.0", "end-1c")
+            self.copy_text(chunk)
+            return "break"
+
+        def select_all(_event=None):
+            text.tag_add("sel", "1.0", "end-1c")
+            return "break"
+
+        text.bind("<Key>", block_keys)
+        text.bind("<Control-c>", copy_selection)
+        text.bind("<Control-C>", copy_selection)
+        text.bind("<Control-a>", select_all)
+
+        menu = tk.Menu(text, tearoff=0)
+        menu.add_command(label="Копировать", command=copy_selection)
+        menu.add_command(label="Копировать всё",
+                         command=lambda: self.copy_text(text.get("1.0", "end-1c")))
+        menu.add_separator()
+        menu.add_command(label="Очистить", command=lambda: text.delete("1.0", "end"))
+        text.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
+
+    def copy_log(self, text: tk.Text, button: tk.Button) -> None:
+        try:
+            chunk = text.get("sel.first", "sel.last")
+        except tk.TclError:
+            chunk = text.get("1.0", "end-1c")
+        self.copy_text(chunk)
+        button.configure(text="✅ Скопировано!")
+        self.after(1600, lambda: button.configure(text="Копировать"))
+
+    def copy_text(self, chunk: str) -> None:
+        """Кладёт текст в буфер обмена и явно показывает результат."""
+        if not chunk.strip():
+            self.hub.set_status("Копировать нечего — лог пуст")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(chunk)
+        self.update()          # без update() Windows не фиксирует буфер сразу
+        lines = chunk.count("\n") + (0 if chunk.endswith("\n") else 1)
+        self.hub.set_status(f"📋 скопировано: {lines} строк, {len(chunk)} символов")
 
     @staticmethod
     def append_log(text: tk.Text, line: str, tag: str | None = None) -> None:
-        text.configure(state="normal")
         text.insert("end", f"{time.strftime('%H:%M:%S')}  {line}\n", (tag,) if tag else ())
         lines = int(text.index("end-1c").split(".")[0])
         if lines > 500:
             text.delete("1.0", f"{lines - 500}.0")
         text.see("end")
-        text.configure(state="disabled")
 
 
 # --------------------------------------------------------------------------- #
@@ -2550,9 +2616,21 @@ def scan_local_repos(root: str, max_depth: int = 4) -> dict[str, str]:
     return found
 
 
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    "і": "i", "ї": "yi", "є": "ye", "ґ": "g",
+}
+
+
 def sanitize_repo_name(name: str) -> str:
+    # GitHub не принимает не-ASCII имена — кириллицу переводим в латиницу
+    transliterated = "".join(_TRANSLIT.get(ch.lower(), ch) for ch in name)
     allowed = "-_. "
-    cleaned = "".join(ch for ch in name if ch.isalnum() or ch in allowed)
+    cleaned = "".join(ch for ch in transliterated if ch.isalnum() or ch in allowed)
     cleaned = "-".join(part for part in cleaned.split() if part)
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
@@ -2809,8 +2887,8 @@ class GitHubPanel(Panel):
         ttk.Label(top, textvariable=self.login_var, style="Muted.TLabel").pack(
             side="right", padx=(0, px(12))
         )
-        self.btn_token = flat_button(top, "🔑 Токен", self.token_dialog, kind="ghost")
-        self.btn_token.pack(side="right", padx=(0, px(8)))
+        self.btn_login = flat_button(top, "Войти в GitHub", self.login_browser, kind="ghost")
+        self.btn_login.pack(side="right", padx=(0, px(8)))
 
         path_row = ttk.Frame(self)
         path_row.pack(fill="x", pady=(px(10), 0))
@@ -2886,13 +2964,15 @@ class GitHubPanel(Panel):
         self.append_log(self.log_box, f"Ошибка: {exc}", "error")
         self.hub.set_status("GitHub: ошибка")
         messagebox.showerror("GitHub", str(exc), parent=self)
-        if "delete_repo" in str(exc).lower():
+        text = str(exc).lower()
+        if "delete_repo" in text or "не выполнен вход" in text:
             if messagebox.askyesno(
-                "Токен GitHub",
-                "Открыть окно замены токена, чтобы добавить право delete_repo?",
+                "Вход в GitHub",
+                "Войти через браузер? Это даст права и на заливку, и на удаление "
+                "репозиториев — без токенов.",
                 parent=self,
             ):
-                self.token_dialog()
+                self.login_browser(confirm=False)
 
     def _selected_repo(self) -> dict | None:
         selection = self.tree.selection()
@@ -2915,7 +2995,7 @@ class GitHubPanel(Panel):
         state = "disabled" if self.busy else "normal"
         self.btn_refresh.configure(state=state)
         self.btn_push.configure(state=state)
-        self.btn_token.configure(state=state)
+        self.btn_login.configure(state=state)
         self.btn_all.configure(state=state if self.repos else "disabled")
         self.btn_open.configure(state="normal" if selected and local and not self.busy else "disabled")
         self.btn_download.configure(
@@ -2954,6 +3034,78 @@ class GitHubPanel(Panel):
             + (f" · показано: {shown}" if query else "")
         )
         self._update_actions()
+
+    # -- вход через браузер ------------------------------------------------ #
+    def login_browser(self, confirm: bool = True) -> None:
+        """Вход в GitHub через браузер: без токенов и копирования строк."""
+        if self.busy:
+            return
+        gh = find_tool("gh")
+        if not gh:
+            messagebox.showerror(
+                "GitHub", "GitHub CLI (gh) не найден. Установите с cli.github.com.", parent=self
+            )
+            return
+        if confirm and not messagebox.askyesno(
+            "Вход в GitHub",
+            "Откроется браузер.\n\n"
+            "1. Войди в GitHub (если ещё не вошёл).\n"
+            "2. Нажми «Authorize».\n\n"
+            "Код для входа приложение скопирует в буфер обмена.\n"
+            "Этот вход сразу даёт право удалять репозитории.",
+            parent=self,
+        ):
+            return
+        self._start_busy("GitHub: вход через браузер…")
+        self.append_log(self.log_box, "открываю браузер для входа…")
+
+        def work():
+            proc = subprocess.Popen(
+                [gh, "auth", "login", "--web", "-h", "github.com",
+                 "--git-protocol", "https", "--skip-ssh-key",
+                 "-s", "repo", "-s", "delete_repo", "-s", "gist"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=tool_env(),
+                creationflags=NO_WINDOW,
+            )
+            try:
+                if proc.stdin:
+                    proc.stdin.write("\n")     # gh ждёт Enter перед открытием браузера
+                    proc.stdin.flush()
+            except OSError:
+                pass
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    self._log_bg(line)
+            return proc.wait()
+
+        self.hub.run_bg(work, self._login_done, self._fail)
+
+    def _login_done(self, code: int) -> None:
+        self._finish()
+        if code == 0:
+            self.append_log(self.log_box, "✅ вход в GitHub выполнен", "ok")
+            self.hub.set_status("GitHub: вход выполнен")
+            messagebox.showinfo(
+                "Вход в GitHub",
+                "Готово. Теперь работают и заливка, и удаление репозиториев.",
+                parent=self,
+            )
+            self.refresh()
+        else:
+            self.append_log(self.log_box, "❌ вход не выполнен", "error")
+            self.hub.set_status("GitHub: вход не выполнен")
+            messagebox.showerror(
+                "Вход в GitHub",
+                "Браузер не подтвердил вход.\nНажмите «Войти в GitHub» и повторите.",
+                parent=self,
+            )
 
     # -- токен ------------------------------------------------------------- #
     def token_dialog(self) -> None:
@@ -3249,10 +3401,9 @@ class GitHubPanel(Panel):
                 message = err or out
                 if "delete_repo" in message:
                     raise RuntimeError(
-                        "У токена нет права delete_repo.\n\n"
-                        "Нажмите «🔑 Токен», создайте новый classic PAT со scope "
-                        "repo + delete_repo и вставьте его — приложение само "
-                        "заменит токен в hosts.yml."
+                        "У входа нет права delete_repo.\n\n"
+                        "Нажмите «Войти в GitHub» и подтвердите вход в браузере — "
+                        "это даст право удалять репозитории."
                     )
                 raise RuntimeError(message or "не удалось удалить репозиторий")
             return True
