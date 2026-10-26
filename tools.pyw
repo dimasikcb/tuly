@@ -30,6 +30,7 @@ import traceback
 import urllib.error
 import urllib.request
 import webbrowser
+import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -1063,7 +1064,13 @@ class Panel(ttk.Frame):
 
     def attach_copy(self, text: tk.Text, *, label: str = "текст",
                     readonly: bool = False, clear: bool = True) -> None:
-        """Делает любой текстовый блок копируемым: Ctrl+C, Ctrl+A, правый клик."""
+        """Делает любой текстовый блок копируемым: Ctrl+C, Ctrl+A, правый клик.
+
+        Копирование ловим через каноническое событие Tk ``<<Copy>>`` (его
+        вызывает и Ctrl+C, и Ctrl+Insert), а не через сырой ``<Control-c>`` —
+        так нет зависимости от порядка обработки <Key>/<Control-c> и от того,
+        в каком состоянии (нормальном/только-чтение) находится виджет.
+        """
 
         def block_keys(event):
             if event.state & 0x4 and event.keysym.lower() in ("c", "a", "insert"):
@@ -1088,8 +1095,7 @@ class Panel(ttk.Frame):
 
         if readonly:
             text.bind("<Key>", block_keys)
-        text.bind("<Control-c>", copy_selection)
-        text.bind("<Control-C>", copy_selection)
+        text.bind("<<Copy>>", copy_selection)
         text.bind("<Control-a>", select_all)
         text.bind("<Control-A>", select_all)
 
@@ -2366,8 +2372,21 @@ class CleanupPanel(Panel):
 #  GitHub: движок (gh + git) и Bypass: HTTP-клиент
 # --------------------------------------------------------------------------- #
 GITHUB_DEFAULT_ROOT = str(Path.home())
-BYPASS_DEFAULT_ROOT = r"C:\Users\admin\WorkBuddy AI\2026-10-17-10-12-49\bypass-manager"
-BYPASS_URL = "http://127.0.0.1:8790"
+
+# --------------------------------------------------------------------------- #
+#  Bypass: встроенный движок (GoodbyeDPI + ProxiFyre)
+# --------------------------------------------------------------------------- #
+BYPASS_DIR = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / "Tools" / "bypass"
+BYPASS_GBD_DIR = BYPASS_DIR / "goodbyedpi"
+BYPASS_PFR_DIR = BYPASS_DIR / "proxifyre"
+BYPASS_GBD_EXE = BYPASS_GBD_DIR / "goodbyedpi.exe"
+BYPASS_PFR_EXE = BYPASS_PFR_DIR / "ProxiFyre.exe"
+# файлы внутри exe — PowerShell-скрипты для скачки (urllib у GitHub ругается на rate-limit реже)
+BYPASS_GBD_REPO = "ValdikSS/GoodbyeDPI"
+BYPASS_PFR_REPO = "wiresock/proxifyre"
+BYPASS_GBD_ASSET = r"goodbyedpi-\d[\w.]*\.zip"
+BYPASS_PFR_ASSET = r"ProxiFyre-v\d[\w.]*-x64\.zip"
+BYPASS_DEFAULT_ENDPOINT = "socks5://127.0.0.1:1080"
 
 GITHUB_IGNORE_BLOCK = """\
 # --- добавлено «Мои инструменты» ---
@@ -3003,8 +3022,211 @@ def http_json(url: str, payload: dict | None = None, timeout: float = 3.0):
         return json.loads(response.read().decode("utf-8"))
 
 
-def bypass_state(timeout: float = 2.0) -> dict:
-    return http_json(BYPASS_URL + "/api/state", timeout=timeout)
+# --------------------------------------------------------------------------- #
+#  Bypass: движок (статусы, админ, скачка, запуск через UAC)
+# --------------------------------------------------------------------------- #
+def bypass_cfg() -> dict:
+    base = config_read().get("bypass") or {}
+    apps = base.get("apps") or []
+    endpoint = str(base.get("endpoint") or BYPASS_DEFAULT_ENDPOINT).strip()
+    if not endpoint:
+        endpoint = BYPASS_DEFAULT_ENDPOINT
+    return {
+        "endpoint": endpoint,
+        "apps": [a.strip() for a in apps if str(a).strip()],
+        "gbd_args": str(base.get("gbd_args") or "-5").strip(),
+    }
+
+
+def bypass_cfg_save(**updates) -> None:
+    config_update(bypass={**bypass_cfg(), **updates})
+
+
+def bypass_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _image_pid(image: str) -> int:
+    """PID процесса по имени образа (tasklist), 0 — не найден."""
+    try:
+        rc, out, _ = run_tool(
+            ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"], timeout=30,
+        )
+    except Exception:  # noqa: BLE001
+        return 0
+    if rc != 0 or not out or "INFO:" in out.upper():
+        return 0
+    try:
+        return int(out.splitlines()[0].split(",")[1].strip().strip('"'))
+    except (ValueError, IndexError):
+        return 0
+
+
+def _elevate(exe: str, params: str = "", cwd: str = "") -> bool:
+    """Запуск с запросом прав администратора (UAC). True — UAC пройден."""
+    code = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, cwd or None, 0)
+    return code > 32
+
+
+def _elevate_kill(image: str) -> None:
+    # taskkill может быть отказан без прав — поднимаем его же через UAC
+    ok = _elevate("taskkill.exe", f"/F /IM {image}")
+    if ok:
+        time.sleep(1.0)
+        if _image_pid(image):
+            raise RuntimeError(f"{image} не удалось остановить")
+    else:
+        raise RuntimeError(f"{image} запущен от администратора — UAC отклонён")
+
+
+def bypass_status(_: object = None) -> dict:
+    cfg = bypass_cfg()
+    pfr_on = _image_pid("ProxiFyre.exe")
+    gbd_on = _image_pid("goodbyedpi.exe")
+    return {
+        "admin": bypass_admin(),
+        "endpoint": cfg["endpoint"],
+        "apps": cfg["apps"],
+        "happ": {
+            "on": pfr_on > 0,
+            "installed": BYPASS_PFR_EXE.exists(),
+        },
+        "gbd": {
+            "on": gbd_on > 0,
+            "installed": BYPASS_GBD_EXE.exists(),
+            "args": cfg["gbd_args"],
+        },
+    }
+
+
+def bypass_download(kind: str) -> dict:
+    """Скачивает и распаковывает GoodbyeDPI или ProxiFyre в %LOCALAPPDATA%."""
+    if kind == "gbd":
+        repo, pattern, target = BYPASS_GBD_REPO, BYPASS_GBD_ASSET, BYPASS_GBD_DIR
+    else:
+        repo, pattern, target = BYPASS_PFR_REPO, BYPASS_PFR_ASSET, BYPASS_PFR_DIR
+    dl_dir = BYPASS_DIR / "downloads"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True)
+    zip_path = dl_dir / f"{kind}.zip"
+
+    script = "\n".join([
+        "$ProgressPreference = 'SilentlyContinue'",
+        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",
+        f"$api = 'https://api.github.com/repos/{repo}/releases/latest'",
+        "$rel = Invoke-RestMethod $api",
+        f"$asset = $rel.assets | Where-Object {{ $_.name -match '{pattern}' }} | Select-Object -First 1",
+        "if (-not $asset) { throw 'подходящий архив не найден в релизе' }",
+        f"Invoke-WebRequest $asset.browser_download_url -OutFile '{zip_path}' -UseBasicParsing",
+        "Write-Output $asset.name",
+    ])
+    name = ps_run(script, timeout=900)
+    if not zip_path.exists() or zip_path.stat().st_size == 0:
+        raise RuntimeError("архив не скачался")
+
+    tmp = dl_dir / f"{kind}-unzip"
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(tmp)
+
+    # exe ищем рекурсивно (в архиве бывает вложенная папка)
+    exe_name = "goodbyedpi.exe" if kind == "gbd" else "ProxiFyre.exe"
+    found = list(tmp.rglob(exe_name))
+    if not found:
+        raise RuntimeError(f"в архиве нет {exe_name}")
+    exe_dir = found[0].parent
+    for item in exe_dir.iterdir():
+        if item.is_dir():
+            shutil.copytree(item, target / item.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, target / item.name)
+    shutil.rmtree(tmp, ignore_errors=True)
+    if not (target / exe_name).exists():
+        raise RuntimeError("файлы не распакованы")
+    return {"ok": True, "detail": f"Скачан {name.strip() or kind}"}
+
+
+def bypass_gbd_start() -> dict:
+    if not BYPASS_GBD_EXE.exists():
+        raise RuntimeError("GoodbyeDPI не скачан — нажмите «Скачать GoodbyeDPI»")
+    if _image_pid("goodbyedpi.exe"):
+        return {"ok": True, "detail": "DPI уже запущен"}
+    exe = str(BYPASS_GBD_EXE)
+    params = f'"{exe}" {bypass_cfg()["gbd_args"]}'
+    if bypass_admin():
+        subprocess.Popen([exe, *bypass_cfg()["gbd_args"].split()], cwd=str(BYPASS_GBD_DIR),
+                         creationflags=NO_WINDOW)
+    elif not _elevate(exe, bypass_cfg()["gbd_args"], str(BYPASS_GBD_DIR)):
+        raise RuntimeError("UAC отклонён — без прав администратора DPI не запустить")
+    time.sleep(2.0)
+    if not _image_pid("goodbyedpi.exe"):
+        raise RuntimeError("goodbyedpi.exe не запустился (галочку в UAC, драйвер WinDivert?)")
+    return {"ok": True, "detail": "GoodbyeDPI запущен (админ)"}
+
+
+def bypass_gbd_stop() -> dict:
+    if not _image_pid("goodbyedpi.exe"):
+        return {"ok": True, "detail": "DPI и так был остановлен"}
+    rc, _out, _err = run_tool(["taskkill", "/F", "/IM", "goodbyedpi.exe"], timeout=30)
+    if rc != 0 or _image_pid("goodbyedpi.exe"):
+        _elevate_kill("goodbyedpi.exe")
+    return {"ok": True, "detail": "GoodbyeDPI остановлен"}
+
+
+def bypass_write_app_config(cfg: dict) -> None:
+    endpoint = cfg["endpoint"]
+    # "socks5://host:port" → "host:port"
+    for prefix in ("socks5://", "socks://"):
+        if endpoint.lower().startswith(prefix):
+            endpoint = endpoint[len(prefix):]
+            break
+    payload = {
+        "logLevel": "Info",
+        "bypassLan": True,
+        "proxies": [{
+            "appNames": cfg["apps"],
+            "socks5ProxyEndpoint": endpoint,
+            "supportedProtocols": ["TCP"] if not cfg.get("udp", True) else ["TCP", "UDP"],
+        }],
+    }
+    (BYPASS_PFR_DIR / "app-config.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+
+def bypass_apps_start() -> dict:
+    if not BYPASS_PFR_EXE.exists():
+        raise RuntimeError("ProxiFyre не скачан — нажмите «Скачать ProxiFyre»")
+    cfg = bypass_cfg()
+    if not cfg["apps"]:
+        raise RuntimeError("Приложения не выбраны — «Настроить» → список exe")
+    if _image_pid("ProxiFyre.exe"):
+        # перезагружаем настройки
+        run_tool(["taskkill", "/F", "/IM", "ProxiFyre.exe"], timeout=30)
+        time.sleep(1.0)
+    bypass_write_app_config(cfg)
+    exe = str(BYPASS_PFR_EXE)
+    if bypass_admin():
+        subprocess.Popen([exe], cwd=str(BYPASS_PFR_DIR), creationflags=NO_WINDOW)
+    elif not _elevate(exe, "", str(BYPASS_PFR_DIR)):
+        raise RuntimeError("UAC отклонён — без прав администратора ProxiFyre не работает")
+    time.sleep(2.0)
+    if not _image_pid("ProxiFyre.exe"):
+        raise RuntimeError("ProxiFyre не запустился (нужен драйвер Windows Packet Filter)")
+    return {"ok": True, "detail": f"ProxiFyre запущен: {', '.join(cfg['apps'])}"}
+
+
+def bypass_apps_stop() -> dict:
+    if not _image_pid("ProxiFyre.exe"):
+        return {"ok": True, "detail": "ProxiFyre и так не был запущен"}
+    rc, _out, _err = run_tool(["taskkill", "/F", "/IM", "ProxiFyre.exe"], timeout=30)
+    if rc != 0 or _image_pid("ProxiFyre.exe"):
+        _elevate_kill("ProxiFyre.exe")
+    return {"ok": True, "detail": "ProxiFyre остановлен"}
 
 
 def listening_pid(port: int) -> int:
@@ -3800,30 +4022,27 @@ class GitHubPanel(Panel):
 
 
 # --------------------------------------------------------------------------- #
-#  Панель: Bypass Manager (пульт)
+#  Панель: Bypass (встроенный движок)
 # --------------------------------------------------------------------------- #
 class BypassPanel(Panel):
     def __init__(self, master: tk.Misc, hub) -> None:
         super().__init__(master, hub)
-        config = config_read().get("bypass") or {}
-        self.root = str(config.get("root") or BYPASS_DEFAULT_ROOT)
         self.online = False
         self.busy = False
         self.checking = False
         self.state: dict = {}
-        self.proc: subprocess.Popen | None = None
         self._offline_noted = False
         self._build()
-        self._tick()
+        self.refresh_now()
 
     def _build(self) -> None:
-        path_row = ttk.Frame(self)
-        path_row.pack(fill="x")
-        self.root_var = tk.StringVar(value=self.root)
-        ttk.Label(path_row, textvariable=self.root_var, style="Muted.TLabel").pack(side="left")
-        flat_button(path_row, "Изменить путь…", self.choose_root, kind="ghost").pack(
-            side="left", padx=(px(10), 0)
-        )
+        engine_row = ttk.Frame(self)
+        engine_row.pack(fill="x")
+        ttk.Label(
+            engine_row,
+            text=f"Движок встроен · {BYPASS_DIR}",
+            style="Muted.TLabel",
+        ).pack(side="left")
 
         card = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
         card.pack(fill="x", pady=(px(12), 0))
@@ -3835,13 +4054,13 @@ class BypassPanel(Panel):
         self.happ_var = tk.StringVar(value="—")
         self.gbd_var = tk.StringVar(value="—")
         for title, variable in (
-            ("Панель:", self.panel_var),
+            ("Права:", self.panel_var),
             ("Приложения:", self.apps_var),
-            ("Happ:", self.happ_var),
+            ("Прокси:", self.happ_var),
             ("GoodbyeDPI:", self.gbd_var),
         ):
             row = tk.Frame(inner, bg=CARD)
-            row.pack(fill="x", pady=(px(6) if title != "Панель:" else 0, 0))
+            row.pack(fill="x", pady=(px(6) if title != "Права:" else 0, 0))
             tk.Label(row, text=title, bg=CARD, fg=MUTED, width=12, anchor="w",
                      font=("Segoe UI", 9)).pack(side="left")
             tk.Label(row, textvariable=variable, bg=CARD, fg=FG, anchor="w",
@@ -3851,43 +4070,44 @@ class BypassPanel(Panel):
 
         controls = ttk.Frame(self)
         controls.pack(fill="x", pady=(px(14), px(6)))
-        self.btn_start = flat_button(controls, "Запустить панель", self.start_panel)
-        self.btn_start.pack(side="left")
-        self.btn_stop = flat_button(controls, "Остановить", self.stop_panel, kind="ghost")
-        self.btn_stop.pack(side="left", padx=(px(8), 0))
-        self.btn_open = flat_button(controls, "Открыть в браузере", self.open_panel, kind="ghost")
-        self.btn_open.pack(side="left", padx=(px(8), 0))
+        self.btn_apps_on = flat_button(controls, "По приложениям вкл",
+                                       lambda: self.toggle("happ", True))
+        self.btn_apps_on.pack(side="left")
+        self.btn_apps_off = flat_button(controls, "По приложениям выкл",
+                                        lambda: self.toggle("happ", False), kind="ghost")
+        self.btn_apps_off.pack(side="left", padx=(px(8), px(18)))
+        self.btn_gbd_on = flat_button(controls, "DPI вкл", lambda: self.toggle("gbd", True))
+        self.btn_gbd_on.pack(side="left")
+        self.btn_gbd_off = flat_button(controls, "DPI выкл", lambda: self.toggle("gbd", False),
+                                       kind="ghost")
+        self.btn_gbd_off.pack(side="left", padx=(px(8), px(18)))
         self.btn_refresh = flat_button(controls, "Обновить", self.refresh_now, kind="ghost")
         self.btn_refresh.pack(side="right")
 
-        toggles = ttk.Frame(self)
-        toggles.pack(fill="x", pady=(px(4), 0))
-        self.btn_happ_on = flat_button(toggles, "Happ вкл", lambda: self.toggle("happ", True),
-                                       kind="ghost")
-        self.btn_happ_on.pack(side="left")
-        self.btn_happ_off = flat_button(toggles, "Happ выкл", lambda: self.toggle("happ", False),
-                                        kind="ghost")
-        self.btn_happ_off.pack(side="left", padx=(px(6), px(18)))
-        self.btn_gbd_on = flat_button(toggles, "DPI вкл", lambda: self.toggle("gbd", True),
-                                      kind="ghost")
-        self.btn_gbd_on.pack(side="left")
-        self.btn_gbd_off = flat_button(toggles, "DPI выкл", lambda: self.toggle("gbd", False),
-                                       kind="ghost")
-        self.btn_gbd_off.pack(side="left", padx=(px(6), px(18)))
-        self.btn_install = flat_button(toggles, "Установить ProxiFyre", self.install,
-                                       kind="ghost")
-        self.btn_install.pack(side="left")
+        extras = ttk.Frame(self)
+        extras.pack(fill="x", pady=(px(4), 0))
+        self.btn_settings = flat_button(extras, "Настроить…", self.configure_dialog, kind="ghost")
+        self.btn_settings.pack(side="left")
+        self.btn_dl_gbd = flat_button(extras, "Скачать GoodbyeDPI",
+                                      lambda: self.download("gbd"), kind="ghost")
+        self.btn_dl_gbd.pack(side="left", padx=(px(8), 0))
+        self.btn_dl_pfr = flat_button(extras, "Скачать ProxiFyre",
+                                      lambda: self.download("pfr"), kind="ghost")
+        self.btn_dl_pfr.pack(side="left", padx=(px(8), 0))
 
         ttk.Label(
             self,
-            text="Панель — это отдельный движок bypass-manager. Здесь только управление: "
-                 "запуск, статусы и переключатели.",
+            text="GoodbyeDPI — обход DPI для всего интернета (нужны права администратора). "
+                 "«По приложениям» — ProxiFyre: трафик выбранных программ уходит в SOCKS5-прокси "
+                 "(адрес сокса задаётся в «Настроить»).",
             style="Muted.TLabel",
+            wraplength=px(900),
+            justify="left",
         ).pack(anchor="w", pady=(px(12), 0))
 
         log_frame, self.log_box = self.make_log(self, height=8)
         log_frame.pack(fill="both", expand=True, pady=(px(10), 0))
-        self.append_log(self.log_box, "Проверяю панель на 127.0.0.1:8790…")
+        self.append_log(self.log_box, "Проверяю статусы движка…")
 
     # -- статус ------------------------------------------------------------ #
     def _tick(self) -> None:
@@ -3895,226 +4115,159 @@ class BypassPanel(Panel):
             return
         if not self.busy and not self.checking:
             self.checking = True
-            self.hub.run_bg(bypass_state, self._state_ok, self._state_off)
+            self.hub.run_bg(bypass_status, self._state_ok, self._state_off)
         self.after(3000, self._tick)
 
     def refresh_now(self) -> None:
         if self.checking or self.busy:
             return
         self.checking = True
-        self.hub.run_bg(bypass_state, self._state_ok, self._state_off)
+        self.hub.run_bg(bypass_status, self._state_ok, self._state_off)
 
     def _state_ok(self, state: dict) -> None:
         self.checking = False
         self.online = True
         self._offline_noted = False
         self.state = state if isinstance(state, dict) else {}
+        self.panel_var.set(
+            "есть (запущено от администратора)" if self.state.get("admin")
+            else "нет — при включении появится окно UAC"
+        )
         apps = self.state.get("apps") or []
-        self.panel_var.set("работает · 127.0.0.1:8790")
-        self.apps_var.set(", ".join(apps) if apps else "не выбраны")
-        happ = self.state.get("happ") or {}
-        if happ.get("on"):
-            detail = "включён"
-            if happ.get("pending"):
-                detail += " · ждёт «Подключить» в Happ"
-            if happ.get("tunnel"):
-                detail += " · туннель поднят"
-            self.happ_var.set(detail)
-        else:
-            self.happ_var.set("выключен" + (" · ждёт подключения" if happ.get("pending") else ""))
+        self.apps_var.set(", ".join(apps) if apps else "не выбраны (кнопка «Настроить…»)")
+        cfg = self.state.get("happ") or {}
+        detail = f"{self.state.get('endpoint') or BYPASS_DEFAULT_ENDPOINT} · "
+        detail += "ProxiFyre запущен" if cfg.get("on") else "ProxiFyre остановлен"
+        detail += "" if cfg.get("installed") else " · ProxiFyre не скачан"
+        self.happ_var.set(detail)
         gbd = self.state.get("gbd") or {}
-        if gbd.get("on"):
-            detail = f"включён · порт {gbd.get('port', '—')}"
-        else:
-            detail = "выключен"
-        detail += " · ProxiFyre установлен" if gbd.get("installed") else " · ProxiFyre не установлен"
-        if gbd.get("on") and gbd.get("admin") is False:
-            detail += " · нет прав администратора"
+        detail = "запущен" if gbd.get("on") else "остановлен"
+        detail += "" if gbd.get("installed") else " · не скачан"
+        if gbd.get("args"):
+            detail += f" · аргументы {gbd['args']}"
         self.gbd_var.set(detail)
         self._update_controls()
 
-    def _state_off(self, _exc: Exception) -> None:
+    def _state_off(self, exc: Exception) -> None:
         self.checking = False
         was_online = self.online
         self.online = False
         self.state = {}
-        self.panel_var.set("не запущена")
+        self.panel_var.set(f"ошибка: {exc}")
         self.apps_var.set("—")
         self.happ_var.set("—")
         self.gbd_var.set("—")
         if not self._offline_noted:
             self._offline_noted = True
-            text = ("Панель не запущена. Нажмите «Запустить панель» — "
-                    "движок поднимется на 127.0.0.1:8790.")
-            self.append_log(self.log_box, text)
+            self.append_log(self.log_box, f"Не удалось опросить движок: {exc}", "error")
         if was_online:
-            self.hub.set_status("Bypass: панель не отвечает")
+            self.hub.set_status("Bypass: движок не отвечает")
         self._update_controls()
 
     def _update_controls(self) -> None:
         busy = self.busy
         online = self.online
-        self.btn_start.configure(state="disabled" if busy or online else "normal")
-        self.btn_stop.configure(state="disabled" if busy or not online else "normal")
-        self.btn_open.configure(state="disabled" if busy or not online else "normal")
+        self.btn_settings.configure(state="disabled" if busy else "normal")
         self.btn_refresh.configure(state="disabled" if busy or self.checking else "normal")
-        for button in (self.btn_happ_on, self.btn_happ_off, self.btn_gbd_on,
-                       self.btn_gbd_off, self.btn_install):
-            button.configure(state="disabled" if busy or not online else "normal")
+        toggles = "normal" if online and not busy else "disabled"
+        self.btn_apps_on.configure(state=toggles)
+        self.btn_apps_off.configure(state=toggles)
+        self.btn_gbd_on.configure(state=toggles)
+        self.btn_gbd_off.configure(state=toggles)
+        for button in (self.btn_dl_gbd, self.btn_dl_pfr):
+            button.configure(state="disabled" if busy else "normal")
 
-    # -- путь -------------------------------------------------------------- #
-    def choose_root(self) -> None:
-        chosen = filedialog.askdirectory(
-            title="Папка bypass-manager", initialdir=self.root, mustexist=True
-        )
-        if not chosen:
-            return
-        self.root = os.path.normpath(chosen)
-        self.root_var.set(self.root)
-        config_update(bypass={"root": self.root})
-        self.append_log(self.log_box, f"Путь сохранён: {self.root}")
-        self.refresh_now()
-
-    # -- запуск / остановка ------------------------------------------------ #
-    def _venv_python(self) -> Path | None:
-        scripts = Path(self.root) / ".venv" / "Scripts"
-        for name in ("pythonw.exe", "python.exe"):
-            candidate = scripts / name
-            if candidate.exists():
-                return candidate
-        return None
-
-    def start_panel(self) -> None:
-        if self.busy or self.online:
-            return
-        if not Path(self.root).is_dir():
-            messagebox.showerror("Bypass", f"Папка не найдена:\n{self.root}", parent=self)
-            return
-        python = self._venv_python()
-        if python is None:
-            messagebox.showerror(
-                "Bypass",
-                "Не найдено окружение .venv.\n\n"
-                f"Один раз запустите run.bat в папке:\n{self.root}\n"
-                "он создаст окружение и поставит Flask, после этого запуск будет из этого окна.",
-                parent=self,
-            )
-            return
-        self.busy = True
-        self._update_controls()
-        self.append_log(self.log_box, "Запускаю панель…")
-        self.hub.set_status("Bypass: запускаю панель…")
-        try:
-            subprocess.run(
-                [str(python), "-m", "app.panel_guard"],
-                cwd=self.root,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=NO_WINDOW,
-                timeout=30,
-            )
-            self.proc = subprocess.Popen(
-                [str(python), "-m", "app.main"],
-                cwd=self.root,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=NO_WINDOW,
-            )
-        except OSError as exc:
-            self.busy = False
-            self._update_controls()
-            self.append_log(self.log_box, f"Не удалось запустить: {exc}", "error")
-            messagebox.showerror("Bypass", str(exc), parent=self)
-            return
-        self.busy = False
-        self.append_log(self.log_box, "Процесс запущен, жду ответа панели…")
-        self.after(2500, self.refresh_now)
-
-    def stop_panel(self) -> None:
+    # -- настройки ---------------------------------------------------------- #
+    def configure_dialog(self) -> None:
         if self.busy:
             return
-        self.busy = True
-        self._update_controls()
-        self.append_log(self.log_box, "Останавливаю панель…")
-        proc = self.proc
+        cfg = bypass_cfg()
+        dialog = tk.Toplevel(self)
+        dialog.title("Настройка Bypass")
+        dialog.configure(bg=CARD)
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
 
-        def work():
-            pid = listening_pid(8790)
-            if not pid and proc is not None and proc.poll() is None:
-                pid = proc.pid
-            if pid:
-                run_tool(["taskkill", "/PID", str(pid), "/F"], timeout=30)
-                return pid
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                return proc.pid
-            return 0
+        tk.Label(dialog, text="SOCKS5-прокси (адрес:порт)", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=px(16), pady=(px(14), px(4)))
+        endpoint_var = tk.StringVar(value=cfg["endpoint"])
+        endpoint = tk.Entry(dialog, textvariable=endpoint_var, bg=FIELD, fg=FG,
+                            insertbackground=FG, relief="flat", width=40)
+        endpoint.pack(anchor="w", padx=px(16))
 
-        self.hub.run_bg(work, self._stop_done, self._stop_fail)
+        tk.Label(dialog, text="Приложения (exe через запятую):", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=px(16), pady=(px(10), px(4)))
+        apps_var = tk.StringVar(value=", ".join(cfg["apps"]))
+        apps = tk.Entry(dialog, textvariable=apps_var, bg=FIELD, fg=FG,
+                        insertbackground=FG, relief="flat", width=40)
+        apps.pack(anchor="w", padx=px(16))
 
-    def _stop_done(self, pid: int) -> None:
-        self.busy = False
-        self.proc = None
-        self.online = False
-        self._update_controls()
-        if pid:
-            self.append_log(self.log_box, f"Панель остановлена (PID {pid})")
-            self.hub.set_status("Bypass: панель остановлена")
-        else:
-            self.append_log(self.log_box, "Панель не была запущена")
-        self.after(600, self.refresh_now)
+        def save() -> None:
+            endpoint = endpoint_var.get().strip()
+            if not endpoint:
+                endpoint = BYPASS_DEFAULT_ENDPOINT
+            app_list = [part.strip() for part in apps_var.get().replace(";", ",").split(",")
+                        if part.strip()]
+            bypass_cfg_save(endpoint=endpoint, apps=app_list)
+            self.append_log(self.log_box,
+                            f"Сохранено: прокси {endpoint}; приложения: "
+                            + (", ".join(app_list) if app_list else "—"))
+            dialog.destroy()
+            self.refresh_now()
 
-    def _stop_fail(self, exc: Exception) -> None:
-        self.busy = False
-        self._update_controls()
-        self.append_log(self.log_box, f"Не удалось остановить: {exc}", "error")
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=px(16), pady=px(14))
+        flat_button(buttons, "Сохранить", save).pack(side="left")
+        flat_button(buttons, "Отмена", dialog.destroy, kind="ghost").pack(
+            side="left", padx=(px(8), 0)
+        )
+        endpoint.focus_set()
 
-    def open_panel(self) -> None:
-        webbrowser.open(BYPASS_URL)
+    # -- скачивание ---------------------------------------------------------- #
+    def download(self, kind: str) -> None:
+        if self.busy:
+            return
+        label = "GoodbyeDPI" if kind == "gbd" else "ProxiFyre"
+        self._run(
+            lambda: bypass_download(kind),
+            f"Скачиваю {label}…",
+            f"Скачиваю {label} с GitHub (может занять пару минут)…",
+        )
 
-    # -- действия ---------------------------------------------------------- #
+    # -- действия ------------------------------------------------------------ #
     def toggle(self, kind: str, on: bool) -> None:
         if self.busy or not self.online:
             return
-        label = "Happ" if kind == "happ" else "GoodbyeDPI"
-        self._post(f"/api/{kind}", {"on": on}, f"{label}: {'включаю' if on else 'выключаю'}…", 180)
+        if kind == "gbd":
+            work = bypass_gbd_start if on else bypass_gbd_stop
+            label = "GoodbyeDPI"
+        else:
+            work = bypass_apps_start if on else bypass_apps_stop
+            label = "ProxiFyre"
+        title = f"{label}: {'включаю' if on else 'выключаю'}…"
+        extra = ("Запуск потребует подтверждение администратора (UAC)."
+                 if on and not bypass_admin() else "")
+        self._run(work, title, title + extra)
 
-    def install(self) -> None:
-        if self.busy or not self.online:
-            return
-        if not messagebox.askyesno(
-            "Установка ProxiFyre",
-            "Скачать и установить ProxiFyre и драйвер?\n\n"
-            "Может потребоваться подтверждение администратора Windows.\n"
-            "Панель должна быть запущена от администратора.",
-            parent=self,
-        ):
-            return
-        self._post("/api/gbd-install", {}, "Устанавливаю ProxiFyre…", 600)
-
-    def _post(self, path: str, payload: dict, title: str, timeout: int) -> None:
+    # -- общий запуск фоновой задачи ----------------------------------------- #
+    def _run(self, work, status_now: str, log_now: str) -> None:
         self.busy = True
         self._update_controls()
-        self.append_log(self.log_box, title)
-        self.hub.set_status(f"Bypass: {title}")
+        self.append_log(self.log_box, log_now)
+        self.hub.set_status(f"Bypass: {status_now}")
+        self.hub.run_bg(work, self._run_done, self._run_fail)
 
-        def work():
-            return http_json(BYPASS_URL + path, payload, timeout=timeout)
-
-        self.hub.run_bg(work, self._post_done, self._post_fail)
-
-    def _post_done(self, result: dict) -> None:
+    def _run_done(self, result: dict) -> None:
         self.busy = False
-        detail = str((result or {}).get("detail") or "")
-        ok = bool((result or {}).get("ok"))
+        result = result if isinstance(result, dict) else {}
+        detail = str(result.get("detail") or "")
+        ok = bool(result.get("ok", True))
         if detail:
             self.append_log(self.log_box, detail, "ok" if ok else "error")
         self.hub.set_status("Bypass: готово" if ok else "Bypass: не выполнено")
         self.refresh_now()
 
-    def _post_fail(self, exc: Exception) -> None:
+    def _run_fail(self, exc: Exception) -> None:
         self.busy = False
         self.append_log(self.log_box, f"Ошибка: {exc}", "error")
         self.hub.set_status("Bypass: ошибка")
@@ -4155,8 +4308,8 @@ HEADERS = {
         "Список репозиториев, заливка папок, скачивание и обновление. Нужны gh и git.",
     ),
     "bypass": (
-        "Bypass Manager",
-        "Обход DPI для выбранных приложений: Happ и GoodbyeDPI. Пульт над панелью.",
+        "Bypass",
+        "Обход DPI: GoodbyeDPI для всего интернета, ProxiFyre — по приложениям.",
     ),
 }
 
