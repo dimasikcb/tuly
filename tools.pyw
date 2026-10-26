@@ -66,7 +66,7 @@ OK = "#4fd18b"
 WARN = "#f0b429"
 LOG_BG = "#0d0f13"
 LOG_FG = "#c7d0de"
-COPIED_BG = "#143a26"   # кратковременная вспышка «скопировано» в логах
+COPIED_BG = "#1b7a4b"   # кратковременная вспышка «скопировано» в логах
 
 SCALE = 1.0
 
@@ -1066,26 +1066,31 @@ class Panel(ttk.Frame):
                     readonly: bool = False, clear: bool = True) -> None:
         """Делает любой текстовый блок копируемым: Ctrl+C, Ctrl+A, правый клик.
 
-        Копирование ловим через каноническое событие Tk ``<<Copy>>`` (его
-        вызывает и Ctrl+C, и Ctrl+Insert), а не через сырой ``<Control-c>`` —
-        так нет зависимости от порядка обработки <Key>/<Control-c> и от того,
-        в каком состоянии (нормальном/только-чтение) находится виджет.
+        Копирование/выделение ловим универсально — по **физическому коду
+        клавиши** (``event.keycode``: VK_C=67, VK_A=65, VK_INSERT=45), который
+        не зависит от раскладки. Иначе при русской раскладке Ctrl+C даёт keysym
+        «с», а не «c», и привязки ``<Control-c>``/``<<Copy>>`` молча не
+        срабатывают — копия не происходит. Дополнительно страхуемся проверкой
+        keysym (c/с, a/а/ф), чтобы сработать в любой раскладке.
         """
 
-        def block_keys(event):
-            if event.state & 0x4 and event.keysym.lower() in ("c", "a", "insert"):
-                return None
-            if event.keysym in ("Left", "Right", "Up", "Down", "Home", "End",
-                                "Prior", "Next", "Shift_L", "Shift_R",
-                                "Control_L", "Control_R", "Tab"):
-                return None
-            return "break"
+        # Навигационные клавиши, разрешённые даже в режиме «только чтение».
+        NAV_KEYS = {
+            "Left", "Right", "Up", "Down", "Home", "End",
+            "Prior", "Next", "Shift_L", "Shift_R",
+            "Control_L", "Control_R", "Tab", "Insert",
+        }
+        # Буквы-«действия» во всех раскладках.
+        COPY_KEYS = {"c", "с"}                 # лат. C и кир. С
+        SELECT_KEYS = {"a", "а", "ф"}          # лат. A, кир. А и кир. Ф (Ctrl+A на RU)
 
         def copy_selection(_event=None):
             try:
                 chunk = text.get("sel.first", "sel.last")
             except tk.TclError:
                 chunk = text.get("1.0", "end-1c")
+            if not chunk:
+                return "break"
             self.copy_text(chunk, label=label, widget=text)
             return "break"
 
@@ -1093,9 +1098,27 @@ class Panel(ttk.Frame):
             text.tag_add("sel", "1.0", "end-1c")
             return "break"
 
-        if readonly:
-            text.bind("<Key>", block_keys)
-        text.bind("<<Copy>>", copy_selection)
+        def on_key(event):
+            ctrl = bool(event.state & 0x4) and not bool(event.state & 0x8)
+            if ctrl:
+                vk = getattr(event, "keycode", 0) or 0
+                ks = (event.keysym or "").lower()
+                if vk == 67 or ks in COPY_KEYS:                # C — копировать
+                    return copy_selection()
+                if vk == 65 or ks in SELECT_KEYS:             # A — выделить всё
+                    return select_all()
+                if vk == 45 or ks == "insert":                # Insert — копировать
+                    return copy_selection()
+                # прочие Ctrl-комбинации в «только чтение» глушим
+                return "break" if readonly else None
+            # без Ctrl
+            if readonly and event.keysym not in NAV_KEYS:
+                return "break"
+            return None
+
+        text.bind("<Key>", on_key)
+        text.bind("<<Copy>>", copy_selection)          # запасной путь (Ctrl+Insert и т.п.)
+        text.bind("<<SelectAll>>", select_all)
         text.bind("<Control-a>", select_all)
         text.bind("<Control-A>", select_all)
 
@@ -1140,17 +1163,17 @@ class Panel(ttk.Frame):
             self.flash_copied(widget)
 
     def flash_copied(self, widget) -> None:
-        """Кратковременная зелёная вспышка текстового блока — подтверждение копии."""
+        """Кратковременная зелёная вспышка + рамка — явное подтверждение копии."""
         try:
-            widget.configure(bg=COPIED_BG)
+            widget.configure(bg=COPIED_BG, highlightbackground=OK, highlightcolor=OK)
         except (tk.TclError, AttributeError):
             return
-        self.after(350, lambda: self._unflash(widget))
+        self.after(500, lambda: self._unflash(widget))
 
     @staticmethod
     def _unflash(widget) -> None:
         try:
-            widget.configure(bg=LOG_BG)
+            widget.configure(bg=LOG_BG, highlightbackground=BORDER, highlightcolor=BORDER)
         except (tk.TclError, AttributeError):
             pass
 
@@ -1813,14 +1836,15 @@ class CleanPanel(Panel):
 
     # -- помощники --------------------------------------------------------- #
     def _write(self, text: str, tag: str | None = None) -> None:
+        # Не выключаем state в "disabled": иначе виджет перестаёт ловить
+        # клавиатуру и Ctrl+C не срабатывает. Защиту от правки даёт attach_copy
+        # (readonly=True), которая глушит ввод, но оставляет фокус/выделение.
         self.list.configure(state="normal")
         self.list.insert("end", text, (tag,) if tag else ())
-        self.list.configure(state="disabled")
 
     def _clear_list(self) -> None:
         self.list.configure(state="normal")
         self.list.delete("1.0", "end")
-        self.list.configure(state="disabled")
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -3177,6 +3201,17 @@ def bypass_gbd_stop() -> dict:
     return {"ok": True, "detail": "GoodbyeDPI остановлен"}
 
 
+def bypass_processes() -> dict:
+    """Список запущенных программ (имена .exe, уникальные, отсортированные)."""
+    out = ps_run(
+        "(Get-Process | Where-Object { $_.Path } | ForEach-Object { Split-Path -Leaf $_.Path } "
+        "| Sort-Object -Unique) -join ';'",
+        timeout=60,
+    )
+    names = sorted({p.strip() for p in out.split(";") if p.strip()})
+    return {"ok": True, "processes": names}
+
+
 def bypass_write_app_config(cfg: dict) -> None:
     endpoint = cfg["endpoint"]
     # "socks5://host:port" → "host:port"
@@ -4034,6 +4069,7 @@ class BypassPanel(Panel):
         self._offline_noted = False
         self._build()
         self.refresh_now()
+        self.after(3000, self._tick)
 
     def _build(self) -> None:
         engine_row = ttk.Frame(self)
@@ -4086,7 +4122,8 @@ class BypassPanel(Panel):
 
         extras = ttk.Frame(self)
         extras.pack(fill="x", pady=(px(4), 0))
-        self.btn_settings = flat_button(extras, "Настроить…", self.configure_dialog, kind="ghost")
+        self.btn_settings = flat_button(extras, "Приложения и прокси…", self.configure_dialog,
+                                        kind="ghost")
         self.btn_settings.pack(side="left")
         self.btn_dl_gbd = flat_button(extras, "Скачать GoodbyeDPI",
                                       lambda: self.download("gbd"), kind="ghost")
@@ -4098,8 +4135,8 @@ class BypassPanel(Panel):
         ttk.Label(
             self,
             text="GoodbyeDPI — обход DPI для всего интернета (нужны права администратора). "
-                 "«По приложениям» — ProxiFyre: трафик выбранных программ уходит в SOCKS5-прокси "
-                 "(адрес сокса задаётся в «Настроить»).",
+                 "«По приложениям» — ProxiFyre: трафик программ, выбранных в "
+                 "«Приложения и прокси…», уходит в SOCKS5-прокси (адрес задаётся там же).",
             style="Muted.TLabel",
             wraplength=px(900),
             justify="left",
@@ -4134,7 +4171,7 @@ class BypassPanel(Panel):
             else "нет — при включении появится окно UAC"
         )
         apps = self.state.get("apps") or []
-        self.apps_var.set(", ".join(apps) if apps else "не выбраны (кнопка «Настроить…»)")
+        self.apps_var.set(", ".join(apps) if apps else "не выбраны · кнопка «Приложения и прокси…»")
         cfg = self.state.get("happ") or {}
         detail = f"{self.state.get('endpoint') or BYPASS_DEFAULT_ENDPOINT} · "
         detail += "ProxiFyre запущен" if cfg.get("on") else "ProxiFyre остановлен"
@@ -4182,46 +4219,168 @@ class BypassPanel(Panel):
         if self.busy:
             return
         cfg = bypass_cfg()
+
         dialog = tk.Toplevel(self)
-        dialog.title("Настройка Bypass")
+        dialog.title("Bypass — для каких приложений")
         dialog.configure(bg=CARD)
         dialog.transient(self.winfo_toplevel())
         dialog.grab_set()
 
-        tk.Label(dialog, text="SOCKS5-прокси (адрес:порт)", bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=px(16), pady=(px(14), px(4)))
+        tk.Label(dialog, text="SOCKS5-прокси (адрес:порт), например socks5://127.0.0.1:1080",
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(
+            anchor="w", padx=px(16), pady=(px(14), px(4)))
         endpoint_var = tk.StringVar(value=cfg["endpoint"])
-        endpoint = tk.Entry(dialog, textvariable=endpoint_var, bg=FIELD, fg=FG,
-                            insertbackground=FG, relief="flat", width=40)
-        endpoint.pack(anchor="w", padx=px(16))
+        tk.Entry(dialog, textvariable=endpoint_var, bg=FIELD, fg=FG,
+                 insertbackground=FG, relief="flat", width=44).pack(anchor="w", padx=px(16))
 
-        tk.Label(dialog, text="Приложения (exe через запятую):", bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=px(16), pady=(px(10), px(4)))
-        apps_var = tk.StringVar(value=", ".join(cfg["apps"]))
-        apps = tk.Entry(dialog, textvariable=apps_var, bg=FIELD, fg=FG,
-                        insertbackground=FG, relief="flat", width=40)
-        apps.pack(anchor="w", padx=px(16))
+        tk.Label(
+            dialog,
+            text="Приложения — отметь программы, трафик которых пойдёт через прокси:",
+            bg=CARD, fg=MUTED, font=("Segoe UI", 9),
+        ).pack(anchor="w", padx=px(16), pady=(px(10), px(4)))
 
-        def save() -> None:
-            endpoint = endpoint_var.get().strip()
-            if not endpoint:
-                endpoint = BYPASS_DEFAULT_ENDPOINT
-            app_list = [part.strip() for part in apps_var.get().replace(";", ",").split(",")
-                        if part.strip()]
-            bypass_cfg_save(endpoint=endpoint, apps=app_list)
-            self.append_log(self.log_box,
-                            f"Сохранено: прокси {endpoint}; приложения: "
-                            + (", ".join(app_list) if app_list else "—"))
-            dialog.destroy()
-            self.refresh_now()
+        head = ttk.Frame(dialog)
+        head.pack(fill="x", padx=px(16))
+        search_var = tk.StringVar()
+        search = tk.Entry(head, textvariable=search_var, bg=FIELD, fg=FG,
+                          insertbackground=FG, relief="flat", width=30)
+        search.pack(side="left")
+        selected_var = tk.StringVar(value="выбрано: 0")
 
-        buttons = ttk.Frame(dialog)
-        buttons.pack(fill="x", padx=px(16), pady=px(14))
-        flat_button(buttons, "Сохранить", save).pack(side="left")
-        flat_button(buttons, "Отмена", dialog.destroy, kind="ghost").pack(
+        listbox = tk.Listbox(
+            dialog, bg=FIELD, fg=FG, selectbackground=ACCENT, relief="flat",
+            selectmode="multiple", height=12, activestyle="none",
+            exportselection=False,
+        )
+        listbox.pack(fill="x", expand=True, padx=px(16), pady=(px(6), 0))
+        ttk.Label(dialog, textvariable=selected_var, style="Muted.TLabel").pack(
+            anchor="w", padx=px(16), pady=(px(4), 0)
+        )
+
+        def sync(_event=None) -> None:
+            self._dlg_sync(listbox, selected_var)
+
+        manual_row = ttk.Frame(dialog)
+        manual_row.pack(fill="x", padx=px(16), pady=(px(6), 0))
+        manual_var = tk.StringVar()
+        manual = tk.Entry(manual_row, textvariable=manual_var, bg=FIELD, fg=FG,
+                          insertbackground=FG, relief="flat", width=24)
+        manual.pack(side="left")
+
+        def manual_add() -> None:
+            name = manual_var.get().strip()
+            if name and name.lower() not in {n.lower() for n in self._dlg_procs}:
+                self._dlg_procs.append(name)
+                self._dlg_procs.sort()
+            manual_var.set("")
+            self._dlg_fill(listbox, search_var.get())
+            sync()
+
+        flat_button(manual_row, "＋ добавить вручную", manual_add, kind="ghost").pack(
             side="left", padx=(px(8), 0)
         )
-        endpoint.focus_set()
+
+        search.bind("<KeyRelease>", lambda _e: (self._dlg_fill(listbox, search_var.get()),
+                                                sync()))
+        listbox.bind("<<ListboxSelect>>", sync)
+
+        def save() -> None:
+            endpoint = endpoint_var.get().strip() or BYPASS_DEFAULT_ENDPOINT
+            apps = sorted(self._dlg["selected"].values())
+            if not apps:
+                if not messagebox.askyesno(
+                    "Bypass", "Ни одно приложение не выбрано — сохранить всё равно?",
+                    parent=dialog,
+                ):
+                    return
+            self._dlg["selected"] = {}
+            bypass_cfg_save(endpoint=endpoint, apps=apps)
+            names = ", ".join(apps) if apps else "—"
+            self.append_log(self.log_box, f"Сохранено: прокси {endpoint}; приложения: {names}")
+            was_running = bool((self.state.get("happ") or {}).get("on"))
+            dialog.destroy()
+            if was_running:
+                self.append_log(self.log_box, "Перезапускаю ProxiFyre с новым списком…")
+                self.toggle("happ", True)
+            else:
+                self.refresh_now()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=px(16), pady=px(12))
+        flat_button(buttons, "Обновить список программ", self._dlg_reload, kind="ghost").pack(
+            side="left"
+        )
+        flat_button(buttons, "Сохранить и применить", save, kind="primary").pack(
+            side="right"
+        )
+        flat_button(buttons, "Отмена", dialog.destroy, kind="ghost").pack(
+            side="right", padx=(0, px(8))
+        )
+
+        self._dlg = {
+            "window": dialog,
+            "listbox": listbox,
+            "selected": {a.lower(): a for a in cfg["apps"]},
+            "search": search_var,
+            "count": selected_var,
+        }
+        self._dlg_procs = list(cfg["apps"])
+        self._dlg_fill(listbox, "")
+        self._dlg_reload()
+        search.focus_set()
+
+    def _dlg_visible_names(self, pattern: str) -> list[str]:
+        needle = pattern.strip().lower()
+        if not needle:
+            return list(self._dlg_procs)
+        return [n for n in self._dlg_procs if needle in n.lower()]
+
+    def _dlg_fill(self, listbox: tk.Listbox, pattern: str) -> None:
+        listbox.delete(0, tk.END)
+        selected = self._dlg["selected"] if isinstance(getattr(self, "_dlg", None), dict) else {}
+        self._dlg_visible = self._dlg_visible_names(pattern)
+        for index, name in enumerate(self._dlg_visible):
+            listbox.insert(index, name)
+            if name.lower() in selected:
+                listbox.selection_set(index)
+
+    def _dlg_sync(self, listbox: tk.Listbox, selected_var: tk.StringVar) -> None:
+        selected = self._dlg["selected"]
+        visible = set(self._dlg_visible)
+        chosen = set()
+        for index in listbox.curselection():
+            try:
+                chosen.add(self._dlg_visible[index])
+            except IndexError:
+                pass
+        for name in list(visible - chosen):
+            selected.pop(name.lower(), None)
+        for name in chosen:
+            selected.setdefault(name.lower(), name)
+        selected_var.set(f"выбрано: {len(selected)}")
+
+    def _dlg_reload(self) -> None:
+        if getattr(self, "_dlg_reloading", False):
+            return
+        self._dlg_reloading = True
+
+        def fetched(result: dict) -> None:
+            self._dlg_reloading = False
+            if not isinstance(getattr(self, "_dlg", None), dict):
+                return
+            names = [str(p) for p in (result or {}).get("processes") or []]
+            # вручную добавленное и сохранённое не теряем
+            names = sorted(set(names) | set(self._dlg_procs))
+            self._dlg_procs = names
+            listbox = self._dlg["listbox"]
+            self._dlg_fill(listbox, self._dlg["search"].get())
+            self._dlg_sync(listbox, self._dlg["count"])
+
+        def failed(exc: Exception) -> None:
+            self._dlg_reloading = False
+            self.append_log(self.log_box, f"Список программ недоступен: {exc}", "error")
+
+        self.hub.run_bg(bypass_processes, fetched, failed)
 
     # -- скачивание ---------------------------------------------------------- #
     def download(self, kind: str) -> None:
@@ -4283,7 +4442,7 @@ NAV = (
     ("dns", "DNS", "Quad9 · Xbox · DoH"),
     ("cleanup", "Очистка Windows", "кэши · корзина"),
     ("github", "GitHub", "бэкап проектов"),
-    ("bypass", "Bypass", "обход DPI по приложениям"),
+    ("bypass", "Bypass", "обход DPI: глобально и по приложениям"),
 )
 
 HEADERS = {
