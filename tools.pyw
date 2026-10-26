@@ -65,6 +65,7 @@ OK = "#4fd18b"
 WARN = "#f0b429"
 LOG_BG = "#0d0f13"
 LOG_FG = "#c7d0de"
+COPIED_BG = "#143a26"   # кратковременная вспышка «скопировано» в логах
 
 SCALE = 1.0
 
@@ -1078,7 +1079,7 @@ class Panel(ttk.Frame):
                 chunk = text.get("sel.first", "sel.last")
             except tk.TclError:
                 chunk = text.get("1.0", "end-1c")
-            self.copy_text(chunk, label=label)
+            self.copy_text(chunk, label=label, widget=text)
             return "break"
 
         def select_all(_event=None):
@@ -1108,13 +1109,17 @@ class Panel(ttk.Frame):
             chunk = text.get("sel.first", "sel.last")
         except tk.TclError:
             chunk = text.get("1.0", "end-1c")
-        self.copy_text(chunk, label=label)
+        self.copy_text(chunk, label=label, widget=text)
         original = button.cget("text")
         button.configure(text="✅ Скопировано")
         self.after(1800, lambda: button.configure(text=original))
 
-    def copy_text(self, chunk: str, *, label: str = "лог") -> None:
-        """Кладёт текст в буфер обмена и явно показывает результат."""
+    def copy_text(self, chunk: str, *, label: str = "лог", widget=None) -> None:
+        """Кладёт текст в буфер обмена и явно показывает результат.
+
+        При копировании текстовый блок кратко вспыхивает зелёным — видно,
+        что именно скопировалось.
+        """
         if not chunk.strip():
             self.hub.set_status("Копировать нечего — пусто")
             self.hub.toast("Копировать нечего — блок пуст", kind="warn")
@@ -1125,6 +1130,23 @@ class Panel(ttk.Frame):
         lines = chunk.count("\n") + (0 if chunk.endswith("\n") else 1)
         self.hub.set_status(f"📋 скопировано: {lines} строк, {len(chunk)} символов")
         self.hub.toast(f"📋 {label}: скопировано {lines} стр., {len(chunk)} симв.")
+        if widget is not None:
+            self.flash_copied(widget)
+
+    def flash_copied(self, widget) -> None:
+        """Кратковременная зелёная вспышка текстового блока — подтверждение копии."""
+        try:
+            widget.configure(bg=COPIED_BG)
+        except (tk.TclError, AttributeError):
+            return
+        self.after(350, lambda: self._unflash(widget))
+
+    @staticmethod
+    def _unflash(widget) -> None:
+        try:
+            widget.configure(bg=LOG_BG)
+        except (tk.TclError, AttributeError):
+            pass
 
     @staticmethod
     def append_log(text: tk.Text, line: str, tag: str | None = None) -> None:
@@ -2438,6 +2460,47 @@ def run_tool(args: list[str], cwd: str | None = None, timeout: int = 300) -> tup
     return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
 
 
+def send_to_recycle_bin(path: str) -> None:
+    """Удаляет папку/файл в Корзину Windows (FOF_ALLOWUNDO), а не навсегда.
+
+    Если shell32 недоступен, падает с OSError — вызывающий обработает.
+    """
+    if sys.platform != "win32":
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+        return
+
+    class SHFILEOPSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", ctypes.c_void_p),
+            ("wFunc", ctypes.c_uint),
+            ("pFrom", ctypes.c_wchar_p),
+            ("pTo", ctypes.c_wchar_p),
+            ("fFlags", ctypes.c_uint),
+            ("fAnyOperationsAborted", ctypes.c_int),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", ctypes.c_wchar_p),
+        ]
+
+    FO_DELETE = 3
+    FOF_ALLOWUNDO = 0x40
+    FOF_NOCONFIRMATION = 0x10
+    FOF_SILENT = 0x4
+    FOF_NOERRORUI = 0x400
+
+    buffer = ctypes.create_unicode_buffer(os.path.normpath(path) + "\0\0")
+    op = SHFILEOPSTRUCT()
+    op.hwnd = 0
+    op.wFunc = FO_DELETE
+    op.pFrom = ctypes.cast(buffer, ctypes.c_wchar_p)
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if result != 0:
+        raise OSError(f"Не удалось отправить в Корзину (код {result})")
+
+
 def gh_authed() -> bool:
     gh = find_tool("gh")
     if not gh:
@@ -3059,10 +3122,18 @@ class GitHubPanel(Panel):
         self.btn_push_sel.pack(side="left", padx=(px(8), 0))
         self.btn_web = flat_button(actions, "Открыть на GitHub", self.open_web, kind="ghost")
         self.btn_web.pack(side="left", padx=(px(8), 0))
-        self.btn_delete = flat_button(actions, "Удалить с GitHub", self.delete_repo, kind="danger")
-        self.btn_delete.pack(side="left", padx=(px(8), 0))
         self.btn_copy = flat_button(actions, "Скопировать список", self.copy_list, kind="ghost")
         self.btn_copy.pack(side="right")
+
+        actions2 = ttk.Frame(self)
+        actions2.pack(fill="x", pady=(px(6), 0))
+        self.btn_visibility = flat_button(actions2, "Видимость…", self.set_visibility, kind="ghost")
+        self.btn_visibility.pack(side="left")
+        self.btn_delete = flat_button(actions2, "Удалить с GitHub", self.delete_repo, kind="danger")
+        self.btn_delete.pack(side="left", padx=(px(8), 0))
+        self.btn_delete_folder = flat_button(actions2, "Удалить папку", self.delete_folder,
+                                             kind="danger")
+        self.btn_delete_folder.pack(side="left", padx=(px(8), 0))
 
         self.summary_var = tk.StringVar(value="Загружаю список…")
         ttk.Label(self, textvariable=self.summary_var, style="Muted.TLabel").pack(
@@ -3140,6 +3211,17 @@ class GitHubPanel(Panel):
         )
         self.btn_web.configure(state="normal" if repo and not self.busy else "disabled")
         self.btn_delete.configure(state="normal" if repo and not self.busy else "disabled")
+        self.btn_delete_folder.configure(
+            state="normal" if local and not self.busy else "disabled"
+        )
+        vis_state = "normal" if repo and not self.busy else "disabled"
+        self.btn_visibility.configure(state=vis_state)
+        if repo:
+            self.btn_visibility.configure(
+                text="Сделать публичным" if repo.get("private") else "Сделать приватным"
+            )
+        else:
+            self.btn_visibility.configure(text="Видимость…")
 
     def _render(self) -> None:
         query = self.search_var.get().strip().lower()
@@ -3636,6 +3718,85 @@ class GitHubPanel(Panel):
         repo = self._selected_repo()
         if repo and repo.get("url"):
             webbrowser.open(repo["url"])
+
+    # -- смена видимости ---------------------------------------------------- #
+    def set_visibility(self) -> None:
+        repo = self._selected_repo()
+        if not repo or self.busy:
+            return
+        make_public = bool(repo.get("private"))
+        target = "public" if make_public else "private"
+        verb = "публичным" if make_public else "приватным"
+        if not messagebox.askyesno(
+            "Сменить видимость",
+            f"{repo['full']}\n\nСделать репозиторий {verb}?",
+            parent=self,
+        ):
+            return
+        self._start_busy(f"GitHub: делаю {verb}…")
+        gh = find_tool("gh")
+        full = repo["full"]
+
+        def work():
+            rc, out, err = run_tool(
+                [gh, "repo", "edit", full, "--visibility", target], timeout=120
+            )
+            if rc != 0:
+                raise RuntimeError(err or out or "не удалось изменить видимость")
+            return target
+
+        self.hub.run_bg(work, self._visibility_done, self._fail)
+
+    def _visibility_done(self, target: str) -> None:
+        self._finish()
+        if target == "public":
+            self.append_log(self.log_box, "🔓 репозиторий стал публичным", "ok")
+            self.hub.set_status("GitHub: публичный")
+        else:
+            self.append_log(self.log_box, "🔒 репозиторий стал приватным", "ok")
+            self.hub.set_status("GitHub: приватный")
+        self.refresh()
+
+    # -- удаление локальной папки ------------------------------------------ #
+    def delete_folder(self) -> None:
+        row = self._selected_row()
+        folder = self._local_for(row)
+        if not folder or self.busy:
+            return
+        if not Path(folder).exists():
+            messagebox.showerror("GitHub", f"Папка уже отсутствует:\n{folder}", parent=self)
+            return
+        repo = row.get("repo")
+        extra = (
+            f"\nСвязанный репозиторий на GitHub: {repo['full']} (не удаляется)."
+            if repo else
+            "\nСвязанного репозитория на GitHub нет."
+        )
+        if not messagebox.askyesno(
+            "Удалить папку?",
+            f"Папка будет отправлена в Корзину Windows (можно восстановить):\n"
+            f"{folder}{extra}\n\n"
+            "Она исчезнет с диска, но останется в Корзине.",
+            parent=self,
+        ):
+            return
+        self._start_busy("GitHub: удаляю папку…")
+        target = folder
+
+        def work():
+            send_to_recycle_bin(target)
+            return target
+
+        self.hub.run_bg(work, self._delete_folder_done, self._fail)
+
+    def _delete_folder_done(self, folder: str) -> None:
+        self._finish()
+        self.local_items = [it for it in self.local_items if it["path"] != folder]
+        self.local_only = [it for it in self.local_only if it["path"] != folder]
+        self.matches = {k: v for k, v in self.matches.items() if v != folder}
+        self.append_log(self.log_box, f"🗑 папка в Корзине: {folder}", "ok")
+        self.hub.set_status("GitHub: папка удалена (Корзина)")
+        self._render()
 
 
 # --------------------------------------------------------------------------- #
