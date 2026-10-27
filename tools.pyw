@@ -3328,7 +3328,15 @@ def bypass_gbd_start() -> dict:
     pids = _image_pids("goodbyedpi.exe")
     if my_pid and my_pid in pids:
         return {"ok": True, "detail": f"GoodbyeDPI уже запущен (PID {my_pid})"}
+    if pids:
+        track["gbd"] = {"pid": pids[0], "started": time.time()}
+        _track_save(track)
+        return {"ok": True, "detail": f"GoodbyeDPI уже запущен (PID {pids[0]})"}
     log_path = BYPASS_DIR / "goodbyedpi.log"
+    try:
+        log_path.unlink()  # старый лог не должен путать диагностику
+    except FileNotFoundError:
+        pass
     exe = str(BYPASS_GBD_EXE)
     args = cfg["gbd_args"]
     if bypass_admin():
@@ -3342,26 +3350,35 @@ def bypass_gbd_start() -> dict:
         )
         handle.close()
     else:
-        # запуск от администратора; вывод — в лог, чтобы видеть причину падения
-        inner = f'"{exe}" {args} > "{log_path}" 2>&1'
-        code = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", "cmd.exe", f"/c {inner}", str(BYPASS_GBD_DIR), 0,
-        )
+        # GoodbyeDPI требует админ-прав: поднимаем cmd через UAC, вывод — в лог.
+        # Важно: cmd /s /c ""exe" args > "log" 2>&1" — без внешних кавычек cmd
+        # не выполняет перенаправление и лог не создаётся.
+        inner = f'""{exe}" {args} > "{log_path}" 2>&1"'
+        code = int(ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "cmd.exe", f"/s /c {inner}", str(BYPASS_GBD_DIR), 0,
+        ))
         if code <= 32:
             raise RuntimeError(
-                "UAC отклонён или закрыт — GoodbyeDPI требует прав администратора. "
-                "Нажмите ещё раз и подтвердите окно."
+                "GoodbyeDPI не запущен: окно UAC закрыто или отклонено.\n"
+                "Нажмите «Включить» ещё раз и подтвердите запрос прав администратора."
             )
-    for _ in range(20):  # ~4 сек ждём признаков жизни
-        time.sleep(0.2)
+    for _ in range(30):  # до ~15 сек: UAC + загрузка драйвера WinDivert
+        time.sleep(0.5)
         alive = _image_pids("goodbyedpi.exe")
         if alive:
             track["gbd"] = {"pid": alive[0], "started": time.time()}
             _track_save(track)
-            return {"ok": True, "detail": f"GoodbyeDPI запущен (PID {alive[0]})"}
+            detail = f"GoodbyeDPI запущен (PID {alive[0]})"
+            if not bypass_admin():
+                detail += " · чтобы убрать окна UAC, нажмите «Перезапустить как админ»"
+            return {"ok": True, "detail": detail}
     tail = _tail(log_path)
+    if tail:
+        raise RuntimeError("goodbyedpi.exe не запускается:\n" + tail)
     raise RuntimeError(
-        "goodbyedpi.exe не запускается:\n" + (tail or "вывода нет — проверьте лог UAC")
+        "goodbyedpi.exe не запустился, лог пуст — скорее всего окно UAC было "
+        "закрыто без подтверждения.\nНажмите «Включить» ещё раз и выберите «Да». "
+        "Либо перезапустите тулзу кнопкой «Перезапустить как админ»."
     )
 
 
