@@ -2398,19 +2398,33 @@ class CleanupPanel(Panel):
 GITHUB_DEFAULT_ROOT = str(Path.home())
 
 # --------------------------------------------------------------------------- #
-#  Bypass: встроенный движок (GoodbyeDPI + ProxiFyre)
+#  Bypass: встроенный движок (GoodbyeDPI + запуск Happ)
 # --------------------------------------------------------------------------- #
 BYPASS_DIR = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / "Tools" / "bypass"
 BYPASS_GBD_DIR = BYPASS_DIR / "goodbyedpi"
-BYPASS_PFR_DIR = BYPASS_DIR / "proxifyre"
 BYPASS_GBD_EXE = BYPASS_GBD_DIR / "goodbyedpi.exe"
-BYPASS_PFR_EXE = BYPASS_PFR_DIR / "ProxiFyre.exe"
 # файлы внутри exe — PowerShell-скрипты для скачки (urllib у GitHub ругается на rate-limit реже)
 BYPASS_GBD_REPO = "ValdikSS/GoodbyeDPI"
-BYPASS_PFR_REPO = "wiresock/proxifyre"
 BYPASS_GBD_ASSET = r"goodbyedpi-\d[\w.]*\.zip"
-BYPASS_PFR_ASSET = r"ProxiFyre-v\d[\w.]*-x64\.zip"
-BYPASS_DEFAULT_ENDPOINT = "socks5://127.0.0.1:1080"
+
+
+def _find_happ() -> Path:
+    """Самостоятельно ищет установленный Happ."""
+    for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        candidate = Path(base) / "FlyFrogLLC" / "Happ" / "Happ.exe"
+        if candidate.exists():
+            return candidate
+    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    try:
+        for item in pf.glob("*/Happ/Happ.exe"):
+            return item
+    except Exception:  # noqa: BLE001
+        pass
+    return pf / "FlyFrogLLC" / "Happ" / "Happ.exe"
+
+
+BYPASS_HAPP_DEFAULT = str(_find_happ())
 
 GITHUB_IGNORE_BLOCK = """\
 # --- добавлено «Мои инструменты» ---
@@ -2762,10 +2776,15 @@ def scan_local_repos(roots, max_depth: int = 4) -> list[dict]:
         except OSError:
             has_git = False
         if has_git:
+            try:
+                status = local_repo_status(str(folder))
+            except Exception:  # noqa: BLE001  — падение git не должно рушить скан
+                status = None
             found.append({
                 "path": str(folder),
                 "name": folder.name,
                 "remote": repo_name_from_url(git_remote_url(str(folder))),
+                "status": status,
             })
         if depth >= max_depth:
             continue
@@ -2783,6 +2802,34 @@ def scan_local_repos(roots, max_depth: int = 4) -> list[dict]:
             except OSError:
                 continue
     return found
+
+
+def local_repo_status(folder: str) -> dict | None:
+    """Статус git-папки: грязные файлы, ahead/behind, привязана ли ветка."""
+    git = find_tool("git")
+    if not git:
+        return None
+    rc, out, _err = run_tool([git, "status", "--porcelain", "-b"], cwd=folder, timeout=120)
+    if rc != 0:
+        return None
+    lines = out.splitlines()
+    if not lines:
+        return {"dirty": False, "ahead": 0, "behind": 0, "upstream": False, "branch": ""}
+    head = lines[0]
+    dirty = any(ln.strip() for ln in lines[1:])
+    ahead = behind = 0
+    upstream = "..." in head
+    m = re.search(r"ahead (\d+)", head)
+    if m:
+        ahead = int(m.group(1))
+    m = re.search(r"behind (\d+)", head)
+    if m:
+        behind = int(m.group(1))
+    branch = ""
+    if head.startswith("## "):
+        branch = head[3:].split("...")[0].strip()
+    return {"dirty": dirty, "ahead": ahead, "behind": behind, "upstream": upstream,
+            "branch": branch}
 
 
 _TRANSLIT = {
@@ -3051,14 +3098,14 @@ def http_json(url: str, payload: dict | None = None, timeout: float = 3.0):
 # --------------------------------------------------------------------------- #
 def bypass_cfg() -> dict:
     base = config_read().get("bypass") or {}
-    apps = base.get("apps") or []
-    endpoint = str(base.get("endpoint") or BYPASS_DEFAULT_ENDPOINT).strip()
-    if not endpoint:
-        endpoint = BYPASS_DEFAULT_ENDPOINT
+    mode = str(base.get("mode") or "happ").strip().lower()
+    if mode not in ("happ", "gbd"):
+        mode = "happ"
+    happ_path = str(base.get("happ_path") or "").strip() or str(BYPASS_HAPP_DEFAULT)
     return {
-        "endpoint": endpoint,
-        "apps": [a.strip() for a in apps if str(a).strip()],
-        "gbd_args": str(base.get("gbd_args") or "-5").strip(),
+        "gbd_args": str(base.get("gbd_args") or "-5").strip() or "-5",
+        "mode": mode,
+        "happ_path": happ_path,
     }
 
 
@@ -3073,76 +3120,245 @@ def bypass_admin() -> bool:
         return False
 
 
-def _image_pid(image: str) -> int:
-    """PID процесса по имени образа (tasklist), 0 — не найден."""
+BYPASS_STATE_FILE = BYPASS_DIR / "state.json"
+
+
+def _bypass_track() -> dict:
+    try:
+        data = json.loads(BYPASS_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _track_save(data: dict) -> None:
+    BYPASS_DIR.mkdir(parents=True, exist_ok=True)
+    BYPASS_STATE_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+
+def _image_pids(image: str) -> list[int]:
     try:
         rc, out, _ = run_tool(
             ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"], timeout=30,
         )
     except Exception:  # noqa: BLE001
-        return 0
+        return []
     if rc != 0 or not out or "INFO:" in out.upper():
-        return 0
+        return []
+    pids: list[int] = []
+    for line in out.splitlines():
+        if '"' not in line:
+            continue
+        fields = line.strip().split('","')
+        if len(fields) >= 2:
+            try:
+                pids.append(int(fields[1]))
+            except ValueError:
+                continue
+    return pids
+
+
+def _pid_alive(pid: int) -> bool:
     try:
-        return int(out.splitlines()[0].split(",")[1].strip().strip('"'))
-    except (ValueError, IndexError):
-        return 0
+        rc, out, _ = run_tool(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], timeout=30,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return rc == 0 and bool(out) and "INFO:" not in out.upper()
 
 
-def _elevate(exe: str, params: str = "", cwd: str = "") -> bool:
-    """Запуск с запросом прав администратора (UAC). True — UAC пройден."""
-    code = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, cwd or None, 0)
-    return code > 32
+def _tail(path: Path, limit: int = 400) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()[-limit:]
+    except Exception:  # noqa: BLE001
+        return ""
 
 
-def _elevate_kill(image: str) -> None:
-    # taskkill может быть отказан без прав — поднимаем его же через UAC
-    ok = _elevate("taskkill.exe", f"/F /IM {image}")
-    if ok:
-        time.sleep(1.0)
-        if _image_pid(image):
-            raise RuntimeError(f"{image} не удалось остановить")
-    else:
-        raise RuntimeError(f"{image} запущен от администратора — UAC отклонён")
-
-
-def bypass_status(_: object = None) -> dict:
+def bypass_status(_timeout: float = 1.5) -> dict:
     cfg = bypass_cfg()
-    pfr_on = _image_pid("ProxiFyre.exe")
-    gbd_on = _image_pid("goodbyedpi.exe")
-    return {
-        "admin": bypass_admin(),
-        "endpoint": cfg["endpoint"],
-        "apps": cfg["apps"],
-        "happ": {
-            "on": pfr_on > 0,
-            "installed": BYPASS_PFR_EXE.exists(),
-        },
-        "gbd": {
-            "on": gbd_on > 0,
-            "installed": BYPASS_GBD_EXE.exists(),
-            "args": cfg["gbd_args"],
-        },
-    }
+    track = _bypass_track()
+    result: dict = {"admin": bypass_admin()}
+    for key, image, exe in (
+        ("happ", Path(cfg["happ_path"]).name, Path(cfg["happ_path"])),
+        ("gbd", "goodbyedpi.exe", BYPASS_GBD_EXE),
+    ):
+        pids = _image_pids(image)
+        entry = track.get(key) if isinstance(track.get(key), dict) else {}
+        my_pid = int(entry.get("pid") or 0)
+        if my_pid and my_pid not in pids:  # наш процесс уже умер
+            track.pop(key, None)
+            _track_save(track)
+        result[key] = {
+            "on": bool(pids),
+            "mine": bool(my_pid and my_pid in pids),
+            "installed": exe.exists(),
+        }
+        if key == "gbd":
+            result[key]["args"] = cfg["gbd_args"]
+        if pids:
+            result[key]["pids"] = pids
+    result["track"] = {}
+    return result
+
+
+def bypass_gbd_start() -> dict:
+    if not BYPASS_GBD_EXE.exists():
+        raise RuntimeError("GoodbyeDPI не скачан — кнопка «Скачать GoodbyeDPI»")
+    cfg = bypass_cfg()
+    track = _bypass_track()
+    entry = track.get("gbd") if isinstance(track.get("gbd"), dict) else {}
+    my_pid = int(entry.get("pid") or 0)
+    pids = _image_pids("goodbyedpi.exe")
+    if my_pid and my_pid in pids:
+        return {"ok": True, "detail": f"GoodbyeDPI уже запущен (PID {my_pid})"}
+    log_path = BYPASS_DIR / "goodbyedpi.log"
+    exe = str(BYPASS_GBD_EXE)
+    args = cfg["gbd_args"]
+    if bypass_admin():
+        handle = open(log_path, "w", encoding="utf-8", errors="replace")
+        subprocess.Popen(
+            [exe, *args.split()],
+            cwd=str(BYPASS_GBD_DIR),
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            creationflags=NO_WINDOW,
+        )
+        handle.close()
+    else:
+        # запуск от администратора; вывод — в лог, чтобы видеть причину падения
+        inner = f'"{exe}" {args} > "{log_path}" 2>&1'
+        code = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "cmd.exe", f"/c {inner}", str(BYPASS_GBD_DIR), 0,
+        )
+        if code <= 32:
+            raise RuntimeError(
+                "UAC отклонён или закрыт — GoodbyeDPI требует прав администратора. "
+                "Нажмите ещё раз и подтвердите окно."
+            )
+    for _ in range(20):  # ~4 сек ждём признаков жизни
+        time.sleep(0.2)
+        alive = _image_pids("goodbyedpi.exe")
+        if alive:
+            track["gbd"] = {"pid": alive[0], "started": time.time()}
+            _track_save(track)
+            return {"ok": True, "detail": f"GoodbyeDPI запущен (PID {alive[0]})"}
+    tail = _tail(log_path)
+    raise RuntimeError(
+        "goodbyedpi.exe не запускается:\n" + (tail or "вывода нет — проверьте лог UAC")
+    )
+
+
+def bypass_stop(key: str) -> dict:
+    if key == "gbd":
+        image, label, extra_images = "goodbyedpi.exe", "GoodbyeDPI", []
+    else:
+        image, label, extra_images = "Happ.exe", "Happ", ["happd.exe"]
+    track = _bypass_track()
+    entry = track.get(key) if isinstance(track.get(key), dict) else {}
+    my_pid = int(entry.get("pid") or 0)
+    pids = _image_pids(image)
+    extras_alive = any(_image_pids(name) for name in extra_images)
+    if not pids and not extras_alive and not (my_pid and _pid_alive(my_pid)):
+        if my_pid:
+            track.pop(key, None)
+            _track_save(track)
+        return {"ok": True, "detail": f"{label} и так не был запущен"}
+    targets = [image, *extra_images]
+    run_tool(["taskkill", "/F", "/IM", image], timeout=30)
+    for name in extra_images:
+        run_tool(["taskkill", "/F", "/IM", name], timeout=30)
+    for _ in range(10):
+        time.sleep(0.2)
+        if not any(_image_pids(name) for name in targets):
+            break
+    if any(_image_pids(name) for name in targets):
+        # скорее всего процесс от администратора — taskkill ещё раз через UAC
+        arguments = " ".join(f"/IM {name}" for name in targets)
+        code = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "taskkill.exe", f"/F {arguments}", None, 0,
+        )
+        if code <= 32:
+            raise RuntimeError(
+                f"{label} запущен от администратора — появится окно UAC, "
+                "подтвердите его, чтобы остановить."
+            )
+        for _ in range(20):
+            time.sleep(0.5)
+            if not any(_image_pids(name) for name in targets):
+                break
+        else:
+            raise RuntimeError(
+                f"{label} всё ещё запущен (UAC отклонён?). Закройте его вручную."
+            )
+    track.pop(key, None)
+    _track_save(track)
+    return {"ok": True, "detail": f"{label} остановлен"}
+
+
+def bypass_happ_start() -> dict:
+    cfg = bypass_cfg()
+    exe = Path(cfg["happ_path"])
+    if not exe.exists():
+        raise RuntimeError(
+            f"Happ не найден: {exe}\nУкажите путь в «Путь Happ…»."
+        )
+    track = _bypass_track()
+    entry = track.get("happ") if isinstance(track.get("happ"), dict) else {}
+    my_pid = int(entry.get("pid") or 0)
+    pids = _image_pids(exe.name)
+    if my_pid and my_pid in pids:
+        return {"ok": True, "detail": f"Happ уже запущен (PID {my_pid})"}
+    subprocess.Popen([str(exe)], cwd=str(exe.parent))
+    for _ in range(15):  # до 3 сек — GUI должен появиться
+        time.sleep(0.2)
+        alive = _image_pids(exe.name)
+        if alive:
+            track["happ"] = {"pid": alive[0], "started": time.time()}
+            _track_save(track)
+            return {"ok": True, "detail": f"Happ запущен (PID {alive[0]}) — подключитесь в нем"}
+    raise RuntimeError("Happ не запустился — проверьте путь")
+
+
+def bypass_apply_mode(mode: str) -> dict:
+    """Включить выбранный режим, автоматически выключив противоположный."""
+    if mode not in ("happ", "gbd"):
+        raise RuntimeError(f"неизвестный режим {mode!r}")
+    notes = []
+    other = "gbd" if mode == "happ" else "happ"
+    track = _bypass_track()
+    entry = track.get(other) if isinstance(track.get(other), dict) else {}
+    other_pid = int(entry.get("pid") or 0)
+    other_image = "goodbyedpi.exe" if other == "gbd" else Path(bypass_cfg()["happ_path"]).name
+    if _image_pids(other_image) and (not other_pid or _pid_alive(other_pid)):
+        notes.append(bypass_stop(other).get("detail") or "")
+    if mode == "gbd":
+        notes.append(bypass_gbd_start().get("detail") or "")
+    else:
+        notes.append(bypass_happ_start().get("detail") or "")
+    return {"ok": True, "detail": "\n".join(filter(None, notes))}
 
 
 def bypass_download(kind: str) -> dict:
-    """Скачивает и распаковывает GoodbyeDPI или ProxiFyre в %LOCALAPPDATA%."""
-    if kind == "gbd":
-        repo, pattern, target = BYPASS_GBD_REPO, BYPASS_GBD_ASSET, BYPASS_GBD_DIR
-    else:
-        repo, pattern, target = BYPASS_PFR_REPO, BYPASS_PFR_ASSET, BYPASS_PFR_DIR
+    """Скачивает и распаковывает GoodbyeDPI в %LOCALAPPDATA%\\Tools\\bypass."""
+    if kind != "gbd":
+        raise RuntimeError(f"неизвестный компонент {kind!r}")
     dl_dir = BYPASS_DIR / "downloads"
     dl_dir.mkdir(parents=True, exist_ok=True)
-    target.mkdir(parents=True, exist_ok=True)
-    zip_path = dl_dir / f"{kind}.zip"
+    BYPASS_GBD_DIR.mkdir(parents=True, exist_ok=True)
+    zip_path = dl_dir / "gbd.zip"
 
     script = "\n".join([
         "$ProgressPreference = 'SilentlyContinue'",
         "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",
-        f"$api = 'https://api.github.com/repos/{repo}/releases/latest'",
+        f"$api = 'https://api.github.com/repos/{BYPASS_GBD_REPO}/releases/latest'",
         "$rel = Invoke-RestMethod $api",
-        f"$asset = $rel.assets | Where-Object {{ $_.name -match '{pattern}' }} | Select-Object -First 1",
+        f"$asset = $rel.assets | Where-Object {{ $_.name -match '{BYPASS_GBD_ASSET}' }} "
+        "| Select-Object -First 1",
         "if (-not $asset) { throw 'подходящий архив не найден в релизе' }",
         f"Invoke-WebRequest $asset.browser_download_url -OutFile '{zip_path}' -UseBasicParsing",
         "Write-Output $asset.name",
@@ -3151,117 +3367,24 @@ def bypass_download(kind: str) -> dict:
     if not zip_path.exists() or zip_path.stat().st_size == 0:
         raise RuntimeError("архив не скачался")
 
-    tmp = dl_dir / f"{kind}-unzip"
+    tmp = dl_dir / "gbd-unzip"
     if tmp.exists():
         shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(zip_path) as archive:
         archive.extractall(tmp)
-
-    # exe ищем рекурсивно (в архиве бывает вложенная папка)
-    exe_name = "goodbyedpi.exe" if kind == "gbd" else "ProxiFyre.exe"
-    found = list(tmp.rglob(exe_name))
+    found = list(tmp.rglob("goodbyedpi.exe"))
     if not found:
-        raise RuntimeError(f"в архиве нет {exe_name}")
+        raise RuntimeError("в архиве нет goodbyedpi.exe")
     exe_dir = found[0].parent
     for item in exe_dir.iterdir():
         if item.is_dir():
-            shutil.copytree(item, target / item.name, dirs_exist_ok=True)
+            shutil.copytree(item, BYPASS_GBD_DIR / item.name, dirs_exist_ok=True)
         else:
-            shutil.copy2(item, target / item.name)
+            shutil.copy2(item, BYPASS_GBD_DIR / item.name)
     shutil.rmtree(tmp, ignore_errors=True)
-    if not (target / exe_name).exists():
-        raise RuntimeError("файлы не распакованы")
-    return {"ok": True, "detail": f"Скачан {name.strip() or kind}"}
-
-
-def bypass_gbd_start() -> dict:
     if not BYPASS_GBD_EXE.exists():
-        raise RuntimeError("GoodbyeDPI не скачан — нажмите «Скачать GoodbyeDPI»")
-    if _image_pid("goodbyedpi.exe"):
-        return {"ok": True, "detail": "DPI уже запущен"}
-    exe = str(BYPASS_GBD_EXE)
-    params = f'"{exe}" {bypass_cfg()["gbd_args"]}'
-    if bypass_admin():
-        subprocess.Popen([exe, *bypass_cfg()["gbd_args"].split()], cwd=str(BYPASS_GBD_DIR),
-                         creationflags=NO_WINDOW)
-    elif not _elevate(exe, bypass_cfg()["gbd_args"], str(BYPASS_GBD_DIR)):
-        raise RuntimeError("UAC отклонён — без прав администратора DPI не запустить")
-    time.sleep(2.0)
-    if not _image_pid("goodbyedpi.exe"):
-        raise RuntimeError("goodbyedpi.exe не запустился (галочку в UAC, драйвер WinDivert?)")
-    return {"ok": True, "detail": "GoodbyeDPI запущен (админ)"}
-
-
-def bypass_gbd_stop() -> dict:
-    if not _image_pid("goodbyedpi.exe"):
-        return {"ok": True, "detail": "DPI и так был остановлен"}
-    rc, _out, _err = run_tool(["taskkill", "/F", "/IM", "goodbyedpi.exe"], timeout=30)
-    if rc != 0 or _image_pid("goodbyedpi.exe"):
-        _elevate_kill("goodbyedpi.exe")
-    return {"ok": True, "detail": "GoodbyeDPI остановлен"}
-
-
-def bypass_processes() -> dict:
-    """Список запущенных программ (имена .exe, уникальные, отсортированные)."""
-    out = ps_run(
-        "(Get-Process | Where-Object { $_.Path } | ForEach-Object { Split-Path -Leaf $_.Path } "
-        "| Sort-Object -Unique) -join ';'",
-        timeout=60,
-    )
-    names = sorted({p.strip() for p in out.split(";") if p.strip()})
-    return {"ok": True, "processes": names}
-
-
-def bypass_write_app_config(cfg: dict) -> None:
-    endpoint = cfg["endpoint"]
-    # "socks5://host:port" → "host:port"
-    for prefix in ("socks5://", "socks://"):
-        if endpoint.lower().startswith(prefix):
-            endpoint = endpoint[len(prefix):]
-            break
-    payload = {
-        "logLevel": "Info",
-        "bypassLan": True,
-        "proxies": [{
-            "appNames": cfg["apps"],
-            "socks5ProxyEndpoint": endpoint,
-            "supportedProtocols": ["TCP"] if not cfg.get("udp", True) else ["TCP", "UDP"],
-        }],
-    }
-    (BYPASS_PFR_DIR / "app-config.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
-    )
-
-
-def bypass_apps_start() -> dict:
-    if not BYPASS_PFR_EXE.exists():
-        raise RuntimeError("ProxiFyre не скачан — нажмите «Скачать ProxiFyre»")
-    cfg = bypass_cfg()
-    if not cfg["apps"]:
-        raise RuntimeError("Приложения не выбраны — «Настроить» → список exe")
-    if _image_pid("ProxiFyre.exe"):
-        # перезагружаем настройки
-        run_tool(["taskkill", "/F", "/IM", "ProxiFyre.exe"], timeout=30)
-        time.sleep(1.0)
-    bypass_write_app_config(cfg)
-    exe = str(BYPASS_PFR_EXE)
-    if bypass_admin():
-        subprocess.Popen([exe], cwd=str(BYPASS_PFR_DIR), creationflags=NO_WINDOW)
-    elif not _elevate(exe, "", str(BYPASS_PFR_DIR)):
-        raise RuntimeError("UAC отклонён — без прав администратора ProxiFyre не работает")
-    time.sleep(2.0)
-    if not _image_pid("ProxiFyre.exe"):
-        raise RuntimeError("ProxiFyre не запустился (нужен драйвер Windows Packet Filter)")
-    return {"ok": True, "detail": f"ProxiFyre запущен: {', '.join(cfg['apps'])}"}
-
-
-def bypass_apps_stop() -> dict:
-    if not _image_pid("ProxiFyre.exe"):
-        return {"ok": True, "detail": "ProxiFyre и так не был запущен"}
-    rc, _out, _err = run_tool(["taskkill", "/F", "/IM", "ProxiFyre.exe"], timeout=30)
-    if rc != 0 or _image_pid("ProxiFyre.exe"):
-        _elevate_kill("ProxiFyre.exe")
-    return {"ok": True, "detail": "ProxiFyre остановлен"}
+        raise RuntimeError("файлы не распакованы")
+    return {"ok": True, "detail": f"Скачан {name.strip() or 'GoodbyeDPI'}"}
 
 
 def listening_pid(port: int) -> int:
@@ -3295,6 +3418,7 @@ class GitHubPanel(Panel):
         self.local_items: list[dict] = []
         self.matches: dict[str, str] = {}
         self.local_only: list[dict] = []
+        self.status_by_path: dict[str, dict] = {}
         self.rows: dict[str, dict] = {}
         self.scan_roots: list[str] = []
         self.login = ""
@@ -3310,6 +3434,8 @@ class GitHubPanel(Panel):
         self.btn_refresh.pack(side="left")
         self.btn_all = flat_button(top, "Загрузить всё", self.update_all, kind="ghost")
         self.btn_all.pack(side="left", padx=(px(8), 0))
+        self.btn_upd_all = flat_button(top, "Обновить всё", self.update_needed, kind="ghost")
+        self.btn_upd_all.pack(side="left", padx=(px(8), 0))
         self.btn_push = flat_button(top, "Залить папку…", self.push_folder)
         self.btn_push.pack(side="right")
         self.login_var = tk.StringVar(value="")
@@ -3344,23 +3470,31 @@ class GitHubPanel(Panel):
         self.only_diff_var = tk.BooleanVar(value=False)
         dark_check(search_row, "только расхождения", self.only_diff_var,
                    bg=BG, command=self._render).pack(side="left")
+        self.only_upd_var = tk.BooleanVar(value=False)
+        dark_check(search_row, "только можно обновить", self.only_upd_var,
+                   bg=BG, command=self._render).pack(side="left", padx=(px(12), 0))
 
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill="both", expand=True)
-        columns = ("name", "access", "state", "local")
+        columns = ("name", "access", "state", "local", "update")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=10,
                                  selectmode="browse")
         self.tree.heading("name", text="Репозиторий")
         self.tree.heading("access", text="Доступ")
         self.tree.heading("state", text="Где есть")
         self.tree.heading("local", text="Папка на ПК")
+        self.tree.heading("update", text="Обновление")
         self.tree.column("name", width=px(190), anchor="w")
         self.tree.column("access", width=px(90), anchor="center", stretch=False)
         self.tree.column("state", width=px(150), anchor="w", stretch=False)
-        self.tree.column("local", width=px(420), anchor="w", stretch=False)
+        self.tree.column("local", width=px(400), anchor="w", stretch=False)
+        self.tree.column("update", width=px(150), anchor="w", stretch=False)
         self.tree.tag_configure("both", foreground=FG)
         self.tree.tag_configure("gh_only", foreground=WARN)
         self.tree.tag_configure("local_only", foreground=ACCENT)
+        self.tree.tag_configure("can_upd", foreground=OK)
+        self.tree.tag_configure("behind", foreground=WARN)
+        self.tree.tag_configure("mut", foreground=MUTED)
         scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -3451,6 +3585,19 @@ class GitHubPanel(Panel):
         except (ValueError, OSError):
             return local
 
+    def _folder_state(self, local: str) -> tuple[str, bool]:
+        """(текст статуса, можно ли обновить) для локальной git-папки."""
+        st = self.status_by_path.get(local)
+        if not st:
+            return ("—", False)
+        if not st.get("upstream"):
+            return ("не привязан к ветке", False)
+        if st.get("ahead", 0) > 0 or st.get("dirty"):
+            return ("можно обновить", True)
+        if st.get("behind", 0) > 0:
+            return ("отстаёт от GitHub", False)
+        return ("актуально", False)
+
     def _update_actions(self) -> None:
         row = self._selected_row()
         repo = row["repo"] if row else None
@@ -3460,6 +3607,7 @@ class GitHubPanel(Panel):
         self.btn_push.configure(state=state)
         self.btn_login.configure(state=state)
         self.btn_all.configure(state=state if self.repos else "disabled")
+        self.btn_upd_all.configure(state=state if (self.repos or self.local_items) else "disabled")
         self.btn_copy.configure(state="normal" if self.rows and not self.busy else "disabled")
         self.btn_open.configure(state="normal" if local and not self.busy else "disabled")
         self.btn_push_sel.configure(state="normal" if local and not self.busy else "disabled")
@@ -3483,6 +3631,7 @@ class GitHubPanel(Panel):
     def _render(self) -> None:
         query = self.search_var.get().strip().lower()
         only_diff = bool(self.only_diff_var.get())
+        only_upd = bool(self.only_upd_var.get())
         previous = self.tree.selection()
         previous_iid = previous[0] if previous else ""
         self.tree.delete(*self.tree.get_children())
@@ -3490,6 +3639,10 @@ class GitHubPanel(Panel):
 
         matched = sum(1 for repo in self.repos if repo["full"] in self.matches)
         gh_only = len(self.repos) - matched
+        upd_count = sum(
+            1 for repo in self.repos
+            if self.matches.get(repo["full"], "") and self._folder_state(self.matches[repo["full"]])[1]
+        ) + len(self.local_only)
         shown = 0
 
         for repo in self.repos:
@@ -3497,10 +3650,15 @@ class GitHubPanel(Panel):
             haystack = f"{repo['name']} {repo['full']} {local}".lower()
             if query and query not in haystack:
                 continue
+            state, can_update = self._folder_state(local) if local else ("—", False)
             if only_diff and local:
                 continue
+            if only_upd and not can_update:
+                continue
             iid = repo["full"]
-            tag = "both" if local else "gh_only"
+            tag = "gh_only" if not local else (
+                "can_upd" if can_update else ("behind" if state == "отстаёт от GitHub" else "mut")
+            )
             self.tree.insert(
                 "", "end", iid=iid, tags=(tag,),
                 values=(
@@ -3508,6 +3666,7 @@ class GitHubPanel(Panel):
                     "приватный" if repo["private"] else "публичный",
                     "● на ПК" if local else "○ только на GitHub",
                     self._display_path(local),
+                    state if local else "—",
                 ),
             )
             self.rows[iid] = {"iid": iid, "repo": repo, "local": local}
@@ -3520,7 +3679,10 @@ class GitHubPanel(Panel):
             iid = "local::" + item["path"]
             self.tree.insert(
                 "", "end", iid=iid, tags=("local_only",),
-                values=(item["name"], "—", "◆ только на ПК", self._display_path(item["path"])),
+                values=(
+                    item["name"], "—", "◆ только на ПК",
+                    self._display_path(item["path"]), "новая — залить",
+                ),
             )
             self.rows[iid] = {"iid": iid, "repo": None, "local": item["path"]}
             shown += 1
@@ -3529,16 +3691,17 @@ class GitHubPanel(Panel):
             self.tree.selection_set(previous_iid)
         summary = (
             f"На GitHub: {len(self.repos)} · есть на ПК: {matched} · "
-            f"только на GitHub: {gh_only} · папок без GitHub: {len(self.local_only)}"
+            f"только на GitHub: {gh_only} · папок без GitHub: {len(self.local_only)} · "
+            f"можно обновить: {upd_count}"
         )
-        if query or only_diff:
+        if query or only_diff or only_upd:
             summary += f" · показано: {shown}"
         self.summary_var.set(summary)
         self._update_actions()
 
     def copy_list(self) -> None:
         """Копирует таблицу текстом: репозиторий, где есть, путь на ПК."""
-        lines = ["Репозиторий\tДоступ\tГде есть\tПапка на ПК"]
+        lines = ["Репозиторий\tДоступ\tГде есть\tПапка на ПК\tОбновление"]
         for iid in self.tree.get_children():
             row = self.rows.get(iid) or {}
             repo = row.get("repo")
@@ -3780,6 +3943,9 @@ class GitHubPanel(Panel):
         self.repos = data.get("repos") or []
         self.local_items = data.get("local") or []
         self.matches, self.local_only = match_local_repos(self.repos, self.local_items)
+        self.status_by_path = {
+            it["path"]: it.get("status") for it in self.local_items if it.get("status")
+        }
         self.login_var.set(f"@{self.login}" if self.login else "")
         self._finish()
         self._render()
@@ -3808,6 +3974,22 @@ class GitHubPanel(Panel):
         if len(self.local_only) > 40:
             self.append_log(self.log_box, f"… ещё {len(self.local_only) - 40} локальных папок")
 
+        need = [
+            (repo["name"], self.matches[repo["full"]], self._folder_state(self.matches[repo["full"]])[0])
+            for repo in self.repos
+            if self.matches.get(repo["full"], "")
+            and self._folder_state(self.matches[repo["full"]])[1]
+        ]
+        need += [(item["name"], item["path"], "новая — залить") for item in self.local_only]
+        if not need:
+            self.append_log(self.log_box, "=== Обновлять нечего: всё актуально ===")
+        else:
+            self.append_log(self.log_box, f"=== Можно обновить: {len(need)} ===")
+            for name, folder, state in need[:40]:
+                self.append_log(self.log_box, f"↑ {state}: {name} → {folder}", "ok")
+            if len(need) > 40:
+                self.append_log(self.log_box, f"… ещё {len(need) - 40} папок к обновлению")
+
     # -- заливка ----------------------------------------------------------- #
     def push_folder(self) -> None:
         if self.busy:
@@ -3824,6 +4006,10 @@ class GitHubPanel(Panel):
         folder = self._local_for(row)
         if not folder or self.busy:
             messagebox.showinfo("GitHub", "У выбранной строки нет папки на ПК.", parent=self)
+            return
+        repo = row["repo"] if row else None
+        if repo:  # репозиторий уже есть — обновляем его, а не пересоздаём
+            self._update_one(folder, repo["name"])
             return
         self._push(folder)
 
@@ -3852,6 +4038,28 @@ class GitHubPanel(Panel):
             self.refresh()
         else:
             self.hub.set_status("GitHub: заливка не удалась")
+
+    # -- обновление одной папки -------------------------------------------- #
+    def _update_one(self, folder: str, name: str) -> None:
+        self._start_busy(f"GitHub: обновляю {name}…")
+        self.append_log(self.log_box, f"=== {name}: коммит и push ===")
+
+        def work():
+            try:
+                return update_local_repo(folder, name, self._log_bg)
+            except Exception as exc:  # noqa: BLE001
+                self._log_bg(f"Ошибка {name}: {exc}")
+                return False
+
+        self.hub.run_bg(work, self._update_done, self._fail)
+
+    def _update_done(self, ok: bool) -> None:
+        self._finish()
+        if ok:
+            self.hub.set_status("GitHub: обновлено")
+            self.refresh()
+        else:
+            self.hub.set_status("GitHub: обновление не удалось")
 
     # -- обновление всех --------------------------------------------------- #
     def update_all(self) -> None:
@@ -3896,6 +4104,73 @@ class GitHubPanel(Panel):
         self.append_log(self.log_box, f"=== Готово: обновлено {updated}, ошибок {failed} ===",
                         "ok" if not failed else "error")
         self.hub.set_status(f"GitHub: обновлено {updated}, ошибок {failed}")
+
+    # -- обновить всё нужное ------------------------------------------------- #
+    def update_needed(self) -> None:
+        """Коммит + push там, где «можно обновить», и заливка новых папок."""
+        if self.busy:
+            return
+        targets = [
+            (self.matches[repo["full"]], repo["name"])
+            for repo in self.repos
+            if self.matches.get(repo["full"], "")
+            and self._folder_state(self.matches[repo["full"]])[1]
+        ]
+        new_items = list(self.local_only)
+        if not targets and not new_items:
+            messagebox.showinfo(
+                "GitHub", "Обновлять нечего: все репозитории актуальны.", parent=self
+            )
+            return
+        if targets:
+            message = f"Сделать коммит и push в {len(targets)} репозиториев?"
+            if new_items:
+                message += (
+                    f"\n\nТакже залить {len(new_items)} папок без GitHub?\n"
+                    "Для каждой будет создан публичный репозиторий."
+                )
+        else:
+            message = (
+                f"Залить на GitHub {len(new_items)} папок?\n"
+                "Для каждой будет создан публичный репозиторий."
+            )
+        if not messagebox.askyesno("Обновить всё", message, parent=self):
+            return
+        self._start_busy(f"GitHub: обновляю {len(targets) + len(new_items)}…")
+        total = len(targets) + len(new_items)
+        self.append_log(
+            self.log_box,
+            f"=== Обновить всё: обновлений {len(targets)}, новых {len(new_items)} ===",
+        )
+
+        def work():
+            updated = 0
+            failed = 0
+            index = 0
+            for folder, name in targets:
+                index += 1
+                self._log_bg(f"[{index}/{total}] {name}")
+                try:
+                    ok = update_local_repo(folder, name, self._log_bg)
+                except Exception as exc:  # noqa: BLE001
+                    self._log_bg(f"Ошибка {name}: {exc}")
+                    ok = False
+                updated += 1 if ok else 0
+                failed += 0 if ok else 1
+            for item in new_items:
+                index += 1
+                name = sanitize_repo_name(Path(item["path"]).name)
+                self._log_bg(f"[{index}/{total}] {name} (новая)")
+                try:
+                    ok = push_folder_to_github(item["path"], name, True, self._log_bg)
+                except Exception as exc:  # noqa: BLE001
+                    self._log_bg(f"Ошибка {name}: {exc}")
+                    ok = False
+                updated += 1 if ok else 0
+                failed += 0 if ok else 1
+            return updated, failed
+
+        self.hub.run_bg(work, self._update_all_done, self._fail)
 
     # -- скачивание / удаление / открытие ---------------------------------- #
     def download(self) -> None:
@@ -4051,100 +4326,156 @@ class GitHubPanel(Panel):
         self.local_items = [it for it in self.local_items if it["path"] != folder]
         self.local_only = [it for it in self.local_only if it["path"] != folder]
         self.matches = {k: v for k, v in self.matches.items() if v != folder}
+        self.status_by_path.pop(folder, None)
         self.append_log(self.log_box, f"🗑 папка в Корзине: {folder}", "ok")
         self.hub.set_status("GitHub: папка удалена (Корзина)")
         self._render()
 
 
 # --------------------------------------------------------------------------- #
-#  Панель: Bypass (встроенный движок)
+#  Панель: Bypass (встроенный движок, режим Happ ↔ GoodbyeDPI)
 # --------------------------------------------------------------------------- #
 class BypassPanel(Panel):
+
+    MODES = ("happ", "gbd")
+
     def __init__(self, master: tk.Misc, hub) -> None:
         super().__init__(master, hub)
-        self.online = False
+        self.selected = str((config_read().get("bypass") or {}).get("mode") or "happ")
+        if self.selected not in self.MODES:
+            self.selected = "happ"
+        self.engines: dict[str, dict] = {}
         self.busy = False
         self.checking = False
-        self.state: dict = {}
         self._offline_noted = False
         self._build()
         self.refresh_now()
         self.after(3000, self._tick)
 
+    # -- интерфейс ------------------------------------------------------------ #
     def _build(self) -> None:
-        engine_row = ttk.Frame(self)
-        engine_row.pack(fill="x")
         ttk.Label(
-            engine_row,
-            text=f"Движок встроен · {BYPASS_DIR}",
-            style="Muted.TLabel",
-        ).pack(side="left")
+            self, text="Что включить?", style="Muted.TLabel",
+        ).pack(anchor="w")
+        grid = tk.Frame(self, bg=BG)
+        grid.pack(fill="x", pady=(px(8), 0))
+        grid.columnconfigure((0, 1), weight=1)
+        grid.rowconfigure(0, weight=1)
 
-        card = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        card.pack(fill="x", pady=(px(12), 0))
-        inner = tk.Frame(card, bg=CARD)
-        inner.pack(fill="x", padx=px(16), pady=px(14))
+        self.mode_cards = {
+            "happ": self._mode_card(
+                grid, 0, "Happ — прокси-клиент",
+                "Открывает Happ: его туннель обслуживает трафик так, как настроено "
+                "в самом Happ. Быстрее включить/выключить, DPI не трогает.",
+            ),
+            "gbd": self._mode_card(
+                grid, 1, "GoodbyeDPI — весь интернет",
+                "Обход DPI для всего трафика сразу (порты 80/443). "
+                "Нужны права администратора, прокси не требуется.",
+            ),
+        }
 
-        self.panel_var = tk.StringVar(value="проверяю…")
-        self.apps_var = tk.StringVar(value="—")
-        self.happ_var = tk.StringVar(value="—")
-        self.gbd_var = tk.StringVar(value="—")
-        for title, variable in (
-            ("Права:", self.panel_var),
-            ("Приложения:", self.apps_var),
-            ("Прокси:", self.happ_var),
-            ("GoodbyeDPI:", self.gbd_var),
-        ):
-            row = tk.Frame(inner, bg=CARD)
-            row.pack(fill="x", pady=(px(6) if title != "Права:" else 0, 0))
-            tk.Label(row, text=title, bg=CARD, fg=MUTED, width=12, anchor="w",
-                     font=("Segoe UI", 9)).pack(side="left")
-            tk.Label(row, textvariable=variable, bg=CARD, fg=FG, anchor="w",
-                     justify="left", wraplength=px(760), font=("Segoe UI", 9)).pack(
-                side="left", fill="x", expand=True
-            )
+        status = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        status.pack(fill="x", pady=(px(12), 0))
+        inner = tk.Frame(status, bg=CARD)
+        inner.pack(fill="x", padx=px(16), pady=px(12))
 
-        controls = ttk.Frame(self)
-        controls.pack(fill="x", pady=(px(14), px(6)))
-        self.btn_apps_on = flat_button(controls, "По приложениям вкл",
-                                       lambda: self.toggle("happ", True))
-        self.btn_apps_on.pack(side="left")
-        self.btn_apps_off = flat_button(controls, "По приложениям выкл",
-                                        lambda: self.toggle("happ", False), kind="ghost")
-        self.btn_apps_off.pack(side="left", padx=(px(8), px(18)))
-        self.btn_gbd_on = flat_button(controls, "DPI вкл", lambda: self.toggle("gbd", True))
-        self.btn_gbd_on.pack(side="left")
-        self.btn_gbd_off = flat_button(controls, "DPI выкл", lambda: self.toggle("gbd", False),
-                                       kind="ghost")
-        self.btn_gbd_off.pack(side="left", padx=(px(8), px(18)))
-        self.btn_refresh = flat_button(controls, "Обновить", self.refresh_now, kind="ghost")
+        self.dot_var = tk.StringVar(value="grey")
+        tk.Label(inner, textvariable=self.dot_var, fg=MUTED, font=("Segoe UI", 10, "bold"),
+                 bg=CARD, width=2).pack(side="left")
+        self.mode_var = tk.StringVar(value="режим: —")
+        tk.Label(inner, textvariable=self.mode_var, fg=FG, font=("Segoe UI", 10, "bold"),
+                 bg=CARD, anchor="w").pack(side="left")
+        self.detail_var = tk.StringVar(value="проверяю…")
+        tk.Label(inner, textvariable=self.detail_var, fg=MUTED, font=("Segoe UI", 9),
+                 bg=CARD, anchor="w", justify="left", wraplength=px(700)).pack(
+            side="left", fill="x", expand=True, padx=(px(14), 0)
+        )
+        self.apps_row = tk.Frame(inner, bg=CARD)
+        self.apps_row.pack(fill="x", pady=(px(8), 0))
+        self.apps_var = tk.StringVar()
+        self.apps_label = tk.Label(self.apps_row, textvariable=self.apps_var, bg=CARD,
+                                   fg=MUTED, font=("Segoe UI", 9), anchor="w",
+                                   justify="left", wraplength=px(600))
+        self.apps_label.pack(side="left", fill="x", expand=True)
+
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", pady=(px(14), px(6)))
+        self.btn_apply = flat_button(actions, "Включить", self.apply_toggle)
+        self.btn_apply.pack(side="left")
+        self.btn_apps = flat_button(
+            actions, "Путь Happ…", self.configure_dialog, kind="ghost",
+        )
+        self.btn_apps.pack(side="left", padx=(px(8), 0))
+        self.btn_refresh = flat_button(actions, "Обновить", self.refresh_now, kind="ghost")
         self.btn_refresh.pack(side="right")
 
         extras = ttk.Frame(self)
         extras.pack(fill="x", pady=(px(4), 0))
-        self.btn_settings = flat_button(extras, "Приложения и прокси…", self.configure_dialog,
-                                        kind="ghost")
-        self.btn_settings.pack(side="left")
         self.btn_dl_gbd = flat_button(extras, "Скачать GoodbyeDPI",
                                       lambda: self.download("gbd"), kind="ghost")
-        self.btn_dl_gbd.pack(side="left", padx=(px(8), 0))
-        self.btn_dl_pfr = flat_button(extras, "Скачать ProxiFyre",
-                                      lambda: self.download("pfr"), kind="ghost")
-        self.btn_dl_pfr.pack(side="left", padx=(px(8), 0))
+        self.btn_dl_gbd.pack(side="left")
 
-        ttk.Label(
-            self,
-            text="GoodbyeDPI — обход DPI для всего интернета (нужны права администратора). "
-                 "«По приложениям» — ProxiFyre: трафик программ, выбранных в "
-                 "«Приложения и прокси…», уходит в SOCKS5-прокси (адрес задаётся там же).",
-            style="Muted.TLabel",
-            wraplength=px(900),
-            justify="left",
-        ).pack(anchor="w", pady=(px(12), 0))
-
-        log_frame, self.log_box = self.make_log(self, height=8)
+        log_frame, self.log_box = self.make_log(self, height=7)
         log_frame.pack(fill="both", expand=True, pady=(px(10), 0))
-        self.append_log(self.log_box, "Проверяю статусы движка…")
+        self.append_log(self.log_box, "Проверяю статусы движков…")
+
+    def _mode_card(self, parent: tk.Misc, column: int, title: str, caption: str) -> dict:
+        card = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1,
+                        cursor="hand2")
+        card.grid(row=0, column=column, sticky="nsew",
+                  padx=(0, px(10) if column == 0 else 0))
+        label = tk.Label(card, text=title, bg=CARD, fg=FG, font=("Segoe UI", 10, "bold"),
+                         anchor="w", cursor="hand2")
+        label.pack(anchor="w", padx=px(14), pady=(px(10), px(2)))
+        caption_label = tk.Label(card, text=caption, bg=CARD, fg=MUTED, font=("Segoe UI", 9),
+                                 anchor="w", justify="left", wraplength=px(260),
+                                 cursor="hand2")
+        caption_label.pack(anchor="w", padx=px(14), pady=(0, px(10)))
+        state_label = tk.Label(card, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 9),
+                               anchor="w", cursor="hand2")
+        state_label.pack(anchor="w", padx=px(14), pady=(0, px(10)))
+        widgets = (card, label, caption_label, state_label)
+        mode = "happ" if column == 0 else "gbd"
+
+        def choose(_event=None) -> None:
+            if not self.busy and self.selected != mode:
+                self.selected = mode
+                self._mode_hint("выбран режим, включит кнопка ниже")
+                self._update_controls()
+            return
+
+        for widget in widgets:
+            widget.bind("<Button-1>", choose)
+        return {"frame": card, "title": label, "caption": caption_label, "state": state_label}
+
+    def _mode_names(self, mode: str) -> str:
+        return "Happ" if mode == "happ" else "GoodbyeDPI"
+
+    def _mode_hint(self, hint: str | None = None) -> None:
+        running_mode, _running_state, _ = self._running_mode()
+        if running_mode is not None:
+            self.mode_var.set(f" работает: {self._mode_names(running_mode)}")
+            if hint:
+                self.detail_var.set(hint)
+            elif running_mode == self.selected:
+                self.detail_var.set(f"{self._mode_names(running_mode)} включён — выключить "
+                                    "кнопкой ниже")
+            else:
+                self.detail_var.set(f"сейчас работает {self._mode_names(running_mode)}, "
+                                    f"«Переключить» заменит его на "
+                                    f"{self._mode_names(self.selected)}")
+            self.dot_var.set("● активен")
+        else:
+            self.mode_var.set(f" выбран: {self._mode_names(self.selected)}")
+            if hint:
+                self.detail_var.set(hint)
+            self.dot_var.set("○ не запущено")
+        show_apps = (running_mode or self.selected) == "happ"
+        if show_apps:
+            self.apps_row.pack(fill="x", pady=(px(6), 0))
+        else:
+            self.apps_row.pack_forget()
 
     # -- статус ------------------------------------------------------------ #
     def _tick(self) -> None:
@@ -4161,252 +4492,217 @@ class BypassPanel(Panel):
         self.checking = True
         self.hub.run_bg(bypass_status, self._state_ok, self._state_off)
 
+    def _running_mode(self) -> tuple[str | None, str, dict]:
+        """(mode, 'on'/'off'/'broken', engine-state) — какой движок реально работает."""
+        happ = (self.state.get("happ") or {}).get("on")
+        gbd = (self.state.get("gbd") or {}).get("on")
+        if happ:
+            return "happ", "on", self.state.get("happ") or {}
+        if gbd:
+            return "gbd", "on", self.state.get("gbd") or {}
+        return None, "off", {}
+
     def _state_ok(self, state: dict) -> None:
         self.checking = False
         self.online = True
         self._offline_noted = False
         self.state = state if isinstance(state, dict) else {}
-        self.panel_var.set(
-            "есть (запущено от администратора)" if self.state.get("admin")
-            else "нет — при включении появится окно UAC"
-        )
-        apps = self.state.get("apps") or []
-        self.apps_var.set(", ".join(apps) if apps else "не выбраны · кнопка «Приложения и прокси…»")
-        cfg = self.state.get("happ") or {}
-        detail = f"{self.state.get('endpoint') or BYPASS_DEFAULT_ENDPOINT} · "
-        detail += "ProxiFyre запущен" if cfg.get("on") else "ProxiFyre остановлен"
-        detail += "" if cfg.get("installed") else " · ProxiFyre не скачан"
-        self.happ_var.set(detail)
-        gbd = self.state.get("gbd") or {}
-        detail = "запущен" if gbd.get("on") else "остановлен"
-        detail += "" if gbd.get("installed") else " · не скачан"
-        if gbd.get("args"):
-            detail += f" · аргументы {gbd['args']}"
-        self.gbd_var.set(detail)
+        self.engines = {
+            "happ": self.state.get("happ") or {},
+            "gbd": self.state.get("gbd") or {},
+        }
+        self.apps_var.set("Happ: " + bypass_cfg()["happ_path"])
+
+        for mode, card in self.mode_cards.items():
+            engine = self.engines.get(mode) or {}
+            installed = bool(engine.get("installed"))
+            on = bool(engine.get("on"))
+            running_mode, _r_state, _r_cfg = self._running_mode()
+            text = "● работает" if on else ("○ готов к запуску" if installed else "— не найден")
+            mark = "нашими средствами" if engine.get("mine") else "не этот экземпляр"
+            if on:
+                pid_text = ""
+                pids = engine.get("pids") or []
+                if pids:
+                    pid_text = f" · PID {', '.join(map(str, pids))}"
+                extra = f" · {mark}{pid_text}"
+                if mode == "gbd" and engine.get("args"):
+                    extra += f" · {engine['args']}"
+                text = f"● работает{extra}"
+            card["state"].configure(
+                text=text, fg=OK if on else (MUTED if installed else WARN),
+            )
+
+        self._mode_hint()
         self._update_controls()
 
     def _state_off(self, exc: Exception) -> None:
         self.checking = False
-        was_online = self.online
         self.online = False
         self.state = {}
-        self.panel_var.set(f"ошибка: {exc}")
-        self.apps_var.set("—")
-        self.happ_var.set("—")
-        self.gbd_var.set("—")
+        self.engines = {}
+        self.mode_var.set(" режим: —")
+        self.detail_var.set(f"ошибка: {exc}")
+        self.dot_var.set("○ —")
+        self.apps_var.set("")
+        for card in self.mode_cards.values():
+            card["state"].configure(text="", fg=MUTED)
         if not self._offline_noted:
             self._offline_noted = True
             self.append_log(self.log_box, f"Не удалось опросить движок: {exc}", "error")
-        if was_online:
-            self.hub.set_status("Bypass: движок не отвечает")
         self._update_controls()
 
     def _update_controls(self) -> None:
-        busy = self.busy
-        online = self.online
-        self.btn_settings.configure(state="disabled" if busy else "normal")
-        self.btn_refresh.configure(state="disabled" if busy or self.checking else "normal")
-        toggles = "normal" if online and not busy else "disabled"
-        self.btn_apps_on.configure(state=toggles)
-        self.btn_apps_off.configure(state=toggles)
-        self.btn_gbd_on.configure(state=toggles)
-        self.btn_gbd_off.configure(state=toggles)
-        for button in (self.btn_dl_gbd, self.btn_dl_pfr):
-            button.configure(state="disabled" if busy else "normal")
+        mode = self.selected
+        running_mode, running_state, _ = self._running_mode()
+        active = running_mode == mode and running_state == "on"
+        other_on = running_mode is not None and running_mode != mode
 
-    # -- настройки ---------------------------------------------------------- #
+        for card_mode, card in self.mode_cards.items():
+            chosen = card_mode == mode
+            on = bool((self.engines.get(card_mode) or {}).get("on"))
+            card["frame"].configure(
+                highlightbackground=OK if on else (ACCENT if chosen else BORDER),
+                highlightthickness=2 if (on or chosen) else 1,
+            )
+            card["title"].configure(fg=OK if on else (FG if chosen else MUTED))
+            card["caption"].configure(fg=FG if chosen else MUTED)
+
+        self.btn_apply.configure(
+            state="disabled" if self.busy else "normal",
+            text=("Выключить" if active else
+                  ("Переключить" if other_on else "Включить")),
+        )
+        self.btn_apps.configure(state="disabled" if self.busy else "normal")
+        self.btn_refresh.configure(state="disabled" if self.busy or self.checking else "normal")
+        need = not bool((self.engines.get("gbd") or {}).get("installed"))
+        self.btn_dl_gbd.configure(state="normal" if not self.busy else "disabled")
+        self.btn_dl_gbd.configure(
+            text="Скачать GoodbyeDPI" + (" ← нужно" if need else ""),
+        )
+
+    # -- настройка пути Happ -------------------------------------------------- #
     def configure_dialog(self) -> None:
         if self.busy:
             return
         cfg = bypass_cfg()
 
         dialog = tk.Toplevel(self)
-        dialog.title("Bypass — для каких приложений")
+        dialog.title('Bypass — путь к Happ')
         dialog.configure(bg=CARD)
         dialog.transient(self.winfo_toplevel())
         dialog.grab_set()
 
-        tk.Label(dialog, text="SOCKS5-прокси (адрес:порт), например socks5://127.0.0.1:1080",
-                 bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(
-            anchor="w", padx=px(16), pady=(px(14), px(4)))
-        endpoint_var = tk.StringVar(value=cfg["endpoint"])
-        tk.Entry(dialog, textvariable=endpoint_var, bg=FIELD, fg=FG,
-                 insertbackground=FG, relief="flat", width=44).pack(anchor="w", padx=px(16))
+        tk.Label(dialog, text='Файл Happ.exe (клиент Happ):', bg=CARD, fg=MUTED,
+                 font=('Segoe UI', 9)).pack(anchor='w', padx=px(16), pady=(px(14), px(4)))
+        path_var = tk.StringVar(value=cfg['happ_path'])
+        entry = tk.Entry(dialog, textvariable=path_var, bg=FIELD, fg=FG,
+                         insertbackground=FG, relief='flat', width=52)
+        entry.pack(anchor='w', padx=px(16))
 
-        tk.Label(
-            dialog,
-            text="Приложения — отметь программы, трафик которых пойдёт через прокси:",
-            bg=CARD, fg=MUTED, font=("Segoe UI", 9),
-        ).pack(anchor="w", padx=px(16), pady=(px(10), px(4)))
+        def browse() -> None:
+            chosen = filedialog.askopenfilename(
+                title='Где лежит Happ.exe',
+                initialdir=str(Path(cfg['happ_path']).parent) if Path(cfg['happ_path']).exists() else 'C:/',
+                filetypes=[('Happ.exe', '*.exe'), ('Все файлы', '*.*')],
+                parent=dialog,
+            )
+            if chosen:
+                path_var.set(os.path.normpath(chosen))
 
-        head = ttk.Frame(dialog)
-        head.pack(fill="x", padx=px(16))
-        search_var = tk.StringVar()
-        search = tk.Entry(head, textvariable=search_var, bg=FIELD, fg=FG,
-                          insertbackground=FG, relief="flat", width=30)
-        search.pack(side="left")
-        selected_var = tk.StringVar(value="выбрано: 0")
+        def auto() -> None:
+            path_var.set(str(_find_happ()))
 
-        listbox = tk.Listbox(
-            dialog, bg=FIELD, fg=FG, selectbackground=ACCENT, relief="flat",
-            selectmode="multiple", height=12, activestyle="none",
-            exportselection=False,
+        row = ttk.Frame(dialog)
+        row.pack(fill='x', padx=px(16), pady=(px(8), 0))
+        flat_button(row, 'Обзор…', browse, kind='ghost').pack(side='left')
+        flat_button(row, 'Найти автоматически', auto, kind='ghost').pack(
+            side='left', padx=(px(8), 0)
         )
-        listbox.pack(fill="x", expand=True, padx=px(16), pady=(px(6), 0))
-        ttk.Label(dialog, textvariable=selected_var, style="Muted.TLabel").pack(
-            anchor="w", padx=px(16), pady=(px(4), 0)
-        )
-
-        def sync(_event=None) -> None:
-            self._dlg_sync(listbox, selected_var)
-
-        manual_row = ttk.Frame(dialog)
-        manual_row.pack(fill="x", padx=px(16), pady=(px(6), 0))
-        manual_var = tk.StringVar()
-        manual = tk.Entry(manual_row, textvariable=manual_var, bg=FIELD, fg=FG,
-                          insertbackground=FG, relief="flat", width=24)
-        manual.pack(side="left")
-
-        def manual_add() -> None:
-            name = manual_var.get().strip()
-            if name and name.lower() not in {n.lower() for n in self._dlg_procs}:
-                self._dlg_procs.append(name)
-                self._dlg_procs.sort()
-            manual_var.set("")
-            self._dlg_fill(listbox, search_var.get())
-            sync()
-
-        flat_button(manual_row, "＋ добавить вручную", manual_add, kind="ghost").pack(
-            side="left", padx=(px(8), 0)
-        )
-
-        search.bind("<KeyRelease>", lambda _e: (self._dlg_fill(listbox, search_var.get()),
-                                                sync()))
-        listbox.bind("<<ListboxSelect>>", sync)
 
         def save() -> None:
-            endpoint = endpoint_var.get().strip() or BYPASS_DEFAULT_ENDPOINT
-            apps = sorted(self._dlg["selected"].values())
-            if not apps:
-                if not messagebox.askyesno(
-                    "Bypass", "Ни одно приложение не выбрано — сохранить всё равно?",
-                    parent=dialog,
-                ):
-                    return
-            self._dlg["selected"] = {}
-            bypass_cfg_save(endpoint=endpoint, apps=apps)
-            names = ", ".join(apps) if apps else "—"
-            self.append_log(self.log_box, f"Сохранено: прокси {endpoint}; приложения: {names}")
-            was_running = bool((self.state.get("happ") or {}).get("on"))
+            value = path_var.get().strip()
+            if not value:
+                messagebox.showinfo('Bypass', 'Укажите путь к Happ.exe', parent=dialog)
+                return
+            bypass_cfg_save(happ_path=value)
+            self.append_log(self.log_box, f'Путь Happ сохранён: {value}')
             dialog.destroy()
-            if was_running:
-                self.append_log(self.log_box, "Перезапускаю ProxiFyre с новым списком…")
-                self.toggle("happ", True)
-            else:
-                self.refresh_now()
+            self.refresh_now()
 
         buttons = ttk.Frame(dialog)
-        buttons.pack(fill="x", padx=px(16), pady=px(12))
-        flat_button(buttons, "Обновить список программ", self._dlg_reload, kind="ghost").pack(
-            side="left"
+        buttons.pack(fill='x', padx=px(16), pady=px(12))
+        flat_button(buttons, 'Сохранить', save).pack(side='right')
+        flat_button(buttons, 'Отмена', dialog.destroy, kind='ghost').pack(
+            side='right', padx=(0, px(8))
         )
-        flat_button(buttons, "Сохранить и применить", save, kind="primary").pack(
-            side="right"
-        )
-        flat_button(buttons, "Отмена", dialog.destroy, kind="ghost").pack(
-            side="right", padx=(0, px(8))
-        )
-
-        self._dlg = {
-            "window": dialog,
-            "listbox": listbox,
-            "selected": {a.lower(): a for a in cfg["apps"]},
-            "search": search_var,
-            "count": selected_var,
-        }
-        self._dlg_procs = list(cfg["apps"])
-        self._dlg_fill(listbox, "")
-        self._dlg_reload()
-        search.focus_set()
-
-    def _dlg_visible_names(self, pattern: str) -> list[str]:
-        needle = pattern.strip().lower()
-        if not needle:
-            return list(self._dlg_procs)
-        return [n for n in self._dlg_procs if needle in n.lower()]
-
-    def _dlg_fill(self, listbox: tk.Listbox, pattern: str) -> None:
-        listbox.delete(0, tk.END)
-        selected = self._dlg["selected"] if isinstance(getattr(self, "_dlg", None), dict) else {}
-        self._dlg_visible = self._dlg_visible_names(pattern)
-        for index, name in enumerate(self._dlg_visible):
-            listbox.insert(index, name)
-            if name.lower() in selected:
-                listbox.selection_set(index)
-
-    def _dlg_sync(self, listbox: tk.Listbox, selected_var: tk.StringVar) -> None:
-        selected = self._dlg["selected"]
-        visible = set(self._dlg_visible)
-        chosen = set()
-        for index in listbox.curselection():
-            try:
-                chosen.add(self._dlg_visible[index])
-            except IndexError:
-                pass
-        for name in list(visible - chosen):
-            selected.pop(name.lower(), None)
-        for name in chosen:
-            selected.setdefault(name.lower(), name)
-        selected_var.set(f"выбрано: {len(selected)}")
-
-    def _dlg_reload(self) -> None:
-        if getattr(self, "_dlg_reloading", False):
-            return
-        self._dlg_reloading = True
-
-        def fetched(result: dict) -> None:
-            self._dlg_reloading = False
-            if not isinstance(getattr(self, "_dlg", None), dict):
-                return
-            names = [str(p) for p in (result or {}).get("processes") or []]
-            # вручную добавленное и сохранённое не теряем
-            names = sorted(set(names) | set(self._dlg_procs))
-            self._dlg_procs = names
-            listbox = self._dlg["listbox"]
-            self._dlg_fill(listbox, self._dlg["search"].get())
-            self._dlg_sync(listbox, self._dlg["count"])
-
-        def failed(exc: Exception) -> None:
-            self._dlg_reloading = False
-            self.append_log(self.log_box, f"Список программ недоступен: {exc}", "error")
-
-        self.hub.run_bg(bypass_processes, fetched, failed)
+        entry.focus_set()
 
     # -- скачивание ---------------------------------------------------------- #
     def download(self, kind: str) -> None:
         if self.busy:
             return
-        label = "GoodbyeDPI" if kind == "gbd" else "ProxiFyre"
+        label = "GoodbyeDPI" if kind == "gbd" else kind
         self._run(
             lambda: bypass_download(kind),
             f"Скачиваю {label}…",
             f"Скачиваю {label} с GitHub (может занять пару минут)…",
         )
 
+    # -- включение / выключение режима --------------------------------------- #
+    def apply_toggle(self) -> None:
+        if self.busy or not self.online:
+            return
+        running_mode, _state, _ = self._running_mode()
+        if running_mode == self.selected:
+            self._turn(self.selected, False)
+            return
+        bypass_cfg_save(mode=self.selected)
+        engine = self.engines.get(self.selected) or {}
+        if not engine.get("installed"):
+            if self.selected == "happ":
+                self.append_log(
+                    self.log_box,
+                    f"Happ не найден по пути:\n{bypass_cfg()['happ_path']}\n"
+                    "Проверьте путь в «Путь Happ…» или скачайте клиент Happ.",
+                    "error",
+                )
+            else:
+                self.append_log(
+                    self.log_box,
+                    "GoodbyeDPI не скачан — кнопка «Скачать GoodbyeDPI» ниже.",
+                    "error",
+                )
+            self.hub.set_status("Bypass: движок недоступен")
+            return
+        if running_mode is not None:
+            self._run(
+                lambda: bypass_apply_mode(self.selected),
+                f"Переключаю на {self._mode_names(self.selected)}…",
+                f"Выключаю {self._mode_names(running_mode)} и включаю "
+                f"{self._mode_names(self.selected)}…",
+            )
+            return
+        self._turn(self.selected, True)
+
+    def _turn(self, mode: str, on: bool) -> None:
+        if mode == "gbd":
+            work = bypass_gbd_start if on else (lambda: bypass_stop("gbd"))
+            label = "GoodbyeDPI"
+            extra = ("Потребуется подтверждение администратора (UAC)."
+                     if on and not bypass_admin() else "")
+        else:
+            work = bypass_happ_start if on else (lambda: bypass_stop("happ"))
+            label = "Happ"
+            extra = ""
+        title = f"{label}: {'включаю' if on else 'выключаю'}…"
+        self._run(work, title, title + (" " + extra if extra else ""))
+
     # -- действия ------------------------------------------------------------ #
     def toggle(self, kind: str, on: bool) -> None:
         if self.busy or not self.online:
             return
-        if kind == "gbd":
-            work = bypass_gbd_start if on else bypass_gbd_stop
-            label = "GoodbyeDPI"
-        else:
-            work = bypass_apps_start if on else bypass_apps_stop
-            label = "ProxiFyre"
-        title = f"{label}: {'включаю' if on else 'выключаю'}…"
-        extra = ("Запуск потребует подтверждение администратора (UAC)."
-                 if on and not bypass_admin() else "")
-        self._run(work, title, title + extra)
+        self._turn("gbd" if kind == "gbd" else "happ", on)
 
     # -- общий запуск фоновой задачи ----------------------------------------- #
     def _run(self, work, status_now: str, log_now: str) -> None:
@@ -4468,7 +4764,7 @@ HEADERS = {
     ),
     "bypass": (
         "Bypass",
-        "Обход DPI: GoodbyeDPI для всего интернета, ProxiFyre — по приложениям.",
+        "Обход DPI: запуск Happ или GoodbyeDPI одной кнопкой.",
     ),
 }
 
