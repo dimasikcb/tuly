@@ -3224,6 +3224,63 @@ def _restore_happ_windows(pids) -> int:
     return restored
 
 
+HAPP_CORE_IMAGES = ("xray.exe", "sing-box.exe", "tun2proxy-bin.exe", "tun2proxy.exe")
+
+
+def _running_images() -> set[str]:
+    """Имена всех запущенных процессов одним вызовом tasklist."""
+    rc, out, _err = run_tool(["tasklist", "/FO", "CSV", "/NH"], timeout=30)
+    names: set[str] = set()
+    if rc != 0:
+        return names
+    for line in out.splitlines():
+        if '"' in line:
+            names.add(line.strip().split('","')[0].strip('"').lower())
+    return names
+
+
+def happ_system_proxy() -> tuple[bool, str]:
+    """Системный прокси Windows: (включён, адрес). Happ ставит сюда 127.0.0.1."""
+    try:
+        import winreg
+    except ImportError:
+        return False, ""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enable = int(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            try:
+                server = str(winreg.QueryValueEx(key, "ProxyServer")[0])
+            except FileNotFoundError:
+                server = ""
+        return bool(enable), server
+    except OSError:
+        return False, ""
+
+
+def happ_connected(images: set[str] | None = None) -> bool:
+    """VPN Happ включён: работает core-процесс или системный прокси смотрит в localhost."""
+    names = images if images is not None else _running_images()
+    if any(name in names for name in HAPP_CORE_IMAGES):
+        return True
+    enable, server = happ_system_proxy()
+    return bool(
+        enable and ("127.0.0.1" in server or "localhost" in server or "::1" in server)
+    )
+
+
+def happ_send(command: str) -> bool:
+    """Отправить команду Happ через зарегистрированную схему happ:// (connect/disconnect/open)."""
+    url = command if "://" in command else "happ://" + command
+    try:
+        code = ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 0)
+    except Exception:  # noqa: BLE001
+        return False
+    return code > 32
+
+
 def _tail(path: Path, limit: int = 400) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace").strip()[-limit:]
@@ -3235,6 +3292,7 @@ def bypass_status(_timeout: float = 1.5) -> dict:
     cfg = bypass_cfg()
     track = _bypass_track()
     result: dict = {"admin": bypass_admin()}
+    images = _running_images()
     for key, image, exe in (
         ("happ", Path(cfg["happ_path"]).name, Path(cfg["happ_path"])),
         ("gbd", "goodbyedpi.exe", BYPASS_GBD_EXE),
@@ -3250,6 +3308,8 @@ def bypass_status(_timeout: float = 1.5) -> dict:
             "mine": bool(my_pid and my_pid in pids),
             "installed": exe.exists(),
         }
+        if key == "happ":
+            result[key]["connected"] = happ_connected(images)
         if key == "gbd":
             result[key]["args"] = cfg["gbd_args"]
         if pids:
@@ -3306,10 +3366,10 @@ def bypass_gbd_start() -> dict:
 
 
 def bypass_stop(key: str) -> dict:
-    if key == "gbd":
-        image, label, extra_images = "goodbyedpi.exe", "GoodbyeDPI", []
-    else:
-        image, label, extra_images = "Happ.exe", "Happ", ["happd.exe"]
+    if key != "gbd":
+        # Happ не закрываем — только отключаем VPN командой happ://disconnect
+        return bypass_happ_stop()
+    image, label, extra_images = "goodbyedpi.exe", "GoodbyeDPI", []
     track = _bypass_track()
     entry = track.get(key) if isinstance(track.get(key), dict) else {}
     my_pid = int(entry.get("pid") or 0)
@@ -3361,49 +3421,91 @@ def bypass_stop(key: str) -> dict:
 
 
 def bypass_happ_start(visible: bool = False) -> dict:
+    """Включает VPN в Happ командой happ://connect — без открытия/закрытия окна."""
     cfg = bypass_cfg()
     exe = Path(cfg["happ_path"])
     if not exe.exists():
         raise RuntimeError(
             f"Happ не найден: {exe}\nУкажите путь в «Путь Happ…»."
         )
-    track = _bypass_track()
-    entry = track.get("happ") if isinstance(track.get("happ"), dict) else {}
-    my_pid = int(entry.get("pid") or 0)
+    if happ_connected():
+        return {"ok": True, "detail": "VPN уже включён"}
     pids = _image_pids(exe.name)
-    if pids:  # уже работает — не запускаем ещё один экземпляр (не открываем окно)
+    if not pids:
+        # клиент не запущен: поднимаем его, чтобы было кому выполнить команду
+        if visible:
+            subprocess.Popen([str(exe)], cwd=str(exe.parent))
+        else:
+            info = subprocess.STARTUPINFO()
+            info.dwFlags = subprocess.STARTF_USESHOWWINDOW
+            info.wShowWindow = 7  # SW_SHOWMINNOACTIVE
+            subprocess.Popen([str(exe)], cwd=str(exe.parent), startupinfo=info)
+        for _ in range(24):
+            time.sleep(0.25)
+            pids = _image_pids(exe.name)
+            if pids:
+                break
+        if not pids:
+            raise RuntimeError("Happ не запустился — проверьте путь в «Путь Happ…»")
+        track = _bypass_track()
+        track["happ"] = {"pid": pids[0], "started": time.time()}
+        _track_save(track)
         if not visible:
-            hidden = _minimize_happ_windows(pids)
-        else:
-            hidden = sum(_restore_happ_windows([pid]) for pid in pids)
-        if my_pid in pids:
-            detail = f"Happ уже запущен (PID {my_pid})"
-        else:
-            detail = f"Happ уже работает (PID {', '.join(map(str, pids))})"
-        if visible and hidden:
-            detail += " — окно развёрнуто"
-        elif not visible:
-            detail += " — VPN работает, окно не тронуто" if hidden == 0 else " — окна свёрнуты"
-        return {"ok": True, "detail": detail}
-    if visible:  # обычный запуск: окно показываем, как открыл сам пользователь
-        subprocess.Popen([str(exe)], cwd=str(exe.parent))
-    else:  # включение VPN в фоне: окно свёрнуто и не перехватывает фокус
-        info = subprocess.STARTUPINFO()
-        info.dwFlags = subprocess.STARTF_USESHOWWINDOW
-        info.wShowWindow = 7  # SW_SHOWMINNOACTIVE
-        subprocess.Popen([str(exe)], cwd=str(exe.parent), startupinfo=info)
-    for _ in range(15):  # до 3 сек — процесс должен появиться
+            _minimize_happ_windows(pids)
+    if not happ_send("connect"):
+        raise RuntimeError("Happ не принял команду подключения (happ://connect)")
+    for _ in range(30):  # до ~15 сек: выбор сервера по пингу и рукопожатие
+        time.sleep(0.5)
+        if happ_connected():
+            return {"ok": True, "detail": "VPN включён"}
+    raise RuntimeError(
+        "Happ не подключился за 15 секунд — нажмите «Показать Happ» "
+        "и проверьте подписку/сервер в самом Happ"
+    )
+
+
+def bypass_happ_stop() -> dict:
+    """Выключает VPN в Happ командой happ://disconnect — программа остаётся открытой."""
+    exe = Path(bypass_cfg()["happ_path"])
+    pids = _image_pids(exe.name)
+    if not pids:
+        return {"ok": True, "detail": "Happ не запущен — VPN и так выключен"}
+    if not happ_connected():
+        return {"ok": True, "detail": "VPN уже выключен"}
+    if not happ_send("disconnect"):
+        raise RuntimeError("Happ не принял команду отключения (happ://disconnect)")
+    for _ in range(20):
+        time.sleep(0.5)
+        if not happ_connected():
+            return {"ok": True, "detail": "VPN выключен"}
+    raise RuntimeError(
+        "Happ не отключил VPN — нажмите «Показать Happ» и выключите вручную"
+    )
+
+
+def bypass_happ_show() -> dict:
+    """Показать окно Happ (VPN не трогаем)."""
+    exe = Path(bypass_cfg()["happ_path"])
+    if not exe.exists():
+        raise RuntimeError(
+            f"Happ не найден: {exe}\nУкажите путь в «Путь Happ…»."
+        )
+    pids = _image_pids(exe.name)
+    if pids:
+        accepted = happ_send("open")
+        for _ in range(10):
+            time.sleep(0.2)
+            if sum(_restore_happ_windows([pid]) for pid in pids):
+                return {"ok": True, "detail": "Окно Happ показано"}
+        return {"ok": True, "detail": (
+            "Команда показа окна отправлена" if accepted
+            else "Окно не найдено — возможно, свёрнуто в трей"
+        )}
+    subprocess.Popen([str(exe)], cwd=str(exe.parent))
+    for _ in range(15):
         time.sleep(0.2)
-        alive = _image_pids(exe.name)
-        if alive:
-            track["happ"] = {"pid": alive[0], "started": time.time()}
-            _track_save(track)
-            if not visible:
-                _minimize_happ_windows(alive)
-            return {"ok": True, "detail": (
-                f"Happ запущен (PID {alive[0]}) — VPN включится автоматически, "
-                "если в Happ включено авто-подключение"
-            )}
+        if _image_pids(exe.name):
+            return {"ok": True, "detail": "Happ запущен"}
     raise RuntimeError("Happ не запустился — проверьте путь")
 
 
@@ -3412,16 +3514,13 @@ def bypass_apply_mode(mode: str) -> dict:
     if mode not in ("happ", "gbd"):
         raise RuntimeError(f"неизвестный режим {mode!r}")
     notes = []
-    other = "gbd" if mode == "happ" else "happ"
-    track = _bypass_track()
-    entry = track.get(other) if isinstance(track.get(other), dict) else {}
-    other_pid = int(entry.get("pid") or 0)
-    other_image = "goodbyedpi.exe" if other == "gbd" else Path(bypass_cfg()["happ_path"]).name
-    if _image_pids(other_image) and (not other_pid or _pid_alive(other_pid)):
-        notes.append(bypass_stop(other).get("detail") or "")
     if mode == "gbd":
+        if happ_connected():
+            notes.append(bypass_happ_stop().get("detail") or "")
         notes.append(bypass_gbd_start().get("detail") or "")
     else:
+        if _image_pids("goodbyedpi.exe"):
+            notes.append(bypass_stop("gbd").get("detail") or "")
         notes.append(bypass_happ_start().get("detail") or "")
     return {"ok": True, "detail": "\n".join(filter(None, notes))}
 
@@ -4450,9 +4549,9 @@ class BypassPanel(Panel):
         self.mode_cards = {
             "happ": self._mode_card(
                 grid, 0, "Happ — прокси-клиент",
-                "Клик по карточке включает/выключает VPN. Включение — в фоне, окно "
-                "Happ не вылезает («Показать Happ» откроет его). Выключение закрывает "
-                "программу — иначе туннель не остановить.",
+                "Клик по карточке включает/выключает VPN. Happ при этом не открывается "
+                "и не закрывается: команда happ://connect / happ://disconnect уходит "
+                "в клиент, окно нужно только для смены сервера («Показать Happ»).",
             ),
             "gbd": self._mode_card(
                 grid, 1, "GoodbyeDPI — весь интернет",
@@ -4555,8 +4654,8 @@ class BypassPanel(Panel):
                 self.detail_var.set(hint)
             elif running_mode == self.selected:
                 self.detail_var.set(
-                    f"{self._mode_names(running_mode)} включён — выключить = отключить VPN; "
-                    "программа при этом закроется, «Включить» запустит её снова"
+                    f"{self._mode_names(running_mode)} включён — клик выключит VPN "
+                    "(окно программы не закроется)"
                 )
             else:
                 self.detail_var.set(f"сейчас работает {self._mode_names(running_mode)}, "
@@ -4589,13 +4688,13 @@ class BypassPanel(Panel):
         self.hub.run_bg(bypass_status, self._state_ok, self._state_off)
 
     def _running_mode(self) -> tuple[str | None, str, dict]:
-        """(mode, 'on'/'off'/'broken', engine-state) — какой движок реально работает."""
-        happ = (self.state.get("happ") or {}).get("on")
-        gbd = (self.state.get("gbd") or {}).get("on")
-        if happ:
-            return "happ", "on", self.state.get("happ") or {}
-        if gbd:
-            return "gbd", "on", self.state.get("gbd") or {}
+        """(mode, 'on'/'off'/'broken', engine-state) — что реально включено."""
+        happ = self.state.get("happ") or {}
+        gbd = self.state.get("gbd") or {}
+        if happ.get("connected"):
+            return "happ", "on", happ
+        if gbd.get("on"):
+            return "gbd", "on", gbd
         return None, "off", {}
 
     def _state_ok(self, state: dict) -> None:
@@ -4613,20 +4712,25 @@ class BypassPanel(Panel):
             engine = self.engines.get(mode) or {}
             installed = bool(engine.get("installed"))
             on = bool(engine.get("on"))
-            running_mode, _r_state, _r_cfg = self._running_mode()
-            text = "● работает" if on else ("○ готов к запуску" if installed else "— не найден")
-            mark = "нашими средствами" if engine.get("mine") else "не этот экземпляр"
-            if on:
-                pid_text = ""
-                pids = engine.get("pids") or []
-                if pids:
-                    pid_text = f" · PID {', '.join(map(str, pids))}"
-                extra = f" · {mark}{pid_text}"
-                if mode == "gbd" and engine.get("args"):
-                    extra += f" · {engine['args']}"
-                text = f"● работает{extra}"
+            connected = bool(engine.get("connected")) if mode == "happ" else on
+            pids = engine.get("pids") or []
+            pid_text = f" · PID {', '.join(map(str, pids))}" if pids else ""
+            if mode == "happ":
+                if connected:
+                    text = f"● VPN включён{pid_text}"
+                elif on:
+                    text = f"○ клиент открыт · VPN выключен{pid_text}"
+                else:
+                    text = "○ VPN выключен" if installed else "— не найден"
+            else:
+                text = "● работает" if on else ("○ готов к запуску" if installed else "— не найден")
+                if on:
+                    mark = "нашими средствами" if engine.get("mine") else "не этот экземпляр"
+                    text = f"● работает · {mark}{pid_text}"
+                    if engine.get("args"):
+                        text += f" · {engine['args']}"
             card["state"].configure(
-                text=text, fg=OK if on else (MUTED if installed else WARN),
+                text=text, fg=OK if connected else (MUTED if installed else WARN),
             )
 
         self._mode_hint()
@@ -4666,8 +4770,7 @@ class BypassPanel(Panel):
 
         self.btn_apply.configure(
             state="disabled" if self.busy else "normal",
-            text=("Выключить (закроет Happ)" if active and mode == "happ" else
-                  "Выключить" if active else
+            text=("Выключить" if active else
                   ("Переключить" if other_on else "Включить")),
         )
         self.btn_apps.configure(state="disabled" if self.busy else "normal")
@@ -4682,31 +4785,10 @@ class BypassPanel(Panel):
 
     # -- настройка пути Happ -------------------------------------------------- #
     def show_happ(self) -> None:
-        """Показать окно Happ: включённый в фоне клиент нужно открыть для смены сервера."""
+        """Показать окно Happ (VPN не трогаем)."""
         if self.busy:
             return
-        exe = Path(bypass_cfg()["happ_path"])
-        if not exe.exists():
-            messagebox.showinfo(
-                "Happ", f"Happ не найден по пути:\n{exe}\nИсправьте в «Путь Happ…».",
-                parent=self,
-            )
-            return
-
-        def work():
-            pids = _image_pids(exe.name)
-            if not pids:
-                return bypass_happ_start(visible=True)
-            restored = sum(_restore_happ_windows([pid]) for pid in pids)
-            if restored:
-                return {"ok": True, "detail": "Окно Happ развёрнуто"}
-            return {
-                "ok": True,
-                "detail": f"Happ работает (PID {', '.join(map(str, pids))}), "
-                          "но окна не нашлось — возможно, оно свёрнуто в трей",
-            }
-
-        self._run(work, "Открываю окно Happ…", "Открываю окно Happ…")
+        self._run(bypass_happ_show, "Открываю окно Happ…", "Открываю окно Happ…")
 
     def configure_dialog(self) -> None:
         if self.busy:
@@ -4825,7 +4907,8 @@ class BypassPanel(Panel):
             work = bypass_happ_start if on else (lambda: bypass_stop("happ"))
             label = "Happ"
             extra = ""
-        title = f"{label}: {'включаю' if on else 'выключаю'}…"
+        title = (f"{label}: {'включаю' if on else 'выключаю'} VPN…" if label == "Happ"
+                 else f"{label}: {'включаю' if on else 'выключаю'}…")
         self._run(work, title, title + (" " + extra if extra else ""))
 
     # -- действия ------------------------------------------------------------ #
