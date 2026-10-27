@@ -3172,6 +3172,58 @@ def _pid_alive(pid: int) -> bool:
     return rc == 0 and bool(out) and "INFO:" not in out.upper()
 
 
+def _pid_windows(pids) -> list[int]:
+    """Видимые top-level окна, принадлежащие перечисленным PID."""
+    user32 = ctypes.windll.user32
+    windows: list[int] = []
+    wanted = {int(pid) for pid in pids if pid}
+    if not wanted:
+        return windows
+    proto = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def on_window(hwnd, _lparam):
+        try:
+            owner = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value in wanted and user32.IsWindowVisible(hwnd):
+                windows.append(hwnd)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(proto(on_window), None)
+    except Exception:  # noqa: BLE001
+        pass
+    return windows
+
+
+def _minimize_happ_windows(pids, attempts: int = 8, delay: float = 0.4) -> int:
+    """Свёртывает окна запущенного Happ, чтобы окно не вылезало при включении VPN."""
+    user32 = ctypes.windll.user32
+    for _ in range(attempts):
+        minimized = 0
+        for hwnd in _pid_windows(pids):
+            if not user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+                minimized += 1
+        if minimized:
+            return minimized
+        time.sleep(delay)
+    return 0
+
+
+def _restore_happ_windows(pids) -> int:
+    """Развёртывает свёрнутые окна Happ — доступ нужен для смены сервера."""
+    user32 = ctypes.windll.user32
+    restored = 0
+    for hwnd in _pid_windows(pids):
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            restored += 1
+    return restored
+
+
 def _tail(path: Path, limit: int = 400) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace").strip()[-limit:]
@@ -3269,13 +3321,21 @@ def bypass_stop(key: str) -> dict:
             _track_save(track)
         return {"ok": True, "detail": f"{label} и так не был запущен"}
     targets = [image, *extra_images]
-    run_tool(["taskkill", "/F", "/IM", image], timeout=30)
-    for name in extra_images:
-        run_tool(["taskkill", "/F", "/IM", name], timeout=30)
+    # 1) вежливо: приложение само завершится и сохранит настройки
+    for name in targets:
+        run_tool(["taskkill", "/IM", name], timeout=30)
     for _ in range(10):
-        time.sleep(0.2)
+        time.sleep(0.4)
         if not any(_image_pids(name) for name in targets):
             break
+    # 2) жёстко, если закрыться само не захотело
+    if any(_image_pids(name) for name in targets):
+        for name in targets:
+            run_tool(["taskkill", "/F", "/IM", name], timeout=30)
+        for _ in range(5):
+            time.sleep(0.2)
+            if not any(_image_pids(name) for name in targets):
+                break
     if any(_image_pids(name) for name in targets):
         # скорее всего процесс от администратора — taskkill ещё раз через UAC
         arguments = " ".join(f"/IM {name}" for name in targets)
@@ -3300,7 +3360,7 @@ def bypass_stop(key: str) -> dict:
     return {"ok": True, "detail": f"{label} остановлен"}
 
 
-def bypass_happ_start() -> dict:
+def bypass_happ_start(visible: bool = False) -> dict:
     cfg = bypass_cfg()
     exe = Path(cfg["happ_path"])
     if not exe.exists():
@@ -3311,18 +3371,38 @@ def bypass_happ_start() -> dict:
     entry = track.get("happ") if isinstance(track.get("happ"), dict) else {}
     my_pid = int(entry.get("pid") or 0)
     pids = _image_pids(exe.name)
-    if my_pid and my_pid in pids:
-        return {"ok": True, "detail": f"Happ уже запущен (PID {my_pid})"}
-    subprocess.Popen([str(exe)], cwd=str(exe.parent))
+    if pids:  # уже работает — не запускаем ещё один экземпляр (не открываем окно)
+        if not visible:
+            hidden = _minimize_happ_windows(pids)
+        else:
+            hidden = sum(_restore_happ_windows([pid]) for pid in pids)
+        if my_pid in pids:
+            detail = f"Happ уже запущен (PID {my_pid})"
+        else:
+            detail = f"Happ уже работает (PID {', '.join(map(str, pids))})"
+        if visible and hidden:
+            detail += " — окно развёрнуто"
+        elif not visible:
+            detail += " — VPN работает, окно не тронуто" if hidden == 0 else " — окна свёрнуты"
+        return {"ok": True, "detail": detail}
+    if visible:  # обычный запуск: окно показываем, как открыл сам пользователь
+        subprocess.Popen([str(exe)], cwd=str(exe.parent))
+    else:  # включение VPN в фоне: окно свёрнуто и не перехватывает фокус
+        info = subprocess.STARTUPINFO()
+        info.dwFlags = subprocess.STARTF_USESHOWWINDOW
+        info.wShowWindow = 7  # SW_SHOWMINNOACTIVE
+        subprocess.Popen([str(exe)], cwd=str(exe.parent), startupinfo=info)
     for _ in range(15):  # до 3 сек — процесс должен появиться
         time.sleep(0.2)
         alive = _image_pids(exe.name)
         if alive:
             track["happ"] = {"pid": alive[0], "started": time.time()}
             _track_save(track)
+            if not visible:
+                _minimize_happ_windows(alive)
             return {"ok": True, "detail": (
                 f"Happ запущен (PID {alive[0]}) — VPN включится автоматически, "
-                "если в Happ включено авто-подключение; иначе нажмите «Подключить» в его окне"
+                "если в Happ включено авто-подключение"
             )}
     raise RuntimeError("Happ не запустился — проверьте путь")
 
@@ -4370,8 +4450,9 @@ class BypassPanel(Panel):
         self.mode_cards = {
             "happ": self._mode_card(
                 grid, 0, "Happ — прокси-клиент",
-                "Клик по карточке: включить/выключить VPN. Трафик идёт так, как "
-                "настроено в самом Happ (при включённом авто-подключении связывается сам).",
+                "Клик по карточке включает/выключает VPN. Включение — в фоне, окно "
+                "Happ не вылезает («Показать Happ» откроет его). Выключение закрывает "
+                "программу — иначе туннель не остановить.",
             ),
             "gbd": self._mode_card(
                 grid, 1, "GoodbyeDPI — весь интернет",
@@ -4412,6 +4493,10 @@ class BypassPanel(Panel):
             actions, "Путь Happ…", self.configure_dialog, kind="ghost",
         )
         self.btn_apps.pack(side="left", padx=(px(8), 0))
+        self.btn_show_happ = flat_button(
+            actions, "Показать Happ", self.show_happ, kind="ghost",
+        )
+        self.btn_show_happ.pack(side="left", padx=(px(8), 0))
         self.btn_refresh = flat_button(actions, "Обновить", self.refresh_now, kind="ghost")
         self.btn_refresh.pack(side="right")
 
@@ -4586,6 +4671,7 @@ class BypassPanel(Panel):
                   ("Переключить" if other_on else "Включить")),
         )
         self.btn_apps.configure(state="disabled" if self.busy else "normal")
+        self.btn_show_happ.configure(state="disabled" if self.busy else "normal")
         self.btn_refresh.configure(state="disabled" if self.busy or self.checking else "normal")
         installed = self.online and bool((self.engines.get("gbd") or {}).get("installed"))
         self.btn_dl_gbd.configure(state="disabled" if self.busy else "normal")
@@ -4595,6 +4681,33 @@ class BypassPanel(Panel):
             self.btn_dl_gbd.pack(side="left")
 
     # -- настройка пути Happ -------------------------------------------------- #
+    def show_happ(self) -> None:
+        """Показать окно Happ: включённый в фоне клиент нужно открыть для смены сервера."""
+        if self.busy:
+            return
+        exe = Path(bypass_cfg()["happ_path"])
+        if not exe.exists():
+            messagebox.showinfo(
+                "Happ", f"Happ не найден по пути:\n{exe}\nИсправьте в «Путь Happ…».",
+                parent=self,
+            )
+            return
+
+        def work():
+            pids = _image_pids(exe.name)
+            if not pids:
+                return bypass_happ_start(visible=True)
+            restored = sum(_restore_happ_windows([pid]) for pid in pids)
+            if restored:
+                return {"ok": True, "detail": "Окно Happ развёрнуто"}
+            return {
+                "ok": True,
+                "detail": f"Happ работает (PID {', '.join(map(str, pids))}), "
+                          "но окна не нашлось — возможно, оно свёрнуто в трей",
+            }
+
+        self._run(work, "Открываю окно Happ…", "Открываю окно Happ…")
+
     def configure_dialog(self) -> None:
         if self.busy:
             return
