@@ -3314,13 +3314,16 @@ def bypass_happ_start() -> dict:
     if my_pid and my_pid in pids:
         return {"ok": True, "detail": f"Happ уже запущен (PID {my_pid})"}
     subprocess.Popen([str(exe)], cwd=str(exe.parent))
-    for _ in range(15):  # до 3 сек — GUI должен появиться
+    for _ in range(15):  # до 3 сек — процесс должен появиться
         time.sleep(0.2)
         alive = _image_pids(exe.name)
         if alive:
             track["happ"] = {"pid": alive[0], "started": time.time()}
             _track_save(track)
-            return {"ok": True, "detail": f"Happ запущен (PID {alive[0]}) — подключитесь в нем"}
+            return {"ok": True, "detail": (
+                f"Happ запущен (PID {alive[0]}) — VPN включится автоматически, "
+                "если в Happ включено авто-подключение; иначе нажмите «Подключить» в его окне"
+            )}
     raise RuntimeError("Happ не запустился — проверьте путь")
 
 
@@ -4348,6 +4351,8 @@ class BypassPanel(Panel):
         self.busy = False
         self.checking = False
         self._offline_noted = False
+        self.online = False
+        self.state: dict = {}
         self._build()
         self.refresh_now()
         self.after(3000, self._tick)
@@ -4365,13 +4370,13 @@ class BypassPanel(Panel):
         self.mode_cards = {
             "happ": self._mode_card(
                 grid, 0, "Happ — прокси-клиент",
-                "Открывает Happ: его туннель обслуживает трафик так, как настроено "
-                "в самом Happ. Быстрее включить/выключить, DPI не трогает.",
+                "Клик по карточке: включить/выключить VPN. Трафик идёт так, как "
+                "настроено в самом Happ (при включённом авто-подключении связывается сам).",
             ),
             "gbd": self._mode_card(
                 grid, 1, "GoodbyeDPI — весь интернет",
-                "Обход DPI для всего трафика сразу (порты 80/443). "
-                "Нужны права администратора, прокси не требуется.",
+                "Клик по карточке: включить/выключить обход DPI для всего трафика "
+                "(порты 80/443). Нужны права администратора, прокси не требуется.",
             ),
         }
 
@@ -4439,11 +4444,16 @@ class BypassPanel(Panel):
         mode = "happ" if column == 0 else "gbd"
 
         def choose(_event=None) -> None:
-            if not self.busy and self.selected != mode:
+            if self.busy:
+                return
+            if self.selected != mode:
                 self.selected = mode
-                self._mode_hint("выбран режим, включит кнопка ниже")
+                if self.online:
+                    bypass_cfg_save(mode=mode)
                 self._update_controls()
-            return
+            if self.online:
+                # клик по карточке = включить, если выключено, и наоборот
+                self._toggle_engine(mode)
 
         for widget in widgets:
             widget.bind("<Button-1>", choose)
@@ -4459,17 +4469,18 @@ class BypassPanel(Panel):
             if hint:
                 self.detail_var.set(hint)
             elif running_mode == self.selected:
-                self.detail_var.set(f"{self._mode_names(running_mode)} включён — выключить "
-                                    "кнопкой ниже")
+                self.detail_var.set(
+                    f"{self._mode_names(running_mode)} включён — нажмите ещё раз "
+                    "(карточку или кнопку), чтобы выключить"
+                )
             else:
                 self.detail_var.set(f"сейчас работает {self._mode_names(running_mode)}, "
-                                    f"«Переключить» заменит его на "
+                                    f"клик по другой карточке выключит его и включит "
                                     f"{self._mode_names(self.selected)}")
             self.dot_var.set("● активен")
         else:
             self.mode_var.set(f" выбран: {self._mode_names(self.selected)}")
-            if hint:
-                self.detail_var.set(hint)
+            self.detail_var.set(hint or "клик по карточке или «Включить» — включит VPN")
             self.dot_var.set("○ не запущено")
         show_apps = (running_mode or self.selected) == "happ"
         if show_apps:
@@ -4575,11 +4586,12 @@ class BypassPanel(Panel):
         )
         self.btn_apps.configure(state="disabled" if self.busy else "normal")
         self.btn_refresh.configure(state="disabled" if self.busy or self.checking else "normal")
-        need = not bool((self.engines.get("gbd") or {}).get("installed"))
-        self.btn_dl_gbd.configure(state="normal" if not self.busy else "disabled")
-        self.btn_dl_gbd.configure(
-            text="Скачать GoodbyeDPI" + (" ← нужно" if need else ""),
-        )
+        installed = self.online and bool((self.engines.get("gbd") or {}).get("installed"))
+        self.btn_dl_gbd.configure(state="disabled" if self.busy else "normal")
+        if installed:
+            self.btn_dl_gbd.pack_forget()  # GoodbyeDPI уже есть — кнопка загрузки не нужна
+        else:
+            self.btn_dl_gbd.pack(side="left")
 
     # -- настройка пути Happ -------------------------------------------------- #
     def configure_dialog(self) -> None:
@@ -4650,17 +4662,15 @@ class BypassPanel(Panel):
         )
 
     # -- включение / выключение режима --------------------------------------- #
-    def apply_toggle(self) -> None:
-        if self.busy or not self.online:
-            return
+    def _toggle_engine(self, mode: str) -> None:
+        """Переключить движок: выключить, если работает, иначе включить."""
         running_mode, _state, _ = self._running_mode()
-        if running_mode == self.selected:
-            self._turn(self.selected, False)
+        if running_mode == mode:
+            self._turn(mode, False)
             return
-        bypass_cfg_save(mode=self.selected)
-        engine = self.engines.get(self.selected) or {}
+        engine = self.engines.get(mode) or {}
         if not engine.get("installed"):
-            if self.selected == "happ":
+            if mode == "happ":
                 self.append_log(
                     self.log_box,
                     f"Happ не найден по пути:\n{bypass_cfg()['happ_path']}\n"
@@ -4677,13 +4687,19 @@ class BypassPanel(Panel):
             return
         if running_mode is not None:
             self._run(
-                lambda: bypass_apply_mode(self.selected),
-                f"Переключаю на {self._mode_names(self.selected)}…",
+                lambda: bypass_apply_mode(mode),
+                f"Переключаю на {self._mode_names(mode)}…",
                 f"Выключаю {self._mode_names(running_mode)} и включаю "
-                f"{self._mode_names(self.selected)}…",
+                f"{self._mode_names(mode)}…",
             )
             return
-        self._turn(self.selected, True)
+        self._turn(mode, True)
+
+    def apply_toggle(self) -> None:
+        if self.busy or not self.online:
+            return
+        bypass_cfg_save(mode=self.selected)
+        self._toggle_engine(self.selected)
 
     def _turn(self, mode: str, on: bool) -> None:
         if mode == "gbd":
