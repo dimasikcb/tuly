@@ -4470,8 +4470,8 @@ class BypassPanel(Panel):
                 self.detail_var.set(hint)
             elif running_mode == self.selected:
                 self.detail_var.set(
-                    f"{self._mode_names(running_mode)} включён — нажмите ещё раз "
-                    "(карточку или кнопку), чтобы выключить"
+                    f"{self._mode_names(running_mode)} включён — выключить = отключить VPN; "
+                    "программа при этом закроется, «Включить» запустит её снова"
                 )
             else:
                 self.detail_var.set(f"сейчас работает {self._mode_names(running_mode)}, "
@@ -4581,7 +4581,8 @@ class BypassPanel(Panel):
 
         self.btn_apply.configure(
             state="disabled" if self.busy else "normal",
-            text=("Выключить" if active else
+            text=("Выключить (закроет Happ)" if active and mode == "happ" else
+                  "Выключить" if active else
                   ("Переключить" if other_on else "Включить")),
         )
         self.btn_apps.configure(state="disabled" if self.busy else "normal")
