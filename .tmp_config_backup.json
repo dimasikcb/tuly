@@ -1,0 +1,26 @@
+{
+  "settings": {
+    "interval": "1",
+    "jitter": "0",
+    "repeats": "0",
+    "wait": "0",
+    "button": "ЛКМ"
+  },
+  "steps": [
+    {
+      "kind": "point",
+      "x": 517,
+      "y": 514,
+      "w": 0,
+      "h": 0,
+      "conf": 0.8,
+      "delay": 0,
+      "wait": 0.0
+    }
+  ],
+  "bypass": {
+    "gbd_args": "-5",
+    "mode": "happ",
+    "happ_path": "C:\\Program Files\\FlyFrogLLC\\Happ\\Happ.exe"
+  }
+}

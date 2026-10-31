@@ -21,6 +21,7 @@ import queue
 import random
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -3097,14 +3098,27 @@ def http_json(url: str, payload: dict | None = None, timeout: float = 3.0):
 #  Bypass: движок (статусы, админ, скачка, запуск через UAC)
 # --------------------------------------------------------------------------- #
 def bypass_cfg() -> dict:
+    """Настройки обхода: движок, область (весь трафик / программы), список программ."""
     base = config_read().get("bypass") or {}
     mode = str(base.get("mode") or "happ").strip().lower()
     if mode not in ("happ", "gbd"):
         mode = "happ"
+    scope = str(base.get("scope") or "all").strip().lower()
+    if scope not in ("all", "apps"):
+        scope = "all"
     happ_path = str(base.get("happ_path") or "").strip() or str(BYPASS_HAPP_DEFAULT)
+    try:
+        socks_port = int(base.get("socks_port") or HAPP_SOCKS_DEFAULT)
+    except (TypeError, ValueError):
+        socks_port = HAPP_SOCKS_DEFAULT
+    if not 0 < socks_port < 65536:
+        socks_port = HAPP_SOCKS_DEFAULT
     return {
         "gbd_args": str(base.get("gbd_args") or "-5").strip() or "-5",
         "mode": mode,
+        "scope": scope,
+        "apps": normalize_apps(base.get("apps")),
+        "socks_port": socks_port,
         "happ_path": happ_path,
     }
 
@@ -3289,10 +3303,12 @@ def _tail(path: Path, limit: int = 400) -> str:
 
 
 def bypass_status(_timeout: float = 1.5) -> dict:
+    """Полное состояние: движки, режим Happ, перенаправление по программам."""
     cfg = bypass_cfg()
     track = _bypass_track()
     result: dict = {"admin": bypass_admin()}
     images = _running_images()
+    port = happ_socks_port()
     for key, image, exe in (
         ("happ", Path(cfg["happ_path"]).name, Path(cfg["happ_path"])),
         ("gbd", "goodbyedpi.exe", BYPASS_GBD_EXE),
@@ -3310,11 +3326,22 @@ def bypass_status(_timeout: float = 1.5) -> dict:
         }
         if key == "happ":
             result[key]["connected"] = happ_connected(images)
+            result[key]["tun"] = any(
+                name in images
+                for name in ("sing-box.exe", "tun2proxy-bin.exe", "tun2proxy.exe")
+            )
+            result[key]["socks_port"] = port
+            result[key]["socks_ok"] = port_open(port)
+            result[key]["mode"] = happ_mode_read()
         if key == "gbd":
             result[key]["args"] = cfg["gbd_args"]
         if pids:
             result[key]["pids"] = pids
     result["track"] = {}
+    result["proxyfyre"] = proxifyre_status()
+    result["scope"] = cfg["scope"]
+    result["apps"] = cfg["apps"]
+    result["mode"] = cfg["mode"]
     return result
 
 
@@ -3384,8 +3411,15 @@ def bypass_gbd_start() -> dict:
 
 def bypass_stop(key: str) -> dict:
     if key != "gbd":
-        # Happ не закрываем — только отключаем VPN командой happ://disconnect
-        return bypass_happ_stop()
+        # Happ не закрываем — отключаем VPN и снимаем перенаправление программ,
+        # иначе выбранные приложения останутся с мёртвым SOCKS и без интернета.
+        notes: list[str] = []
+        try:
+            notes.append(proxifyre_stop().get("detail") or "")
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"ProxiFyre: {exc}")
+        notes.append(bypass_happ_stop().get("detail") or "")
+        return {"ok": True, "detail": "\n".join(filter(None, notes))}
     image, label, extra_images = "goodbyedpi.exe", "GoodbyeDPI", []
     track = _bypass_track()
     entry = track.get(key) if isinstance(track.get(key), dict) else {}
@@ -3584,6 +3618,689 @@ def bypass_download(kind: str) -> dict:
     if not BYPASS_GBD_EXE.exists():
         raise RuntimeError("файлы не распакованы")
     return {"ok": True, "detail": f"Скачан {name.strip() or 'GoodbyeDPI'}"}
+
+
+# --------------------------------------------------------------------------- #
+#  Bypass: обход по выбранным программам (каталог, режим Happ, ProxiFyre)
+# --------------------------------------------------------------------------- #
+BYPASS_SCOPES = ("all", "apps")
+HAPP_SOCKS_DEFAULT = 10808
+HAPP_PREFS_KEY = r"Software\Happ\OrganizationDefaults\Preferences\AdvancedSettings"
+HAPP_CONFIG_FILE = (Path(os.environ.get("LOCALAPPDATA") or str(Path.home()))
+                    / "Happ" / "config.json")
+PROXIFYRE_DIR = (Path(os.environ.get("LOCALAPPDATA") or str(Path.home()))
+                 / "BypassManager" / "proxifyre")
+PROXIFYRE_EXE = PROXIFYRE_DIR / "ProxiFyre.exe"
+PROXIFYRE_CONFIG = PROXIFYRE_DIR / "app-config.json"
+PROXIFYRE_LOG_DIR = PROXIFYRE_DIR / "logs"
+PROXIFYRE_SERVICE = "ProxiFyre"
+PACKET_FILTER_DRIVER = "ndisrd"   # Windows Packet Filter — нужен ProxiFyre
+
+SVC_STOPPED = 1
+SVC_RUNNING = 4
+
+AVATAR_COLORS = ("#4c8dff", "#4fd18b", "#f0b429", "#c084fc",
+                 "#f97362", "#38bdf8", "#f472b6", "#a3e635")
+
+APP_SKIP_PREFIXES = ("unins", "setup", "install", "update", "vcredist", "dxsetup")
+
+
+@dataclass(frozen=True)
+class AppEntry:
+    """Строка каталога программ: одна запись = один exe."""
+
+    exe: str
+    name: str
+    path: str = ""
+    running: bool = False
+    source: str = ""
+
+
+def pretty_app_name(exe: str) -> str:
+    """discord-desktop.exe → «Discord Desktop»."""
+    stem = Path(str(exe or "")).stem
+    stem = re.sub(r"(?i)([-_](x64|x86|amd64|setup|portable|bin))$", "", stem)
+    words = [word for word in re.split(r"[-_\s]+", stem) if word]
+    if not words:
+        return Path(str(exe)).name or str(exe or "")
+    return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def normalize_app(value: str) -> str:
+    """Путь или имя → имя exe. Пустое/не-exe → ''."""
+    text = str(value or "").strip().strip('"')
+    if not text:
+        return ""
+    name = Path(text.replace("/", "\\")).name if ("\\" in text or "/" in text) else text
+    name = name.strip()
+    return name if name.lower().endswith(".exe") else ""
+
+
+def normalize_apps(values) -> list[str]:
+    """Список программ без дублей и мусора, в порядке появления."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values or []:
+        name = normalize_app(value)
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(name)
+    return result
+
+
+def app_score(entry: AppEntry, query: str) -> int:
+    """Насколько запись подходит под запрос. 0 — не подходит."""
+    text = (query or "").strip().lower()
+    if not text:
+        return 1
+    name = entry.name.lower()
+    exe = entry.exe.lower()
+    path = (entry.path or "").lower()
+    total = 0
+    for token in text.split():
+        if name.startswith(token):
+            weight = 5
+        elif token in name:
+            weight = 4
+        elif exe.startswith(token):
+            weight = 3
+        elif token in exe:
+            weight = 2
+        elif token in path:
+            weight = 1
+        else:
+            return 0
+        total += weight
+    return total
+
+
+def filter_apps(entries, query: str = "", *, only_running: bool = False,
+                limit: int = 0) -> list[AppEntry]:
+    """Поиск по каталогу: точное совпадение выше, запущенные выше остальных."""
+    scored: list[tuple[int, AppEntry]] = []
+    for entry in entries or []:
+        if only_running and not entry.running:
+            continue
+        score = app_score(entry, query)
+        if score:
+            scored.append((score, entry))
+    scored.sort(key=lambda pair: (-pair[0], not pair[1].running, pair[1].name.lower()))
+    result = [entry for _score, entry in scored]
+    return result[:limit] if limit else result
+
+
+def _usable_exe(path: str) -> bool:
+    text = str(path or "").strip().strip('"')
+    if not text.lower().endswith(".exe"):
+        return False
+    low = text.lower()
+    if "\\windows\\" in low:          # системные утилиты не нужны в списке
+        return False
+    name = Path(text).name.lower()
+    if name.startswith(APP_SKIP_PREFIXES):
+        return False
+    return True
+
+
+def _running_exe_paths() -> list[str]:
+    """Пути запущенных процессов через ctypes — без PowerShell и без задержек."""
+    if sys.platform != "win32":
+        return []
+    try:
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        count = 2048
+        buffer = (ctypes.c_ulong * count)()
+        needed = ctypes.c_ulong()
+        if not kernel32.EnumProcesses(buffer, ctypes.sizeof(buffer), ctypes.byref(needed)):
+            return []
+        total = min(count, needed.value // ctypes.sizeof(ctypes.c_ulong))
+        paths: list[str] = []
+        for index in range(total):
+            pid = int(buffer[index])
+            if not pid:
+                continue
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                continue
+            try:
+                name_buffer = ctypes.create_unicode_buffer(32768)
+                size = ctypes.c_ulong(len(name_buffer))
+                if kernel32.QueryFullProcessImageNameW(
+                    handle, 0, name_buffer, ctypes.byref(size)
+                ):
+                    if name_buffer.value:
+                        paths.append(name_buffer.value)
+            finally:
+                kernel32.CloseHandle(handle)
+        return paths
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _registry_app_paths() -> list[str]:
+    """«App Paths» из реестра: большинство установленных программ."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    paths: list[str] = []
+    sub = r"Software\Microsoft\Windows\CurrentVersion\App Paths"
+    views = (0, getattr(winreg, "KEY_WOW64_64KEY", 0), getattr(winreg, "KEY_WOW64_32KEY", 0))
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in views:
+            try:
+                with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ | view) as key:
+                    index = 0
+                    while True:
+                        try:
+                            child = winreg.EnumKey(key, index)
+                        except OSError:
+                            break
+                        index += 1
+                        try:
+                            with winreg.OpenKey(key, child) as app_key:
+                                value, _kind = winreg.QueryValueEx(app_key, "")
+                        except OSError:
+                            continue
+                        value = str(value or "").strip().strip('"')
+                        if value:
+                            paths.append(value)
+            except OSError:
+                continue
+    return paths
+
+
+def _start_menu_apps() -> list[tuple[str, str]]:
+    """Ярлыки меню «Пуск»: (подпись, путь к exe). Один вызов PowerShell."""
+    script = (
+        "$shell = New-Object -ComObject WScript.Shell\n"
+        "$dirs = @(\"$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\", "
+        "\"$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\")\n"
+        "foreach ($dir in $dirs) {\n"
+        "  if (-not (Test-Path $dir)) { continue }\n"
+        "  Get-ChildItem -Path $dir -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | "
+        "ForEach-Object {\n"
+        "    try {\n"
+        "      $target = $shell.CreateShortcut($_.FullName).TargetPath\n"
+        "      if ($target -and $target.ToLower().EndsWith('.exe')) {\n"
+        "        \"{0}`t{1}\" -f $_.BaseName, $target\n"
+        "      }\n"
+        "    } catch { }\n"
+        "  }\n"
+        "}\n"
+    )
+    try:
+        output = ps_run(script, timeout=90)
+    except Exception:  # noqa: BLE001
+        return []
+    result: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        if "\t" not in line:
+            continue
+        label, _, target = line.partition("\t")
+        label = label.strip()
+        target = target.strip()
+        if target:
+            result.append((label, target))
+    return result
+
+
+def app_catalog(running_paths=None, registry_paths=None,
+                shortcuts=None) -> list[AppEntry]:
+    """Каталог программ: запущенные + реестр + меню «Пуск», без дублей по exe."""
+    if running_paths is None:
+        running_paths = _running_exe_paths()
+    if registry_paths is None:
+        registry_paths = _registry_app_paths()
+    if shortcuts is None:
+        shortcuts = _start_menu_apps()
+
+    entries: dict[str, AppEntry] = {}
+
+    def key_of(path: str) -> str:
+        return Path(path).name.lower()
+
+    for path in running_paths:
+        if not _usable_exe(path):
+            continue
+        entries[key_of(path)] = AppEntry(
+            exe=Path(path).name, name=pretty_app_name(Path(path).name),
+            path=path, running=True, source="running",
+        )
+
+    for path in registry_paths:
+        if not _usable_exe(path):
+            continue
+        name = Path(path).name
+        key = key_of(path)
+        if key in entries:
+            if not entries[key].path:
+                entries[key] = replace(entries[key], path=path)
+            continue
+        entries[key] = AppEntry(exe=name, name=pretty_app_name(name),
+                                path=path, source="registry")
+
+    for label, path in shortcuts:
+        if not _usable_exe(path):
+            continue
+        name = Path(path).name
+        key = key_of(path)
+        title = label.strip() or pretty_app_name(name)
+        previous = entries.get(key)
+        if previous is None:
+            entries[key] = AppEntry(exe=name, name=title, path=path, source="startmenu")
+        elif previous.source != "running":
+            entries[key] = replace(previous, name=title, path=previous.path or path,
+                                   source="startmenu")
+
+    items = list(entries.values())
+    items.sort(key=lambda item: (not item.running, item.name.lower()))
+    return items
+
+
+# -- Happ: режим туннеля и локальный SOCKS ---------------------------------- #
+def happ_socks_port_from(data) -> int:
+    """Порт локального SOCKS Happ из его конфига (sing-box)."""
+    if not isinstance(data, dict):
+        return HAPP_SOCKS_DEFAULT
+    for outbound in data.get("outbounds") or []:
+        if not isinstance(outbound, dict):
+            continue
+        if str(outbound.get("type") or "").lower() not in ("socks", "socks5"):
+            continue
+        server = str(outbound.get("server") or "").strip()
+        if server not in ("127.0.0.1", "localhost", "::1"):
+            continue
+        try:
+            port = int(outbound.get("server_port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if 0 < port < 65536:
+            return port
+    return HAPP_SOCKS_DEFAULT
+
+
+def happ_socks_port(config_file: Path | None = None) -> int:
+    path = Path(config_file) if config_file else HAPP_CONFIG_FILE
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return HAPP_SOCKS_DEFAULT
+    return happ_socks_port_from(data)
+
+
+def port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.4) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            return sock.connect_ex((host, int(port))) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reg_get_int(key_path: str, name: str, default: int) -> int:
+    try:
+        import winreg
+    except ImportError:
+        return default
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+        return int(value)
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def _reg_set_int(key_path: str, name: str, value: int) -> bool:
+    try:
+        import winreg
+    except ImportError:
+        return False
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value))
+        return True
+    except OSError:
+        return False
+
+
+def happ_mode_read() -> dict:
+    """Как Happ сейчас пускает трафик: TUN-адаптер и системный прокси."""
+    return {
+        "tun": bool(_reg_get_int(HAPP_PREFS_KEY, "tun", 1)),
+        "system_proxy": bool(_reg_get_int(HAPP_PREFS_KEY, "system_proxy", 1)),
+    }
+
+
+def happ_mode_write(tun: bool | None = None, system_proxy: bool | None = None) -> dict:
+    if tun is not None and not _reg_set_int(HAPP_PREFS_KEY, "tun", 1 if tun else 0):
+        raise RuntimeError(
+            "Не удалось изменить настройку Happ (tun) в реестре HKCU\\Software\\Happ"
+        )
+    if system_proxy is not None and not _reg_set_int(
+        HAPP_PREFS_KEY, "system_proxy", 1 if system_proxy else 0
+    ):
+        raise RuntimeError(
+            "Не удалось изменить настройку Happ (systemProxy) в реестре HKCU\\Software\\Happ"
+        )
+    return happ_mode_read()
+
+
+def happ_tunnel_restart(timeout: float = 25.0) -> dict:
+    """Перезапуск туннеля Happ, чтобы он применил новые настройки."""
+    exe = Path(bypass_cfg()["happ_path"])
+    if not _image_pids(exe.name) or not happ_connected():
+        return bypass_happ_start()
+    happ_send("disconnect")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not happ_connected():
+            break
+        time.sleep(0.4)
+    return bypass_happ_start()
+
+
+# -- ProxiFyre: перенаправление только выбранных процессов ------------------ #
+class SERVICE_STATUS(ctypes.Structure):
+    _fields_ = [
+        ("dwServiceType", ctypes.c_ulong),
+        ("dwCurrentState", ctypes.c_ulong),
+        ("dwControlsAccepted", ctypes.c_ulong),
+        ("dwWin32ExitCode", ctypes.c_ulong),
+        ("dwServiceSpecificExitCode", ctypes.c_ulong),
+        ("dwCheckPoint", ctypes.c_ulong),
+        ("dwWaitHint", ctypes.c_ulong),
+    ]
+
+
+_ADVAPI_READY = False
+
+
+def _advapi():
+    global _ADVAPI_READY
+    api = ctypes.windll.advapi32
+    if not _ADVAPI_READY:
+        api.OpenSCManagerW.restype = ctypes.c_void_p
+        api.OpenSCManagerW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        api.OpenServiceW.restype = ctypes.c_void_p
+        api.OpenServiceW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        api.QueryServiceStatus.argtypes = [ctypes.c_void_p, ctypes.POINTER(SERVICE_STATUS)]
+        api.StartServiceW.restype = ctypes.c_int
+        api.StartServiceW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                      ctypes.POINTER(ctypes.c_wchar_p)]
+        api.ControlService.restype = ctypes.c_int
+        api.ControlService.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                       ctypes.POINTER(SERVICE_STATUS)]
+        api.CloseServiceHandle.argtypes = [ctypes.c_void_p]
+        _ADVAPI_READY = True
+    return api
+
+
+def _svc_state(name: str) -> int | None:
+    """Состояние службы/драйвера: 4 — работает, 1 — остановлена, None — нет такой."""
+    if sys.platform != "win32":
+        return None
+    try:
+        api = _advapi()
+        scm = api.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
+        if not scm:
+            return None
+        try:
+            handle = api.OpenServiceW(scm, name, 0x0004)  # SERVICE_QUERY_STATUS
+            if not handle:
+                return None
+            try:
+                status = SERVICE_STATUS()
+                if not api.QueryServiceStatus(handle, ctypes.byref(status)):
+                    return None
+                return int(status.dwCurrentState)
+            finally:
+                api.CloseServiceHandle(handle)
+        finally:
+            api.CloseServiceHandle(scm)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _svc_start(name: str, wait: float = 12.0) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        api = _advapi()
+        scm = api.OpenSCManagerW(None, None, 0x0001)
+        if not scm:
+            return False
+        try:
+            handle = api.OpenServiceW(scm, name, 0x0010 | 0x0004)
+            if not handle:
+                return False
+            try:
+                api.StartServiceW(handle, 0, None)
+            finally:
+                api.CloseServiceHandle(handle)
+        finally:
+            api.CloseServiceHandle(scm)
+    except Exception:  # noqa: BLE001
+        return False
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if _svc_state(name) == SVC_RUNNING:
+            return True
+        time.sleep(0.3)
+    return _svc_state(name) == SVC_RUNNING
+
+
+def _svc_stop(name: str, wait: float = 12.0) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        api = _advapi()
+        scm = api.OpenSCManagerW(None, None, 0x0001)
+        if not scm:
+            return False
+        try:
+            handle = api.OpenServiceW(scm, name, 0x0020 | 0x0004)
+            if not handle:
+                return False
+            try:
+                status = SERVICE_STATUS()
+                api.ControlService(handle, 1, ctypes.byref(status))  # SERVICE_CONTROL_STOP
+            finally:
+                api.CloseServiceHandle(handle)
+        finally:
+            api.CloseServiceHandle(scm)
+    except Exception:  # noqa: BLE001
+        return False
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if _svc_state(name) == SVC_STOPPED:
+            return True
+        time.sleep(0.3)
+    return _svc_state(name) == SVC_STOPPED
+
+
+def proxifyre_config_data(apps, port: int) -> dict:
+    return {
+        "logLevel": "INFO",
+        "proxies": [{
+            "appNames": normalize_apps(apps),
+            "socks5ProxyEndpoint": f"127.0.0.1:{int(port)}",
+            "supportedProtocols": ["TCP", "UDP"],
+        }],
+    }
+
+
+def proxifyre_write_config(apps, port: int) -> bool:
+    """Пишет app-config.json. True — файл изменился (нужен перезапуск службы)."""
+    data = proxifyre_config_data(apps, port)
+    try:
+        current = json.loads(PROXIFYRE_CONFIG.read_text("utf-8"))
+    except (OSError, ValueError):
+        current = None
+    if current == data:
+        return False
+    PROXIFYRE_DIR.mkdir(parents=True, exist_ok=True)
+    PROXIFYRE_CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=4), "utf-8")
+    return True
+
+
+def proxifyre_driver_ok() -> bool:
+    return _svc_state(PACKET_FILTER_DRIVER) == SVC_RUNNING
+
+
+def proxifyre_status() -> dict:
+    state = _svc_state(PROXIFYRE_SERVICE)
+    apps: list[str] = []
+    try:
+        data = json.loads(PROXIFYRE_CONFIG.read_text("utf-8"))
+        for proxy in data.get("proxies") or []:
+            if isinstance(proxy, dict):
+                apps.extend(normalize_apps(proxy.get("appNames")))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {
+        "installed": PROXIFYRE_EXE.exists(),
+        "driver": proxifyre_driver_ok(),
+        "service": state,
+        "running": state == SVC_RUNNING,
+        "apps": normalize_apps(apps),
+    }
+
+
+def _proxifyre_install() -> bool:
+    if not PROXIFYRE_EXE.exists():
+        return False
+    if is_admin():
+        run_tool([str(PROXIFYRE_EXE), "install"], cwd=str(PROXIFYRE_DIR), timeout=120)
+    else:
+        try:
+            code = int(ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", str(PROXIFYRE_EXE), "install", str(PROXIFYRE_DIR), 0,
+            ))
+        except Exception:  # noqa: BLE001
+            return False
+        if code <= 32:
+            return False
+    for _ in range(40):
+        time.sleep(0.5)
+        if _svc_state(PROXIFYRE_SERVICE) is not None:
+            return True
+    return False
+
+
+def proxifyre_start(apps=None, port: int | None = None) -> dict:
+    """Включает перенаправление выбранных программ в SOCKS Happ."""
+    cfg = bypass_cfg()
+    names = normalize_apps(cfg["apps"] if apps is None else apps)
+    if not names:
+        raise RuntimeError("Не выбрано ни одной программы — отметьте их в списке")
+    port = int(port or cfg.get("socks_port") or happ_socks_port())
+    if not PROXIFYRE_EXE.exists():
+        raise RuntimeError(f"ProxiFyre не найден: {PROXIFYRE_EXE}")
+    if not proxifyre_driver_ok():
+        raise RuntimeError(
+            "Драйвер Windows Packet Filter (ndisrd) не запущен — "
+            "обход по программам без него невозможен"
+        )
+    changed = proxifyre_write_config(names, port)
+    state = _svc_state(PROXIFYRE_SERVICE)
+    if state is None:
+        if not _proxifyre_install():
+            raise RuntimeError(
+                "Служба ProxiFyre не установлена: подтвердите запрос прав администратора"
+            )
+        state = _svc_state(PROXIFYRE_SERVICE)
+    if state == SVC_RUNNING and not changed:
+        return {"ok": True, "detail": f"Обход уже включён для {len(names)} программ"}
+    if state == SVC_RUNNING:
+        _svc_stop(PROXIFYRE_SERVICE)
+    if not _svc_start(PROXIFYRE_SERVICE):
+        raise RuntimeError(
+            "Не удалось запустить службу ProxiFyre — нужны права администратора"
+        )
+    return {
+        "ok": True,
+        "detail": f"Обход включён для {len(names)} программ через SOCKS 127.0.0.1:{port}",
+    }
+
+
+def proxifyre_stop() -> dict:
+    state = _svc_state(PROXIFYRE_SERVICE)
+    if state is None:
+        return {"ok": True, "detail": ""}
+    if state != SVC_RUNNING:
+        return {"ok": True, "detail": "Обход по программам уже выключен"}
+    if not _svc_stop(PROXIFYRE_SERVICE):
+        raise RuntimeError("Не удалось остановить службу ProxiFyre")
+    return {"ok": True, "detail": "Обход по программам выключен"}
+
+
+def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
+    """Единая точка применения: весь трафик или только выбранные программы."""
+    cfg = bypass_cfg()
+    scope = str(scope or cfg["scope"]).lower()
+    mode = str(mode or cfg["mode"]).lower()
+    if scope not in BYPASS_SCOPES:
+        raise RuntimeError(f"неизвестная область обхода {scope!r}")
+    if mode not in ("happ", "gbd"):
+        raise RuntimeError(f"неизвестный режим {mode!r}")
+    if scope == "apps" and mode != "happ":
+        raise RuntimeError(
+            "Обход по программам работает только через Happ: "
+            "GoodbyeDPI правит пакеты и не различает процессы"
+        )
+    if scope == "apps" and not normalize_apps(cfg["apps"]):
+        raise RuntimeError("Не выбрано ни одной программы")
+
+    notes: list[str] = []
+
+    def add(result) -> None:
+        if isinstance(result, dict) and result.get("detail"):
+            notes.append(str(result["detail"]))
+
+    # 1. Гасим то, что противоречит выбранному режиму
+    if mode == "gbd" and (happ_connected() or _image_pids("xray.exe")):
+        add(bypass_happ_stop())
+    if mode == "happ" and _image_pids("goodbyedpi.exe"):
+        add(bypass_stop("gbd"))
+
+    # 2. Настройки Happ: TUN нужен только для «всего трафика»
+    if mode == "happ":
+        want_tun = scope == "all"
+        current = happ_mode_read()
+        if current["tun"] != want_tun or current["system_proxy"] != want_tun:
+            happ_mode_write(tun=want_tun, system_proxy=want_tun)
+            notes.append(
+                "Happ: весь трафик (TUN)" if want_tun
+                else "Happ: без TUN — только локальный SOCKS для выбранных программ"
+            )
+            if _image_pids(Path(cfg["happ_path"]).name):
+                add(happ_tunnel_restart())
+
+    # 3. Включаем движок
+    if mode == "happ":
+        add(bypass_happ_start())
+        if scope == "apps":
+            port = happ_socks_port()
+            if not port_open(port):
+                raise RuntimeError(
+                    f"Локальный SOCKS Happ не отвечает на 127.0.0.1:{port} — "
+                    "обход по программам не заработает. Проверьте, что Happ подключён."
+                )
+            add(proxifyre_start(cfg["apps"], port))
+        else:
+            add(proxifyre_stop())
+    else:
+        add(bypass_gbd_start())
+
+    bypass_cfg_save(mode=mode, scope=scope)
+    return {"ok": True, "detail": "\n".join(filter(None, notes))}
 
 
 def listening_pid(port: int) -> int:
@@ -4534,162 +5251,633 @@ class GitHubPanel(Panel):
 # --------------------------------------------------------------------------- #
 #  Панель: Bypass (встроенный движок, режим Happ ↔ GoodbyeDPI)
 # --------------------------------------------------------------------------- #
+def _round_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
+                radius: float, **options):
+    """Скруглённый прямоугольник на Canvas (в Tk его нет из коробки)."""
+    radius = max(0.0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+    points = [
+        x1 + radius, y1, x2 - radius, y1, x2, y1,
+        x2, y1 + radius, x2, y2 - radius, x2, y2,
+        x2 - radius, y2, x1 + radius, y2, x1, y2,
+        x1, y2 - radius, x1, y1 + radius, x1, y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, **options)
+
+
+class Switch(tk.Canvas):
+    """Переключатель в стиле iOS: скруглённый трек + белый кружок."""
+
+    def __init__(self, parent, value: bool = False, command=None, *, bg: str = CARD):
+        self._tw, self._th = px(46), px(26)
+        super().__init__(parent, width=self._tw, height=self._th, bg=bg,
+                         highlightthickness=0, cursor="hand2")
+        self.value = bool(value)
+        self.command = command
+        self.enabled = True
+        self.bind("<Button-1>", self._on_click)
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        if not self.enabled:
+            track = "#2a2f39"
+        else:
+            track = OK if self.value else "#3a4150"
+        _round_rect(self, 1, 1, self._tw - 1, self._th - 1, (self._th - 2) / 2,
+                    fill=track, outline="")
+        radius = (self._th - 8) / 2
+        center_y = self._th / 2
+        center_x = (self._tw - 4 - radius) if self.value else (4 + radius)
+        self.create_oval(center_x - radius, center_y - radius,
+                         center_x + radius, center_y + radius,
+                         fill="#ffffff", outline="")
+
+    def set(self, value: bool, *, notify: bool = False) -> None:
+        self.value = bool(value)
+        self._draw()
+        if notify and self.command:
+            self.command(self.value)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.configure(cursor="hand2" if self.enabled else "arrow")
+        self._draw()
+
+    def _on_click(self, _event=None) -> None:
+        if not self.enabled:
+            return
+        self.set(not self.value, notify=True)
+
+
+class Segmented(tk.Canvas):
+    """Сегментированный контрол в стиле macOS."""
+
+    def __init__(self, parent, options, value, command, *, bg: str = BG):
+        import tkinter.font as tkfont
+
+        self.options = list(options)
+        self.value = value
+        self.command = command
+        self.enabled = True
+        self._font = ("Segoe UI", 9, "bold")
+        metrics = tkfont.Font(font=self._font)
+        self._widths = [max(px(132), metrics.measure(label) + px(38))
+                        for _key, label in self.options]
+        self._h = px(34)
+        super().__init__(parent, width=sum(self._widths) + px(6), height=self._h,
+                         bg=bg, highlightthickness=0, cursor="hand2")
+        self.bind("<Button-1>", self._on_click)
+        self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        total = sum(self._widths) + px(6)
+        _round_rect(self, 1, 1, total - 1, self._h - 1, (self._h - 2) / 2,
+                    fill=FIELD, outline=BORDER)
+        x = px(3)
+        for (key, label), width in zip(self.options, self._widths):
+            active = key == self.value
+            if active:
+                _round_rect(self, x, px(3), x + width - px(3), self._h - px(3),
+                            (self._h - px(6)) / 2,
+                            fill=ACCENT if self.enabled else "#2b303a", outline="")
+            self.create_text(
+                x + (width - px(3)) / 2, self._h / 2, text=label,
+                fill="#ffffff" if (active and self.enabled) else MUTED,
+                font=self._font,
+            )
+            x += width
+
+    def set_value(self, value: str, *, notify: bool = False) -> None:
+        self.value = value
+        self._draw()
+        if notify and self.command:
+            self.command(self.value)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.configure(cursor="hand2" if self.enabled else "arrow")
+        self._draw()
+
+    def _on_click(self, event) -> None:
+        if not self.enabled:
+            return
+        x = px(3)
+        for (key, _label), width in zip(self.options, self._widths):
+            if x <= event.x <= x + width - px(3):
+                if key != self.value:
+                    self.set_value(key, notify=True)
+                return
+            x += width
+
+
+class AppRow(tk.Frame):
+    """Строка программы: аватар, имя, путь, бейдж «запущена», галочка."""
+
+    def __init__(self, parent, entry: AppEntry, selected: bool, on_toggle, *,
+                 bg: str = CARD):
+        super().__init__(parent, bg=bg)
+        self.entry = entry
+        self.selected = bool(selected)
+        self.on_toggle = on_toggle
+        self._bg = bg
+        self._hover = CARD_HOVER
+        self._parts: list[tk.Widget] = []
+
+        # Полоска слева: сразу видно, какие программы уже выбраны.
+        self.stripe = tk.Frame(self, width=px(3), bg=bg)
+        self.stripe.pack(side="left", fill="y")
+
+        self.avatar = tk.Canvas(self, width=px(34), height=px(34), bg=bg,
+                                highlightthickness=0)
+        self.avatar.pack(side="left", padx=(px(10), px(10)), pady=px(8))
+        self._parts.append(self.avatar)
+
+        body = tk.Frame(self, bg=bg)
+        body.pack(side="left", fill="x", expand=True)
+        self._parts.append(body)
+        self.name_label = tk.Label(body, text=entry.name, bg=bg, fg=FG,
+                                   font=("Segoe UI", 10, "bold"), anchor="w")
+        self.name_label.pack(fill="x")
+        self._parts.append(self.name_label)
+        subtitle = entry.path or entry.exe
+        if len(subtitle) > 78:
+            subtitle = subtitle[:36] + "…" + subtitle[-38:]
+        self.path_label = tk.Label(body, text=subtitle, bg=bg, fg=MUTED,
+                                   font=("Segoe UI", 8), anchor="w")
+        self.path_label.pack(fill="x")
+        self._parts.append(self.path_label)
+
+        if entry.running:
+            badge = tk.Label(self, text="запущена", bg=bg, fg=OK,
+                             font=("Segoe UI", 8, "bold"))
+            badge.pack(side="right", padx=(0, px(10)))
+            self._parts.append(badge)
+
+        self.box = tk.Canvas(self, width=px(22), height=px(22), bg=bg,
+                             highlightthickness=0, cursor="hand2")
+        self.box.pack(side="right", padx=(0, px(6)))
+        self._parts.append(self.box)
+
+        for widget in self._parts:
+            widget.bind("<Button-1>", self._click)
+            widget.bind("<Enter>", self._enter)
+            widget.bind("<Leave>", self._leave)
+        self._paint()
+
+    def _base_color(self) -> str:
+        return "#1a2333" if self.selected else self._bg
+
+    def _paint(self) -> None:
+        self._tint(self._base_color())
+        self.stripe.configure(bg=ACCENT if self.selected else self._base_color())
+        self.avatar.delete("all")
+        color = AVATAR_COLORS[sum(self.entry.exe.lower().encode()) % len(AVATAR_COLORS)]
+        self.avatar.create_oval(1, 1, px(33), px(33), fill=color, outline="")
+        letter = (self.entry.name or self.entry.exe)[:1].upper()
+        self.avatar.create_text(px(17), px(17), text=letter, fill="#0d0f13",
+                                font=("Segoe UI", 12, "bold"))
+        self.box.delete("all")
+        if self.selected:
+            _round_rect(self.box, 1, 1, px(21), px(21), px(6), fill=ACCENT, outline="")
+            self.box.create_text(px(11), px(11), text="✓", fill="#ffffff",
+                                 font=("Segoe UI", 10, "bold"))
+        else:
+            _round_rect(self.box, 1, 1, px(21), px(21), px(6), fill="", outline=BORDER,
+                        width=2)
+
+    def _tint(self, color: str) -> None:
+        for widget in [self, *self._parts]:
+            try:
+                widget.configure(bg=color)
+            except tk.TclError:
+                pass
+
+    def _enter(self, _event=None) -> None:
+        self._tint(self._hover)
+
+    def _leave(self, _event=None) -> None:
+        self._tint(self._base_color())
+
+    def _click(self, _event=None) -> None:
+        self.set_selected(not self.selected, notify=True)
+
+    def set_selected(self, selected: bool, *, notify: bool = False) -> None:
+        self.selected = bool(selected)
+        self._paint()
+        if notify and self.on_toggle:
+            self.on_toggle(self.entry, self.selected)
+
+
+class ScrollList(tk.Frame):
+    """Прокручиваемый контейнер для строк списка."""
+
+    def __init__(self, parent, *, bg: str = CARD):
+        super().__init__(parent, bg=bg)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self.bar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.bar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.bar.pack(side="right", fill="y")
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", self._on_inner)
+        self.canvas.bind("<Configure>", self._on_canvas)
+        self.canvas.bind("<Enter>", lambda _e: self._wheel(True))
+        self.canvas.bind("<Leave>", lambda _e: self._wheel(False))
+
+    def _on_inner(self, _event=None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas(self, event) -> None:
+        self.canvas.itemconfigure(self._window, width=event.width)
+
+    def _wheel(self, active: bool) -> None:
+        if active:
+            self.canvas.bind_all("<MouseWheel>", self._scroll)
+        else:
+            self.canvas.unbind_all("<MouseWheel>")
+
+    def _scroll(self, event) -> None:
+        try:
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+        except tk.TclError:
+            pass
+
+    def clear(self) -> None:
+        for child in self.inner.winfo_children():
+            child.destroy()
+
+
 class BypassPanel(Panel):
+    """Обход DPI: Happ (весь трафик или выбранные программы) и GoodbyeDPI."""
 
     MODES = ("happ", "gbd")
+    ROW_LIMIT = 80
 
     def __init__(self, master: tk.Misc, hub) -> None:
         super().__init__(master, hub)
-        self.selected = str((config_read().get("bypass") or {}).get("mode") or "happ")
-        if self.selected not in self.MODES:
-            self.selected = "happ"
-        self.engines: dict[str, dict] = {}
+        cfg = bypass_cfg()
+        self.mode = cfg["mode"]
+        self.scope = cfg["scope"]
+        self.selected_apps: set[str] = {name.lower() for name in cfg["apps"]}
+        self.catalog: list[AppEntry] = []
+        self.rows: dict[str, AppRow] = {}
+        self.state: dict = {}
+        self.online = False
         self.busy = False
         self.checking = False
+        self.loading_apps = False
+        self.query = ""
+        self.only_running = False
         self._offline_noted = False
-        self.online = False
-        self.state: dict = {}
         self._build()
+        self.load_catalog()
         self.refresh_now()
         self.after(3000, self._tick)
 
-    # -- интерфейс ------------------------------------------------------------ #
+    # -- разметка ----------------------------------------------------------- #
     def _build(self) -> None:
-        ttk.Label(
-            self, text="Что включить?", style="Muted.TLabel",
-        ).pack(anchor="w")
-        grid = tk.Frame(self, bg=BG)
-        grid.pack(fill="x", pady=(px(8), 0))
-        grid.columnconfigure((0, 1), weight=1)
-        grid.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(3, weight=4)
+        self.rowconfigure(5, weight=1)
 
-        self.mode_cards = {
-            "happ": self._mode_card(
-                grid, 0, "Happ — прокси-клиент",
-                "Клик по карточке включает/выключает VPN. Happ при этом не открывается "
-                "и не закрывается: команда happ://connect / happ://disconnect уходит "
-                "в клиент, окно нужно только для смены сервера («Показать Happ»).",
-            ),
-            "gbd": self._mode_card(
-                grid, 1, "GoodbyeDPI — весь интернет",
-                "Клик по карточке: включить/выключить обход DPI для всего трафика "
-                "(порты 80/443). Нужны права администратора, прокси не требуется.",
-            ),
+        top = tk.Frame(self, bg=BG)
+        top.grid(row=0, column=0, sticky="ew")
+        self.scope_control = Segmented(
+            top, (("all", "Весь трафик"), ("apps", "Только программы")),
+            self.scope, self._set_scope,
+        )
+        self.scope_control.pack(side="left")
+        self.scope_hint = tk.Label(
+            top, text="", bg=BG, fg=MUTED, font=("Segoe UI", 9), anchor="w",
+            justify="left",
+        )
+        self.scope_hint.pack(side="left", padx=(px(14), 0), fill="x", expand=True)
+
+        cards = tk.Frame(self, bg=BG)
+        cards.grid(row=1, column=0, sticky="ew", pady=(px(10), 0))
+        cards.columnconfigure(0, weight=1)
+        cards.columnconfigure(1, weight=1)
+        self.cards = {
+            "happ": self._engine_card(cards, 0, "happ", "Happ",
+                                      "VPN + обход по выбранным программам"),
+            "gbd": self._engine_card(cards, 1, "gbd", "GoodbyeDPI",
+                                     "обход DPI для всего интернета"),
         }
 
-        status = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        status.pack(fill="x", pady=(px(12), 0))
-        inner = tk.Frame(status, bg=CARD)
-        inner.pack(fill="x", padx=px(16), pady=px(12))
-
-        self.dot_var = tk.StringVar(value="grey")
-        tk.Label(inner, textvariable=self.dot_var, fg=MUTED, font=("Segoe UI", 10, "bold"),
-                 bg=CARD, width=2).pack(side="left")
-        self.mode_var = tk.StringVar(value="режим: —")
-        tk.Label(inner, textvariable=self.mode_var, fg=FG, font=("Segoe UI", 10, "bold"),
-                 bg=CARD, anchor="w").pack(side="left")
-        self.detail_var = tk.StringVar(value="проверяю…")
-        tk.Label(inner, textvariable=self.detail_var, fg=MUTED, font=("Segoe UI", 9),
-                 bg=CARD, anchor="w", justify="left", wraplength=px(700)).pack(
-            side="left", fill="x", expand=True, padx=(px(14), 0)
-        )
-        self.apps_row = tk.Frame(inner, bg=CARD)
-        self.apps_row.pack(fill="x", pady=(px(8), 0))
-        self.apps_var = tk.StringVar()
-        self.apps_label = tk.Label(self.apps_row, textvariable=self.apps_var, bg=CARD,
-                                   fg=MUTED, font=("Segoe UI", 9), anchor="w",
-                                   justify="left", wraplength=px(600))
-        self.apps_label.pack(side="left", fill="x", expand=True)
-
-        actions = ttk.Frame(self)
-        actions.pack(fill="x", pady=(px(14), px(6)))
-        self.btn_apply = flat_button(actions, "Включить", self.apply_toggle)
-        self.btn_apply.pack(side="left")
-        self.btn_apps = flat_button(
-            actions, "Путь Happ…", self.configure_dialog, kind="ghost",
-        )
-        self.btn_apps.pack(side="left", padx=(px(8), 0))
-        self.btn_show_happ = flat_button(
-            actions, "Показать Happ", self.show_happ, kind="ghost",
-        )
+        tools = tk.Frame(self, bg=BG)
+        tools.grid(row=2, column=0, sticky="ew", pady=(px(8), 0))
+        self.btn_happ_path = flat_button(tools, "Путь Happ…", self.configure_dialog,
+                                         kind="ghost")
+        self.btn_happ_path.pack(side="left")
+        self.btn_show_happ = flat_button(tools, "Показать Happ", self.show_happ,
+                                         kind="ghost")
         self.btn_show_happ.pack(side="left", padx=(px(8), 0))
-        self.btn_refresh = flat_button(actions, "Обновить", self.refresh_now, kind="ghost")
+        self.btn_download = flat_button(tools, "Скачать GoodbyeDPI",
+                                        lambda: self.download("gbd"), kind="ghost")
+        self.btn_download.pack(side="left", padx=(px(8), 0))
+        self.btn_refresh = flat_button(tools, "Обновить", self.refresh_now, kind="ghost")
         self.btn_refresh.pack(side="right")
 
-        extras = ttk.Frame(self)
-        extras.pack(fill="x", pady=(px(4), 0))
-        self.btn_dl_gbd = flat_button(extras, "Скачать GoodbyeDPI",
-                                      lambda: self.download("gbd"), kind="ghost")
-        self.btn_dl_gbd.pack(side="left")
+        self.apps_card = self._apps_card(self)
+        self.apps_card.grid(row=3, column=0, sticky="nsew", pady=(px(10), 0))
 
-        log_frame, self.log_box = self.make_log(self, height=7)
-        log_frame.pack(fill="both", expand=True, pady=(px(10), 0))
-        self.append_log(self.log_box, "Проверяю статусы движков…")
+        status = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        status.grid(row=4, column=0, sticky="ew", pady=(px(10), 0))
+        inner = tk.Frame(status, bg=CARD)
+        inner.pack(fill="x", padx=px(14), pady=px(10))
+        self.dot_var = tk.StringVar(value="○")
+        self.dot_label = tk.Label(inner, textvariable=self.dot_var, bg=CARD, fg=MUTED,
+                                  font=("Segoe UI", 12, "bold"), width=2)
+        self.dot_label.pack(side="left")
+        self.headline_var = tk.StringVar(value="проверяю…")
+        tk.Label(inner, textvariable=self.headline_var, bg=CARD, fg=FG,
+                 font=("Segoe UI", 10, "bold"), anchor="w").pack(side="left")
+        self.detail_var = tk.StringVar(value="")
+        tk.Label(inner, textvariable=self.detail_var, bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 9), anchor="w", justify="left",
+                 wraplength=px(640)).pack(side="left", fill="x", expand=True,
+                                          padx=(px(12), 0))
 
-    def _mode_card(self, parent: tk.Misc, column: int, title: str, caption: str) -> dict:
-        card = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1,
-                        cursor="hand2")
+        log_frame, self.log_box = self.make_log(self, height=5)
+        log_frame.grid(row=5, column=0, sticky="nsew", pady=(px(10), 0))
+        self.append_log(self.log_box, "Проверяю движки и локальный SOCKS Happ…")
+
+    def _engine_card(self, parent, column: int, key: str, title: str,
+                     subtitle: str) -> dict:
+        card = tk.Frame(parent, bg=CARD, highlightbackground=BORDER,
+                        highlightthickness=1, cursor="hand2")
         card.grid(row=0, column=column, sticky="nsew",
-                  padx=(0, px(10) if column == 0 else 0))
-        label = tk.Label(card, text=title, bg=CARD, fg=FG, font=("Segoe UI", 10, "bold"),
-                         anchor="w", cursor="hand2")
-        label.pack(anchor="w", padx=px(14), pady=(px(10), px(2)))
-        caption_label = tk.Label(card, text=caption, bg=CARD, fg=MUTED, font=("Segoe UI", 9),
-                                 anchor="w", justify="left", wraplength=px(260),
-                                 cursor="hand2")
-        caption_label.pack(anchor="w", padx=px(14), pady=(0, px(10)))
-        state_label = tk.Label(card, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 9),
-                               anchor="w", cursor="hand2")
-        state_label.pack(anchor="w", padx=px(14), pady=(0, px(10)))
-        widgets = (card, label, caption_label, state_label)
-        mode = "happ" if column == 0 else "gbd"
+                  padx=(0, px(10)) if column == 0 else (0, 0))
 
-        def choose(_event=None) -> None:
-            if self.busy:
-                return
-            if self.selected != mode:
-                self.selected = mode
-                if self.online:
-                    bypass_cfg_save(mode=mode)
-                self._update_controls()
-            if self.online:
-                # клик по карточке = включить, если выключено, и наоборот
-                self._toggle_engine(mode)
+        head = tk.Frame(card, bg=CARD, cursor="hand2")
+        head.pack(fill="x", padx=px(14), pady=(px(12), 0))
+        avatar = tk.Canvas(head, width=px(30), height=px(30), bg=CARD,
+                           highlightthickness=0, cursor="hand2")
+        avatar.pack(side="left")
+        _round_rect(avatar, 1, 1, px(29), px(29), px(9), fill=CARD_HOVER, outline="")
+        avatar.create_text(px(15), px(15), text=title[:1], fill=FG,
+                           font=("Segoe UI", 12, "bold"))
 
-        for widget in widgets:
-            widget.bind("<Button-1>", choose)
-        return {"frame": card, "title": label, "caption": caption_label, "state": state_label}
+        text = tk.Frame(head, bg=CARD, cursor="hand2")
+        text.pack(side="left", padx=(px(10), 0), fill="x", expand=True)
+        title_label = tk.Label(text, text=title, bg=CARD, fg=FG,
+                               font=("Segoe UI", 10, "bold"), anchor="w",
+                               cursor="hand2")
+        title_label.pack(fill="x")
+        subtitle_label = tk.Label(text, text=subtitle, bg=CARD, fg=MUTED,
+                                  font=("Segoe UI", 8), anchor="w", cursor="hand2")
+        subtitle_label.pack(fill="x")
 
-    def _mode_names(self, mode: str) -> str:
-        return "Happ" if mode == "happ" else "GoodbyeDPI"
+        switch = Switch(head, False, lambda value, k=key: self._on_switch(k, value),
+                        bg=CARD)
+        switch.pack(side="right")
 
-    def _mode_hint(self, hint: str | None = None) -> None:
-        running_mode, _running_state, _ = self._running_mode()
-        if running_mode is not None:
-            self.mode_var.set(f" работает: {self._mode_names(running_mode)}")
-            if hint:
-                self.detail_var.set(hint)
-            elif running_mode == self.selected:
-                self.detail_var.set(
-                    f"{self._mode_names(running_mode)} включён — клик выключит VPN "
-                    "(окно программы не закроется)"
-                )
-            else:
-                self.detail_var.set(f"сейчас работает {self._mode_names(running_mode)}, "
-                                    f"клик по другой карточке выключит его и включит "
-                                    f"{self._mode_names(self.selected)}")
-            self.dot_var.set("● активен")
+        status_label = tk.Label(card, text="проверяю…", bg=CARD, fg=MUTED,
+                                font=("Segoe UI", 9), anchor="w", justify="left",
+                                wraplength=px(300), cursor="hand2")
+        status_label.pack(fill="x", padx=px(14), pady=(px(8), px(12)))
+
+        for widget in (card, head, avatar, text, title_label, subtitle_label, status_label):
+            widget.bind("<Button-1>", lambda _e, k=key: self._choose(k))
+        return {"frame": card, "switch": switch, "status": status_label,
+                "avatar": avatar, "title": title_label}
+
+    def _apps_card(self, parent) -> tk.Frame:
+        card = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        head = tk.Frame(card, bg=CARD)
+        head.pack(fill="x", padx=px(14), pady=(px(12), px(6)))
+        tk.Label(head, text="Программы через обход", bg=CARD, fg=FG,
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.count_var = tk.StringVar(value="выбрано 0")
+        tk.Label(head, textvariable=self.count_var, bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(px(10), 0))
+        self.only_running_btn = flat_button(
+            head, "Только запущенные", self._toggle_only_running, kind="ghost")
+        self.only_running_btn.pack(side="right")
+        flat_button(head, "Снять все", self._clear_apps, kind="ghost").pack(
+            side="right", padx=(0, px(8)))
+
+        search_row = tk.Frame(card, bg=FIELD, highlightbackground=BORDER,
+                              highlightthickness=1)
+        search_row.pack(fill="x", padx=px(14), pady=(0, px(8)))
+        tk.Label(search_row, text="⌕", bg=FIELD, fg=MUTED,
+                 font=("Segoe UI", 12)).pack(side="left", padx=(px(10), px(4)))
+        self.search_var = tk.StringVar()
+        self.search_entry = tk.Entry(
+            search_row, textvariable=self.search_var, bg=FIELD, fg=FG,
+            insertbackground=FG, relief="flat", bd=0, font=("Segoe UI", 10),
+            highlightthickness=0,
+        )
+        self.search_entry.pack(side="left", fill="x", expand=True, pady=px(7))
+        self.search_var.trace_add("write", lambda *_args: self._on_search())
+        self.placeholder = tk.Label(search_row, text="Поиск программы — имя или путь",
+                                    bg=FIELD, fg="#5f6773", font=("Segoe UI", 10),
+                                    cursor="xterm")
+        self.placeholder.place(in_=self.search_entry, x=px(2), rely=0.5, anchor="w")
+        self.search_entry.bind("<Button-1>", lambda _e: self.placeholder.place_forget())
+        self.placeholder.bind("<Button-1>", lambda _e: self._focus_search())
+        self.clear_search_btn = flat_button(search_row, "✕", self._clear_search,
+                                            kind="ghost", padx=px(8), pady=px(2))
+        self.clear_search_btn.pack(side="right", padx=(0, px(4)))
+
+        self.app_list = ScrollList(card, bg=CARD)
+        self.app_list.pack(fill="both", expand=True, padx=px(6), pady=(0, px(4)))
+        self.empty_label = tk.Label(
+            card, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 9),
+            anchor="w", justify="left", wraplength=px(700),
+        )
+        self.empty_label.pack(fill="x", padx=px(14), pady=(0, px(10)))
+        return card
+
+    # -- каталог программ ---------------------------------------------------- #
+    def load_catalog(self) -> None:
+        if self.loading_apps:
+            return
+        self.loading_apps = True
+        self.empty_label.configure(text="Собираю список программ…")
+        self.hub.run_bg(app_catalog, self._catalog_done, self._catalog_fail)
+
+    def _catalog_done(self, catalog) -> None:
+        self.loading_apps = False
+        self.catalog = list(catalog or [])
+        self._rebuild_rows()
+        self._apply_filter()
+        self.append_log(self.log_box, f"Найдено программ: {len(self.catalog)}")
+
+    def _catalog_fail(self, exc: Exception) -> None:
+        self.loading_apps = False
+        self.empty_label.configure(text=f"Не удалось собрать список: {exc}")
+        self.append_log(self.log_box, f"Каталог программ: {exc}", "error")
+
+    def _rebuild_rows(self) -> None:
+        self.app_list.clear()
+        self.rows.clear()
+
+    def _apply_filter(self) -> None:
+        matched = filter_apps(self.catalog, self.query, only_running=self.only_running)
+        visible = matched[: self.ROW_LIMIT]
+        shown: set[str] = set()
+        for entry in visible:
+            key = entry.exe.lower()
+            row = self.rows.get(key)
+            if row is None:
+                row = AppRow(self.app_list.inner, entry, key in self.selected_apps,
+                             self._on_app_toggle, bg=CARD)
+                self.rows[key] = row
+            row.pack(fill="x")
+            shown.add(key)
+        for key, row in self.rows.items():
+            if key not in shown:
+                row.pack_forget()
+        self.app_list.canvas.yview_moveto(0)
+        self._update_empty_hint(matched)
+
+    def _update_empty_hint(self, matched) -> None:
+        total = len(self.catalog)
+        if not total:
+            self.empty_label.configure(
+                text="Список пуст — нажмите «Обновить» или добавьте программу вручную."
+            )
+        elif not matched:
+            self.empty_label.configure(
+                text="Ничего не нашлось. Попробуйте другое имя или сбросьте фильтр."
+            )
+        elif len(matched) > self.ROW_LIMIT:
+            self.empty_label.configure(
+                text=f"Показано {self.ROW_LIMIT} из {len(matched)} — уточните поиск."
+            )
         else:
-            self.mode_var.set(f" выбран: {self._mode_names(self.selected)}")
-            self.detail_var.set(hint or "клик по карточке или «Включить» — включит VPN")
-            self.dot_var.set("○ не запущено")
-        show_apps = (running_mode or self.selected) == "happ"
-        if show_apps:
-            self.apps_row.pack(fill="x", pady=(px(6), 0))
-        else:
-            self.apps_row.pack_forget()
+            self.empty_label.configure(text="")
+        self.count_var.set(f"выбрано {len(self.selected_apps)} из {total}")
 
-    # -- статус ------------------------------------------------------------ #
+    def _on_search(self) -> None:
+        self.query = self.search_var.get()
+        if self.query:
+            self.placeholder.place_forget()
+        else:
+            self.placeholder.place(in_=self.search_entry, x=px(2), rely=0.5, anchor="w")
+        self._apply_filter()
+
+    def _clear_search(self) -> None:
+        self.search_var.set("")
+        self.search_entry.focus_set()
+
+    def _focus_search(self) -> None:
+        self.placeholder.place_forget()
+        self.search_entry.focus_set()
+
+    def _toggle_only_running(self) -> None:
+        self.only_running = not self.only_running
+        self.only_running_btn.configure(
+            text="● Только запущенные" if self.only_running else "Только запущенные",
+            fg=ACCENT if self.only_running else FG,
+        )
+        self._apply_filter()
+
+    def _on_app_toggle(self, entry: AppEntry, selected: bool) -> None:
+        key = entry.exe.lower()
+        if selected:
+            self.selected_apps.add(key)
+        else:
+            self.selected_apps.discard(key)
+        self._save_cfg()
+        self._update_controls()
+
+    def _clear_apps(self) -> None:
+        self.selected_apps.clear()
+        for row in self.rows.values():
+            row.set_selected(False)
+        self._save_cfg()
+        self._update_controls()
+
+    def _selected_exe(self) -> list[str]:
+        result = []
+        for entry in self.catalog:
+            if entry.exe.lower() in self.selected_apps:
+                result.append(entry.exe)
+        known = {name.lower() for name in result}
+        for name in bypass_cfg()["apps"]:
+            if name.lower() in self.selected_apps and name.lower() not in known:
+                result.append(name)
+        return normalize_apps(result)
+
+    def _save_cfg(self) -> None:
+        bypass_cfg_save(mode=self.mode, scope=self.scope,
+                        apps=self._selected_exe())
+
+    # -- выбор движка и области ---------------------------------------------- #
+    def _choose(self, mode: str) -> None:
+        if self.busy or self.mode == mode:
+            return
+        self.mode = mode
+        if mode == "gbd" and self.scope == "apps":
+            self.scope = "all"
+            self.hub.toast("GoodbyeDPI не различает процессы — включён режим «весь трафик»",
+                           kind="warn")
+        self._save_cfg()
+        self._update_controls()
+
+    def _set_scope(self, scope: str) -> None:
+        if self.busy or scope == self.scope:
+            return
+        self.scope = scope
+        self._save_cfg()
+        self._update_controls()
+        if self._engine_on(self.mode):
+            self._start_mode(self.mode)
+
+    def _engine_on(self, mode: str) -> bool:
+        if mode == "happ":
+            return bool((self.state.get("happ") or {}).get("connected"))
+        return bool((self.state.get("gbd") or {}).get("on"))
+
+    def _on_switch(self, mode: str, value: bool) -> None:
+        if self.busy:
+            self._sync_switches()
+            return
+        self.mode = mode
+        self._save_cfg()
+        if value:
+            self._start_mode(mode)
+        else:
+            self._stop_mode(mode)
+
+    def _start_mode(self, mode: str) -> None:
+        if mode == "gbd" and self.scope == "apps":
+            self.scope = "all"
+            self._save_cfg()
+        if mode == "happ" and self.scope == "apps" and not self.selected_apps:
+            self.hub.toast("Отметьте программы, для которых нужен обход", kind="warn")
+            self._update_controls()
+            return
+        if mode == "gbd" and not (self.state.get("gbd") or {}).get("installed"):
+            self.hub.toast("GoodbyeDPI не скачан — нажмите «Скачать GoodbyeDPI»",
+                           kind="warn")
+            self._update_controls()
+            return
+        label = "Happ" if mode == "happ" else "GoodbyeDPI"
+        scope_text = "весь трафик" if self.scope == "all" else (
+            f"программы: {len(self.selected_apps)}")
+        self._run(lambda: bypass_apply(self.scope, mode),
+                  f"{label}: включаю ({scope_text})…",
+                  f"Включаю {label} · {scope_text}" + (
+                      " · потребуется подтверждение администратора (UAC)"
+                      if not bypass_admin() and self.scope == "apps" else ""))
+
+    def _stop_mode(self, mode: str) -> None:
+        label = "Happ" if mode == "happ" else "GoodbyeDPI"
+        self._run(lambda: bypass_stop(mode), f"{label}: выключаю…",
+                  f"Выключаю {label}")
+
+    def _toggle_engine(self, mode: str) -> None:
+        if self._engine_on(mode):
+            self._stop_mode(mode)
+        else:
+            self._start_mode(mode)
+
+    # -- статус -------------------------------------------------------------- #
     def _tick(self) -> None:
         if not self.winfo_exists():
             return
@@ -4704,108 +5892,174 @@ class BypassPanel(Panel):
         self.checking = True
         self.hub.run_bg(bypass_status, self._state_ok, self._state_off)
 
-    def _running_mode(self) -> tuple[str | None, str, dict]:
-        """(mode, 'on'/'off'/'broken', engine-state) — что реально включено."""
-        happ = self.state.get("happ") or {}
-        gbd = self.state.get("gbd") or {}
-        if happ.get("connected"):
-            return "happ", "on", happ
-        if gbd.get("on"):
-            return "gbd", "on", gbd
-        return None, "off", {}
-
     def _state_ok(self, state: dict) -> None:
         self.checking = False
         self.online = True
         self._offline_noted = False
         self.state = state if isinstance(state, dict) else {}
-        self.engines = {
-            "happ": self.state.get("happ") or {},
-            "gbd": self.state.get("gbd") or {},
-        }
-        self.apps_var.set("Happ: " + bypass_cfg()["happ_path"])
-
-        for mode, card in self.mode_cards.items():
-            engine = self.engines.get(mode) or {}
-            installed = bool(engine.get("installed"))
-            on = bool(engine.get("on"))
-            connected = bool(engine.get("connected")) if mode == "happ" else on
-            pids = engine.get("pids") or []
-            pid_text = f" · PID {', '.join(map(str, pids))}" if pids else ""
-            if mode == "happ":
-                if connected:
-                    text = f"● VPN включён{pid_text}"
-                elif on:
-                    text = f"○ клиент открыт · VPN выключен{pid_text}"
-                else:
-                    text = "○ VPN выключен" if installed else "— не найден"
-            else:
-                text = "● работает" if on else ("○ готов к запуску" if installed else "— не найден")
-                if on:
-                    mark = "нашими средствами" if engine.get("mine") else "не этот экземпляр"
-                    text = f"● работает · {mark}{pid_text}"
-                    if engine.get("args"):
-                        text += f" · {engine['args']}"
-            card["state"].configure(
-                text=text, fg=OK if connected else (MUTED if installed else WARN),
-            )
-
-        self._mode_hint()
         self._update_controls()
 
     def _state_off(self, exc: Exception) -> None:
         self.checking = False
         self.online = False
         self.state = {}
-        self.engines = {}
-        self.mode_var.set(" режим: —")
-        self.detail_var.set(f"ошибка: {exc}")
-        self.dot_var.set("○ —")
-        self.apps_var.set("")
-        for card in self.mode_cards.values():
-            card["state"].configure(text="", fg=MUTED)
+        self.headline_var.set("движок недоступен")
+        self.detail_var.set(str(exc))
+        self.dot_var.set("○")
+        for card in self.cards.values():
+            card["status"].configure(text="состояние неизвестно", fg=MUTED)
         if not self._offline_noted:
             self._offline_noted = True
             self.append_log(self.log_box, f"Не удалось опросить движок: {exc}", "error")
         self._update_controls()
 
-    def _update_controls(self) -> None:
-        mode = self.selected
-        running_mode, running_state, _ = self._running_mode()
-        active = running_mode == mode and running_state == "on"
-        other_on = running_mode is not None and running_mode != mode
+    def _sync_switches(self) -> None:
+        for mode, card in self.cards.items():
+            card["switch"].set(self._engine_on(mode))
 
-        for card_mode, card in self.mode_cards.items():
-            chosen = card_mode == mode
-            on = bool((self.engines.get(card_mode) or {}).get("on"))
+    def _update_controls(self) -> None:
+        happ = self.state.get("happ") or {}
+        gbd = self.state.get("gbd") or {}
+        proxyfyre = self.state.get("proxyfyre") or {}
+
+        # карточки движков
+        for mode, card in self.cards.items():
+            engine = happ if mode == "happ" else gbd
+            installed = bool(engine.get("installed", True if mode == "happ" else False))
+            on = self._engine_on(mode)
+            chosen = mode == self.mode
             card["frame"].configure(
                 highlightbackground=OK if on else (ACCENT if chosen else BORDER),
                 highlightthickness=2 if (on or chosen) else 1,
             )
             card["title"].configure(fg=OK if on else (FG if chosen else MUTED))
-            card["caption"].configure(fg=FG if chosen else MUTED)
+            card["switch"].set(on)
+            card["switch"].set_enabled(not self.busy)
+            card["status"].configure(text=self._engine_text(mode), fg=(
+                OK if on else (MUTED if installed else WARN)
+            ))
 
-        self.btn_apply.configure(
-            state="disabled" if self.busy else "normal",
-            text=("Выключить" if active else
-                  ("Переключить" if other_on else "Включить")),
-        )
-        self.btn_apps.configure(state="disabled" if self.busy else "normal")
-        self.btn_show_happ.configure(state="disabled" if self.busy else "normal")
-        self.btn_refresh.configure(state="disabled" if self.busy or self.checking else "normal")
-        installed = self.online and bool((self.engines.get("gbd") or {}).get("installed"))
-        self.btn_dl_gbd.configure(state="disabled" if self.busy else "normal")
-        if installed:
-            self.btn_dl_gbd.pack_forget()  # GoodbyeDPI уже есть — кнопка загрузки не нужна
+        # область обхода
+        self.scope_control.set_enabled(self.mode == "happ" and not self.busy)
+        self.scope_control.set_value(self.scope)
+        if self.mode != "happ":
+            self.scope_hint.configure(
+                text="GoodbyeDPI правит пакеты и не различает процессы — только весь трафик."
+            )
+        elif self.scope == "apps":
+            self.scope_hint.configure(
+                text="Выбранные программы идут через Happ, остальные — напрямую."
+            )
         else:
-            self.btn_dl_gbd.pack(side="left")
+            self.scope_hint.configure(
+                text="Весь трафик через Happ: TUN-адаптер и системный прокси."
+            )
 
-    # -- настройка пути Happ -------------------------------------------------- #
+        # секция программ
+        show_apps = self.mode == "happ" and self.scope == "apps"
+        if show_apps:
+            if not self.apps_card.winfo_manager():
+                self.apps_card.grid(row=3, column=0, sticky="nsew", pady=(px(10), 0))
+            self.rowconfigure(3, weight=4)
+            self.rowconfigure(5, weight=1)
+        else:
+            self.apps_card.grid_remove()
+            self.rowconfigure(3, weight=0)   # иначе пустая дыра на месте списка
+            self.rowconfigure(5, weight=1)
+        self.count_var.set(f"выбрано {len(self.selected_apps)} из {len(self.catalog)}")
+
+        # кнопки
+        self.btn_happ_path.configure(state="disabled" if self.busy else "normal")
+        self.btn_show_happ.configure(state="disabled" if self.busy else "normal")
+        self.btn_refresh.configure(
+            state="disabled" if self.busy or self.checking else "normal")
+        gbd_installed = bool(gbd.get("installed"))
+        self.btn_download.configure(state="disabled" if self.busy else "normal")
+        if gbd_installed:
+            self.btn_download.pack_forget()
+        else:
+            self.btn_download.pack(side="left", padx=(px(8), 0))
+
+        # нижняя карточка статуса
+        headline, detail, color = self._status_text()
+        self.headline_var.set(headline)
+        self.detail_var.set(detail)
+        self.dot_var.set("●" if color == OK else "○")
+        self.dot_label.configure(fg=color)
+
+    def _engine_text(self, mode: str) -> str:
+        engine = (self.state.get("happ") if mode == "happ" else self.state.get("gbd")) or {}
+        installed = bool(engine.get("installed"))
+        pids = engine.get("pids") or []
+        pid_text = f" · PID {', '.join(map(str, pids))}" if pids else ""
+        if mode == "happ":
+            if not installed:
+                return "не найден — укажите путь к Happ.exe"
+            if engine.get("connected"):
+                tun = "TUN" if engine.get("tun") else f"SOCKS {engine.get('socks_port') or ''}".strip()
+                return f"● VPN включён · {tun}{pid_text}"
+            if engine.get("on"):
+                return f"○ клиент открыт, VPN выключен{pid_text}"
+            return "○ выключен"
+        if not installed:
+            return "не скачан"
+        if engine.get("on"):
+            return f"● работает{pid_text}"
+        return "○ готов к запуску"
+
+    def _status_text(self) -> tuple[str, str, str]:
+        happ = self.state.get("happ") or {}
+        gbd = self.state.get("gbd") or {}
+        proxyfyre = self.state.get("proxyfyre") or {}
+        port = happ.get("socks_port") or HAPP_SOCKS_DEFAULT
+
+        if self.mode == "gbd":
+            if gbd.get("on"):
+                return ("GoodbyeDPI работает", f"обход DPI для всего трафика · PID "
+                        f"{', '.join(map(str, gbd.get('pids') or []))}", OK)
+            return ("GoodbyeDPI выключен", "обход для всего интернета · нужен запуск",
+                    MUTED)
+
+        if self.scope == "apps":
+            if happ.get("connected") and proxyfyre.get("running"):
+                return (
+                    "Обход по программам включён",
+                    f"{len(proxyfyre.get('apps') or [])} программ через "
+                    f"SOCKS 127.0.0.1:{port} · остальные напрямую",
+                    OK,
+                )
+            if happ.get("connected"):
+                return ("Happ подключён, обход по программам выключен",
+                        "включите переключатель Happ или отметьте программы", MUTED)
+            if gbd.get("on"):
+                return ("Работает GoodbyeDPI",
+                        "обход по программам выключен: два движка одновременно не работают",
+                        WARN)
+            return ("Обход по программам выключен",
+                    "Happ не подключён — включите переключатель Happ", MUTED)
+
+        if happ.get("connected"):
+            return ("Весь трафик через Happ", f"TUN: "
+                    f"{'включён' if happ.get('tun') else 'выключен'} · "
+                    f"системный прокси: {'да' if (happ.get('mode') or {}).get('system_proxy') else 'нет'}",
+                    OK)
+        if gbd.get("on"):
+            return ("Работает GoodbyeDPI",
+                    "Happ выключен: два движка одновременно не работают", WARN)
+        return ("Весь трафик через Happ выключен", "включите переключатель Happ", MUTED)
+
+    # -- действия ------------------------------------------------------------ #
     def show_happ(self) -> None:
-        """Показать окно Happ (VPN не трогаем)."""
         if self.busy:
             return
         self._run(bypass_happ_show, "Открываю окно Happ…", "Открываю окно Happ…")
+
+    def download(self, kind: str) -> None:
+        if self.busy:
+            return
+        label = "GoodbyeDPI" if kind == "gbd" else kind
+        self._run(lambda: bypass_download(kind), f"Скачиваю {label}…",
+                  f"Скачиваю {label} с GitHub (может занять пару минут)…")
 
     def configure_dialog(self) -> None:
         if self.busy:
@@ -4813,23 +6067,24 @@ class BypassPanel(Panel):
         cfg = bypass_cfg()
 
         dialog = tk.Toplevel(self)
-        dialog.title('Bypass — путь к Happ')
+        dialog.title("Bypass — путь к Happ")
         dialog.configure(bg=CARD)
         dialog.transient(self.winfo_toplevel())
         dialog.grab_set()
 
-        tk.Label(dialog, text='Файл Happ.exe (клиент Happ):', bg=CARD, fg=MUTED,
-                 font=('Segoe UI', 9)).pack(anchor='w', padx=px(16), pady=(px(14), px(4)))
-        path_var = tk.StringVar(value=cfg['happ_path'])
+        tk.Label(dialog, text="Файл Happ.exe (клиент Happ):", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w", padx=px(16), pady=(px(14), px(4)))
+        path_var = tk.StringVar(value=cfg["happ_path"])
         entry = tk.Entry(dialog, textvariable=path_var, bg=FIELD, fg=FG,
-                         insertbackground=FG, relief='flat', width=52)
-        entry.pack(anchor='w', padx=px(16))
+                         insertbackground=FG, relief="flat", width=52)
+        entry.pack(anchor="w", padx=px(16))
 
         def browse() -> None:
             chosen = filedialog.askopenfilename(
-                title='Где лежит Happ.exe',
-                initialdir=str(Path(cfg['happ_path']).parent) if Path(cfg['happ_path']).exists() else 'C:/',
-                filetypes=[('Happ.exe', '*.exe'), ('Все файлы', '*.*')],
+                title="Где лежит Happ.exe",
+                initialdir=str(Path(cfg["happ_path"]).parent)
+                if Path(cfg["happ_path"]).exists() else "C:/",
+                filetypes=[("Happ.exe", "*.exe"), ("Все файлы", "*.*")],
                 parent=dialog,
             )
             if chosen:
@@ -4839,100 +6094,27 @@ class BypassPanel(Panel):
             path_var.set(str(_find_happ()))
 
         row = ttk.Frame(dialog)
-        row.pack(fill='x', padx=px(16), pady=(px(8), 0))
-        flat_button(row, 'Обзор…', browse, kind='ghost').pack(side='left')
-        flat_button(row, 'Найти автоматически', auto, kind='ghost').pack(
-            side='left', padx=(px(8), 0)
-        )
+        row.pack(fill="x", padx=px(16), pady=(px(8), 0))
+        flat_button(row, "Обзор…", browse, kind="ghost").pack(side="left")
+        flat_button(row, "Найти автоматически", auto, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
 
         def save() -> None:
             value = path_var.get().strip()
             if not value:
-                messagebox.showinfo('Bypass', 'Укажите путь к Happ.exe', parent=dialog)
+                messagebox.showinfo("Bypass", "Укажите путь к Happ.exe", parent=dialog)
                 return
             bypass_cfg_save(happ_path=value)
-            self.append_log(self.log_box, f'Путь Happ сохранён: {value}')
+            self.append_log(self.log_box, f"Путь Happ сохранён: {value}")
             dialog.destroy()
             self.refresh_now()
 
         buttons = ttk.Frame(dialog)
-        buttons.pack(fill='x', padx=px(16), pady=px(12))
-        flat_button(buttons, 'Сохранить', save).pack(side='right')
-        flat_button(buttons, 'Отмена', dialog.destroy, kind='ghost').pack(
-            side='right', padx=(0, px(8))
-        )
+        buttons.pack(fill="x", padx=px(16), pady=px(12))
+        flat_button(buttons, "Сохранить", save).pack(side="right")
+        flat_button(buttons, "Отмена", dialog.destroy, kind="ghost").pack(
+            side="right", padx=(0, px(8)))
         entry.focus_set()
-
-    # -- скачивание ---------------------------------------------------------- #
-    def download(self, kind: str) -> None:
-        if self.busy:
-            return
-        label = "GoodbyeDPI" if kind == "gbd" else kind
-        self._run(
-            lambda: bypass_download(kind),
-            f"Скачиваю {label}…",
-            f"Скачиваю {label} с GitHub (может занять пару минут)…",
-        )
-
-    # -- включение / выключение режима --------------------------------------- #
-    def _toggle_engine(self, mode: str) -> None:
-        """Переключить движок: выключить, если работает, иначе включить."""
-        running_mode, _state, _ = self._running_mode()
-        if running_mode == mode:
-            self._turn(mode, False)
-            return
-        engine = self.engines.get(mode) or {}
-        if not engine.get("installed"):
-            if mode == "happ":
-                self.append_log(
-                    self.log_box,
-                    f"Happ не найден по пути:\n{bypass_cfg()['happ_path']}\n"
-                    "Проверьте путь в «Путь Happ…» или скачайте клиент Happ.",
-                    "error",
-                )
-            else:
-                self.append_log(
-                    self.log_box,
-                    "GoodbyeDPI не скачан — кнопка «Скачать GoodbyeDPI» ниже.",
-                    "error",
-                )
-            self.hub.set_status("Bypass: движок недоступен")
-            return
-        if running_mode is not None:
-            self._run(
-                lambda: bypass_apply_mode(mode),
-                f"Переключаю на {self._mode_names(mode)}…",
-                f"Выключаю {self._mode_names(running_mode)} и включаю "
-                f"{self._mode_names(mode)}…",
-            )
-            return
-        self._turn(mode, True)
-
-    def apply_toggle(self) -> None:
-        if self.busy or not self.online:
-            return
-        bypass_cfg_save(mode=self.selected)
-        self._toggle_engine(self.selected)
-
-    def _turn(self, mode: str, on: bool) -> None:
-        if mode == "gbd":
-            work = bypass_gbd_start if on else (lambda: bypass_stop("gbd"))
-            label = "GoodbyeDPI"
-            extra = ("Потребуется подтверждение администратора (UAC)."
-                     if on and not bypass_admin() else "")
-        else:
-            work = bypass_happ_start if on else (lambda: bypass_stop("happ"))
-            label = "Happ"
-            extra = ""
-        title = (f"{label}: {'включаю' if on else 'выключаю'} VPN…" if label == "Happ"
-                 else f"{label}: {'включаю' if on else 'выключаю'}…")
-        self._run(work, title, title + (" " + extra if extra else ""))
-
-    # -- действия ------------------------------------------------------------ #
-    def toggle(self, kind: str, on: bool) -> None:
-        if self.busy or not self.online:
-            return
-        self._turn("gbd" if kind == "gbd" else "happ", on)
 
     # -- общий запуск фоновой задачи ----------------------------------------- #
     def _run(self, work, status_now: str, log_now: str) -> None:
@@ -4951,12 +6133,15 @@ class BypassPanel(Panel):
             self.append_log(self.log_box, detail, "ok" if ok else "error")
         self.hub.set_status("Bypass: готово" if ok else "Bypass: не выполнено")
         self.refresh_now()
+        self._update_controls()
 
     def _run_fail(self, exc: Exception) -> None:
         self.busy = False
         self.append_log(self.log_box, f"Ошибка: {exc}", "error")
         self.hub.set_status("Bypass: ошибка")
+        self.hub.toast(f"Bypass: {exc}", kind="error", ms=4000)
         self.refresh_now()
+        self._update_controls()
 
 
 # --------------------------------------------------------------------------- #
@@ -4994,7 +6179,7 @@ HEADERS = {
     ),
     "bypass": (
         "Bypass",
-        "Обход DPI: запуск Happ или GoodbyeDPI одной кнопкой.",
+        "Обход DPI: весь трафик или только выбранные программы. Happ и GoodbyeDPI.",
     ),
 }
 
