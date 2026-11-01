@@ -33,3 +33,8 @@ output/
 *.so
 *.dylib
 ffmpeg*/
+
+# лиды 2GIS
+leads.csv
+leads.jsonl
+out/

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import csv
 import json
 import os
 import queue
@@ -33,6 +34,7 @@ import urllib.request
 import webbrowser
 import zipfile
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import tkinter as tk
@@ -251,6 +253,126 @@ def dark_text(parent: tk.Misc, *, height: int = 10, wrap: str = "word", **kwargs
     )
     options.update(kwargs)
     return tk.Text(parent, **options)
+
+
+def _iter_widgets(root: tk.Misc):
+    for child in root.winfo_children():
+        yield child
+        yield from _iter_widgets(child)
+
+
+def enable_input_paste(root: tk.Misc) -> None:
+    """Ctrl+V / C / X / A в любом поле и в любой раскладке.
+
+    Tk ловит Ctrl+V по keysym «v», а при русской раскладке keysym — «м»,
+    поэтому штатная вставка молча не срабатывала. Ловим только комбинации
+    с Ctrl (обычный набор клавиш не перехватываем) и сверяем физический код
+    клавиши — раскладка не важна.
+    """
+    if getattr(root, "_paste_hooked", False):
+        return
+    root._paste_hooked = True
+
+    VK_PASTE, VK_COPY, VK_CUT, VK_ALL = 86, 67, 88, 65
+    PASTE_KS, COPY_KS = {"v", "м"}, {"c", "с"}
+    CUT_KS, ALL_KS = {"x", "ч"}, {"a", "а", "ф"}
+
+    def on_ctrl(event):
+        w = event.widget
+        if not isinstance(w, (tk.Entry, tk.Text, ttk.Entry)):
+            return None
+        if event.state & 0x8:  # Alt зажат — не наше
+            return None
+        vk = getattr(event, "keycode", 0) or 0
+        ks = (event.keysym or "").lower()
+        if vk == VK_PASTE or ks in PASTE_KS:
+            w.event_generate("<<Paste>>")
+            return "break"
+        if vk == VK_COPY or ks in COPY_KS:
+            w.event_generate("<<Copy>>")
+            return "break"
+        if vk == VK_CUT or ks in CUT_KS:
+            w.event_generate("<<Cut>>")
+            return "break"
+        if vk == VK_ALL or ks in ALL_KS:
+            if isinstance(w, tk.Text):
+                w.tag_add("sel", "1.0", "end-1c")
+            else:
+                w.selection_range(0, "end")
+            return "break"
+        return None
+
+    def on_menu(event):
+        w = event.widget
+        if not isinstance(w, (tk.Entry, tk.Text, ttk.Entry)):
+            return None
+        menu = tk.Menu(w, tearoff=0, bg=CARD, fg=FG, activebackground=ACCENT,
+                       activeforeground="#0d1117", bd=0)
+        menu.add_command(label="Вставить", command=lambda: w.event_generate("<<Paste>>"))
+        menu.add_command(label="Копировать", command=lambda: w.event_generate("<<Copy>>"))
+        menu.add_command(label="Вырезать", command=lambda: w.event_generate("<<Cut>>"))
+        menu.add_separator()
+        if isinstance(w, tk.Text):
+            menu.add_command(label="Выделить всё",
+                             command=lambda: w.tag_add("sel", "1.0", "end-1c"))
+        else:
+            menu.add_command(label="Выделить всё",
+                             command=lambda: w.selection_range(0, "end"))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    for widget in _iter_widgets(root):
+        if not isinstance(widget, (tk.Entry, tk.Text, ttk.Entry)):
+            continue
+        if getattr(widget, "_paste_hooked", False):
+            continue
+        widget._paste_hooked = True
+        widget.bind("<Control-KeyPress>", on_ctrl, add="+")
+        widget.bind("<Button-3>", on_menu, add="+")
+
+        def on_click(event, w=widget):
+            # клик по полю всегда ставит фокус — даже если окно было неактивно
+            w.focus_set()
+            return None
+
+        widget.bind("<Button-1>", on_click, add="+")
+
+
+def _fmt_phone(phone) -> str:
+    """Телефон в читаемом виде: Treeview иначе превращает «+7900…» в число."""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if len(digits) == 11 and digits[0] in "78":
+        return f"+7 {digits[1:4]} {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
+    return str(phone or "—") if digits else "—"
+
+
+def _short_link(url: str) -> str:
+    """Ссылка для таблицы: без схемы, чтобы влезала в колонку."""
+    text = str(url or "").strip()
+    if text.lower().startswith("mailto:"):
+        return text[7:]
+    return re.sub(r"^https?://", "", text).rstrip("/")
+
+
+def _score(value) -> float:
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_hot(row) -> bool:
+    """Горячий лид: поле tier, иначе префикс reason, иначе score ≥ 70."""
+    tier = str(row.get("tier") or "").strip().lower()
+    if tier:
+        return tier == "hot"
+    reason = str(row.get("reason") or "").strip().lower()
+    if reason:
+        return reason.startswith("hot")
+    return _score(row.get("score")) >= 70
 
 
 def fmt_size(size: float | None) -> str:
@@ -6147,6 +6269,1118 @@ class BypassPanel(Panel):
 # --------------------------------------------------------------------------- #
 #  Боковое меню и главное окно
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+#  Лиды 2GIS
+# --------------------------------------------------------------------------- #
+try:
+    import leads2gis as leads_engine
+
+    LEADS_OK = bool(getattr(leads_engine, "DEPS_OK", True))
+    LEADS_ERROR = "" if LEADS_OK else "нет requests/selectolax"
+except Exception as exc:  # noqa: BLE001
+    leads_engine = None
+    LEADS_OK = False
+    LEADS_ERROR = str(exc)
+
+LEADS_DIR = (
+    Path(sys.executable).parent if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+
+try:
+    import leads_mail
+
+    MAIL_OK = True
+    MAIL_ERROR = ""
+except Exception as exc:  # noqa: BLE001
+    leads_mail = None
+    MAIL_OK = False
+    MAIL_ERROR = str(exc)
+
+_leads_local = threading.local()
+
+
+def _leads_client():
+    """Свой HTTP-клиент на поток: requests.Session не потокобезопасен."""
+    client = getattr(_leads_local, "client", None)
+    if client is None:
+        client = leads_engine.TwoGisClient(timeout=30, delay=0.4)
+        _leads_local.client = client
+    return client
+
+
+def leads_collect(city: str, query: str, pages: int, only_no_site: bool,
+                  min_reviews: int | None, output: str, on_progress, on_log, stop) -> dict:
+    """Обходит выдачу и карточки, пишет CSV+JSONL. Возвращает счётчики."""
+    if not LEADS_OK:
+        raise RuntimeError(LEADS_ERROR or "нет requests/selectolax")
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    client = leads_engine.TwoGisClient(timeout=30, delay=0.4)
+
+    cards: list[dict] = []
+    seen: set[str] = set()
+    last_page = 1
+    for page in range(1, pages + 1):
+        if stop.is_set() or page > last_page:
+            break
+        found, last_page = client.search_page(city, query, page)
+        fresh = [card for card in found if card["id"] not in seen]
+        for card in fresh:
+            seen.add(card["id"])
+        cards.extend(fresh)
+        on_progress(f"страница {page}/{last_page} · карточек {len(cards)}")
+        if not fresh:
+            break
+
+    on_log(f"{city} / {query}: карточек {len(cards)}")
+    if not cards:
+        return {"checked": 0, "saved": 0, "file": output, "top": []}
+
+    def one(firm_id: str) -> dict | None:
+        try:
+            html = _leads_client().firm_html(city, firm_id)
+        except Exception:  # noqa: BLE001 - битая карточка не рушит прогон
+            return None
+        return leads_engine.parse_firm(html, city, firm_id, query)
+
+    parsed: list[dict] = []
+    total = len(cards)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(one, card["id"]) for card in cards]
+        for index, future in enumerate(as_completed(futures), 1):
+            if stop.is_set():
+                break
+            lead = future.result()
+            if lead:
+                parsed.append(lead)
+            on_progress(f"карточки {index}/{total} · собрано {len(parsed)}")
+
+    ratings = client.ratings(lead["id"] for lead in parsed)
+    for lead in parsed:
+        if ratings.get(lead["id"]) is not None:
+            lead["rating"] = ratings[lead["id"]]
+        lead["score"], lead["reason"] = leads_engine.score(lead)
+
+    dropped = leads_engine.drop_boilerplate_domains(parsed)
+    if dropped:
+        on_log(f"убрано общих доменов-заглушек: {dropped}")
+
+    filters = leads_engine.Filters(
+        no_website=only_no_site,
+        has_phone=True,
+        min_reviews=min_reviews,
+    )
+    selected = sorted(
+        (lead for lead in parsed if filters.accepts(lead)),
+        key=lambda lead: lead["score"],
+        reverse=True,
+    )
+
+    saved = 0
+    with leads_engine.Store(Path(output)) as store:
+        for lead in selected:
+            if store.add(lead):
+                saved += 1
+
+    pooled = 0
+    if MAIL_OK:
+        try:
+            pooled = leads_mail.pool_add(output, selected)
+        except Exception as exc:  # noqa: BLE001 - пул не должен валить сбор
+            on_log(f"пул горячих: {exc}")
+
+    on_log(f"в файл: {saved} из {len(parsed)}")
+    if pooled:
+        on_log(f"в пул горячих добавлено: {pooled}")
+    return {
+        "checked": len(parsed), "saved": saved, "file": output,
+        "pooled": pooled, "top": selected[:5], "rows": selected[:300],
+    }
+
+
+class LeadsPanel(Panel):
+    """Сбор лидов 2GIS: контакты организаций + приоритет под аутрич."""
+
+    def __init__(self, master: tk.Misc, hub) -> None:
+        super().__init__(master, hub)
+        self.stop_event = threading.Event()
+        self.busy = False
+        self._build()
+
+    def _build(self) -> None:
+        card = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        card.pack(fill="x")
+        body = tk.Frame(card, bg=CARD)
+        body.pack(fill="x", padx=px(16), pady=px(14))
+        body.columnconfigure(1, weight=1)
+        body.columnconfigure(3, weight=1)
+
+        self.city_var = tk.StringVar(value="moscow")
+        self.query_var = tk.StringVar(value="барбершоп")
+        self.pages_var = tk.StringVar(value="5")
+        self.reviews_var = tk.StringVar(value="")
+        self.output_var = tk.StringVar(value=str(LEADS_DIR / "leads.csv"))
+        self.no_site_var = tk.BooleanVar(value=True)
+        self.open_var = tk.BooleanVar(value=True)
+
+        def caption(row: int, column: int, text: str) -> None:
+            tk.Label(body, text=text, bg=CARD, fg=MUTED, anchor="w",
+                     font=("Segoe UI", 9)).grid(
+                row=row, column=column, sticky="w", padx=(0, px(8)), pady=px(5))
+
+        caption(0, 0, "Город")
+        ttk.Entry(body, textvariable=self.city_var, width=20).grid(
+            row=0, column=1, sticky="ew", pady=px(5))
+        caption(0, 2, "Что искать")
+        ttk.Entry(body, textvariable=self.query_var).grid(
+            row=0, column=3, sticky="ew", padx=(px(16), 0), pady=px(5))
+
+        caption(1, 0, "Страниц")
+        ttk.Spinbox(body, from_=1, to=50, width=6, textvariable=self.pages_var).grid(
+            row=1, column=1, sticky="w", pady=px(5))
+        caption(1, 2, "Мин. отзывов")
+        ttk.Entry(body, textvariable=self.reviews_var, width=8).grid(
+            row=1, column=3, sticky="w", padx=(px(16), 0), pady=px(5))
+
+        caption(2, 0, "Файл")
+        ttk.Entry(body, textvariable=self.output_var).grid(
+            row=2, column=1, columnspan=2, sticky="ew", pady=px(5))
+        flat_button(body, "Обзор…", self.pick_file, kind="ghost").grid(
+            row=2, column=3, sticky="w", padx=(px(16), 0))
+
+        options = tk.Frame(body, bg=CARD)
+        options.grid(row=3, column=0, columnspan=4, sticky="w", pady=(px(8), 0))
+        dark_check(options, "только без сайта", self.no_site_var, bg=CARD).pack(side="left")
+        dark_check(options, "открыть CSV после", self.open_var, bg=CARD).pack(
+            side="left", padx=(px(18), 0))
+
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", pady=(px(14), 0))
+        self.start_btn = flat_button(actions, "Собрать лидов", self.start, kind="primary")
+        self.start_btn.pack(side="left")
+        self.stop_btn = flat_button(actions, "Стоп", self.stop_run, kind="ghost")
+        self.stop_btn.pack(side="left", padx=(px(8), 0))
+        flat_button(actions, "Открыть CSV", self.open_file, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(actions, "Рассылка ИИ", self.open_mail, kind="primary").pack(
+            side="left", padx=(px(8), 0))
+        self.status_var = tk.StringVar(value="Готово")
+        ttk.Label(actions, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
+
+        table_frame = ttk.Frame(self)
+        table_frame.pack(fill="both", expand=True, pady=(px(10), 0))
+        cols = ("name", "tg", "max", "vk", "mail", "phone")
+        self.result_tree = ttk.Treeview(
+            table_frame, columns=cols, show="headings", height=9)
+        for col, title, width in (
+            ("name", "Название", 210), ("tg", "Telegram", 165), ("max", "MAX", 140),
+            ("vk", "ВКонтакте", 150), ("mail", "Почта", 175), ("phone", "Телефон", 130),
+        ):
+            self.result_tree.heading(col, text=title)
+            self.result_tree.column(col, width=px(width), anchor="w")
+        rscroll = ttk.Scrollbar(table_frame, orient="vertical",
+                                command=self.result_tree.yview)
+        self.result_tree.configure(yscrollcommand=rscroll.set)
+        self.result_tree.grid(row=0, column=0, sticky="nsew")
+        rscroll.grid(row=0, column=1, sticky="ns")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        self.result_tree.bind("<Double-1>", self._open_row_link)
+        self.result_tree.bind("<Button-3>", self._row_menu)
+        self._row_links: dict[str, list[tuple[str, str]]] = {}
+        self._row_urls: dict[str, str] = {}
+
+        log_frame, self.log_box = self.make_log(self, height=6)
+        log_frame.pack(fill="both", expand=True, pady=(px(10), 0))
+        self.append_log(
+            self.log_box,
+            "Город — слаг 2GIS: moscow, spb, kazan, ekb, nsk. "
+            "Главный сигнал лида — отсутствие сайта.",
+        )
+        self._set_buttons(running=False)
+        self.load_last()
+
+    # -- действия ---------------------------------------------------------- #
+    def pick_file(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Куда сохранить лиды",
+            defaultextension=".csv",
+            initialfile=Path(self.output_var.get()).name or "leads.csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if path:
+            self.output_var.set(path)
+
+    def open_file(self) -> None:
+        path = Path(self.output_var.get())
+        if not path.exists():
+            messagebox.showwarning("Лиды 2GIS", "Файла ещё нет — сначала собери лидов.", parent=self)
+            return
+        try:
+            os.startfile(str(path.resolve()))  # noqa: S606 - Windows
+        except OSError as exc:
+            messagebox.showerror("Лиды 2GIS", f"Не открылся файл:\n{exc}", parent=self)
+
+    def open_mail(self) -> None:
+        if not MAIL_OK:
+            messagebox.showerror(
+                "Рассылка ИИ", "Нет модуля рассылки:\n" + (MAIL_ERROR or "leads_mail.py"),
+                parent=self,
+            )
+            return
+        path = Path(self.output_var.get().strip() or (LEADS_DIR / "leads.csv"))
+        if not path.exists():
+            messagebox.showwarning(
+                "Рассылка ИИ", "Сначала собери лидов — CSV ещё нет.", parent=self)
+            return
+        MailWindow(self.hub, path)
+
+    def start(self) -> None:
+        if self.busy:
+            return
+        if not LEADS_OK:
+            messagebox.showerror(
+                "Лиды 2GIS",
+                "Нет зависимостей: " + (LEADS_ERROR or "requests, selectolax")
+                + "\n\nУстанови: pip install requests selectolax",
+                parent=self,
+            )
+            return
+
+        city = self.city_var.get().strip().lower()
+        query = self.query_var.get().strip()
+        if not city or not query:
+            messagebox.showwarning("Лиды 2GIS", "Нужны город и поисковый запрос.", parent=self)
+            return
+
+        try:
+            pages = max(1, min(50, int(self.pages_var.get())))
+        except ValueError:
+            pages = 5
+        try:
+            min_reviews = int(self.reviews_var.get()) if self.reviews_var.get().strip() else None
+        except ValueError:
+            min_reviews = None
+
+        output = self.output_var.get().strip() or str(LEADS_DIR / "leads.csv")
+        # Значения Tk-переменных читаем только в главном потоке: из рабочего
+        # это даёт "main thread is not in main loop".
+        only_no_site = bool(self.no_site_var.get())
+
+        self.stop_event.clear()
+        self.busy = True
+        self._set_buttons(running=True)
+        self.status_var.set("Собираю…")
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
+        self.append_log(self.log_box, f"старт: {city} / {query}, страниц {pages}")
+
+        def work() -> dict:
+            return leads_collect(
+                city,
+                query,
+                pages,
+                only_no_site,
+                min_reviews,
+                output,
+                lambda text: self.hub.post(lambda text=text: self.status_var.set(text)),
+                lambda text: self.hub.post(lambda text=text: self.append_log(self.log_box, text)),
+                self.stop_event,
+            )
+
+        self.hub.run_bg(work, self._done, self._fail)
+
+    def stop_run(self) -> None:
+        if not self.busy:
+            return
+        self.stop_event.set()
+        self.status_var.set("Останавливаю…")
+        self.append_log(self.log_box, "остановка по кнопке")
+
+    # -- результат --------------------------------------------------------- #
+    def _done(self, result: dict) -> None:
+        self.busy = False
+        self._set_buttons(running=False)
+        self.status_var.set(f"Готово: {result['saved']} лидов")
+
+        if not result["saved"]:
+            self.append_log(
+                self.log_box,
+                "ничего не подошло под фильтры — попробуй снять «только без сайта»",
+                "error",
+            )
+            return
+
+        rows = result.get("rows") or result.get("top") or []
+        self._fill_results(rows)
+        self.append_log(
+            self.log_box,
+            f"готово: {result['saved']} лидов, в таблице {len(rows)}; "
+            f"двойной клик по строке открывает контакт",
+            "ok",
+        )
+        self.hub.toast(f"Лиды: {result['saved']} → {Path(result['file']).name}")
+
+        if self.open_var.get():
+            try:
+                os.startfile(str(Path(result["file"]).resolve()))  # noqa: S606 - Windows
+            except OSError:
+                pass
+
+    def _append_link(self, url: str) -> None:
+        """Ссылка на контакт в логе — кликабельная."""
+        tag = f"link:{url}"
+        if tag not in self.log_box.tag_names():
+            self.log_box.tag_configure(tag, foreground=ACCENT, underline=True)
+            self.log_box.tag_bind(tag, "<Button-1>", lambda _e, u=url: webbrowser.open(u))
+            self.log_box.tag_bind(tag, "<Enter>",
+                                  lambda _e: self.log_box.configure(cursor="hand2"))
+            self.log_box.tag_bind(tag, "<Leave>",
+                                  lambda _e: self.log_box.configure(cursor=""))
+        self.log_box.insert("end", f"      {url}\n", tag)
+        self.log_box.see("end")
+
+    def _fill_results(self, leads: list[dict]) -> None:
+        """Таблица результатов сбора: контакты — готовыми ссылками."""
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
+        self._row_links.clear()
+        self._row_urls.clear()
+        for index, lead in enumerate(leads):
+            links = leads_engine.messenger_links(lead)
+            iid = str(lead.get("id") or f"r{index}")
+            self._row_links[iid] = [
+                (title, links[key])
+                for key, title in (("telegram", "Telegram"), ("max", "MAX"),
+                                   ("vk", "ВКонтакте"), ("email", "Почта"))
+                if links.get(key)
+            ]
+            self._row_urls[iid] = str(lead.get("url") or "")
+            self.result_tree.insert("", "end", iid=iid, values=(
+                lead.get("name", ""), links.get("telegram", ""), links.get("max", ""),
+                links.get("vk", ""), links.get("email", ""), _fmt_phone(lead.get("phone")),
+            ))
+
+    def _open_row_link(self, _event=None) -> None:
+        sel = self.result_tree.selection()
+        if not sel:
+            return
+        items = self._row_links.get(sel[0], [])
+        if not items:
+            self.append_log(self.log_box, "у лида нет ссылок — только телефон", "warn")
+            return
+        webbrowser.open(items[0][1])
+        self.append_log(self.log_box, f"открыто: {items[0][1]}", "ok")
+
+    def _open_2gis(self, iid: str) -> None:
+        url = self._row_urls.get(iid, "")
+        if url:
+            webbrowser.open(url)
+
+    def _row_menu(self, event) -> None:
+        iid = self.result_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.result_tree.selection_set(iid)
+        items = self._row_links.get(iid, [])
+        menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=ACCENT,
+                       activeforeground="#0d1117", bd=0)
+        if not items:
+            menu.add_command(label="ссылок нет — только телефон", state="disabled")
+        for title, url in items:
+            menu.add_command(label=f"{title}: {url}",
+                             command=lambda u=url: webbrowser.open(u))
+        menu.add_separator()
+        menu.add_command(label="Открыть карточку в 2GIS",
+                         command=lambda: self._open_2gis(iid))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _fail(self, exc: Exception) -> None:
+        self.busy = False
+        self._set_buttons(running=False)
+        self.status_var.set("Ошибка")
+        self.append_log(self.log_box, f"ошибка: {exc}", "error")
+        busy = isinstance(exc, getattr(leads_engine, "LeadsFileBusy", ()))
+        title = "Лиды 2GIS — файл занят" if busy else "Лиды 2GIS"
+        messagebox.showerror(title, str(exc), parent=self)
+
+    def _set_buttons(self, *, running: bool) -> None:
+        self.start_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
+
+    def load_last(self) -> None:
+        """Показывает в таблице прошлый сбор из CSV — он не должен пропадать."""
+        if self.busy:
+            return
+        path = Path(self.output_var.get().strip() or (LEADS_DIR / "leads.csv"))
+        if not path.exists():
+            return
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        except (OSError, csv.Error):
+            return
+        rows.sort(key=lambda r: _score(r.get("score")), reverse=True)
+        self._fill_results(rows[:300])
+        hot = sum(1 for r in rows if _is_hot(r))
+        self.status_var.set(f"в файле: {len(rows)} (горячих {hot})")
+
+    on_show = load_last
+
+
+class HotPoolPanel(Panel):
+    """Пул горячих лидов: что лежит в hot_pool.csv и сколько ему осталось жить."""
+
+    def __init__(self, master: tk.Misc, hub) -> None:
+        super().__init__(master, hub)
+        self.csv_path = LEADS_DIR / "leads.csv"
+        self._links: dict[str, list[tuple[str, str]]] = {}
+        self._rows: dict[str, dict] = {}
+        self._build()
+        self.refresh()
+
+    def _build(self) -> None:
+        actions = ttk.Frame(self)
+        actions.pack(fill="x")
+        flat_button(actions, "Обновить", self.refresh, kind="primary").pack(side="left")
+        flat_button(actions, "Открыть контакт", self.open_link, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(actions, "Написал вручную", self.mark_manual, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(actions, "Убрать из пула", self.remove, kind="danger").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(actions, "Рассылка ИИ", self.open_mail, kind="primary").pack(
+            side="left", padx=(px(8), 0))
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(actions, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, pady=(px(10), 0))
+        cols = ("name", "tg", "max", "vk", "mail", "phone", "left")
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for col, title, width in (
+            ("name", "Название", 190), ("tg", "Telegram", 165), ("max", "MAX", 140),
+            ("vk", "ВКонтакте", 150), ("mail", "Почта", 175), ("phone", "Телефон", 130),
+            ("left", "Осталось", 90),
+        ):
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=px(width), anchor="w")
+        vscroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vscroll.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.tree.bind("<Double-1>", self.open_link)
+        self.tree.bind("<Button-3>", self._menu)
+
+    # -- данные ------------------------------------------------------------ #
+    def _pool_days(self) -> float:
+        settings = leads_mail.load_settings(
+            self.csv_path.with_name("leads_mail_settings.json"))
+        try:
+            return max(1.0, float(str(settings.get("pool_days", "5")).replace(",", ".")))
+        except (TypeError, ValueError):
+            return 5.0
+
+    def refresh(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._links.clear()
+        self._rows.clear()
+        if not MAIL_OK:
+            self.status_var.set("нет модуля рассылки")
+            return
+        if not self.csv_path.exists():
+            self.status_var.set("нет leads.csv — сначала собери лидов")
+            return
+
+        days = self._pool_days()
+        synced = 0
+        busy = ""
+        try:
+            synced = leads_mail.pool_sync(self.csv_path)
+            leads_mail.pool_purge(self.csv_path, days)
+            leads_mail.pool_refresh(self.csv_path)
+        except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
+            busy = str(exc)
+        rows = leads_mail.pool_load(self.csv_path)
+        stats = leads_mail.pool_stats(self.csv_path, days)
+        now = datetime.now()
+
+        for index, row in enumerate(rows):
+            links = []
+            for channel, title in (("telegram", "Telegram"), ("max", "MAX"),
+                                   ("vk", "ВКонтакте"), ("email", "Почта")):
+                url = leads_mail._to_link(channel, row.get(channel))
+                if url:
+                    links.append((title, url))
+            iid = f"r{index}"
+            self._links[iid] = links
+            self._rows[iid] = row
+
+            found = leads_mail._parse_dt(row.get("found_at"))
+            left = "—"
+            if found is not None and not (row.get("sent_at") or "").strip():
+                rest = (found + timedelta(days=days)) - now
+                left = "просрочен" if rest.total_seconds() <= 0 else f"{rest.days} дн."
+            urls = {title: _short_link(url) for title, url in links}
+            self.tree.insert("", "end", iid=iid, values=(
+                row.get("name", ""), urls.get("Telegram", ""), urls.get("MAX", ""),
+                urls.get("ВКонтакте", ""), urls.get("Почта", ""),
+                _fmt_phone(row.get("phone")), left,
+            ))
+
+        tail = f" · из CSV +{synced}" if synced else ""
+        if busy:
+            tail = f" · {busy}"
+        self.status_var.set(
+            f"в пуле: {stats['total']} · истекают сегодня: {stats['expiring']} · "
+            f"срок {days:g} дн.{tail}")
+
+    on_show = refresh
+
+    # -- действия ---------------------------------------------------------- #
+    def _selected(self) -> str:
+        sel = self.tree.selection()
+        if not sel:
+            self.hub.toast("выбери лида в таблице")
+            return ""
+        return sel[0]
+
+    def _key_of(self, iid: str) -> str:
+        return leads_mail.pool_key(self._rows.get(iid, {}))
+
+    def open_link(self, _event=None) -> None:
+        lead_id = self._selected()
+        if not lead_id:
+            return
+        links = self._links.get(lead_id, [])
+        if not links:
+            self.hub.toast("у лида нет ссылок — только телефон")
+            return
+        webbrowser.open(links[0][1])
+
+    def mark_manual(self) -> None:
+        lead_id = self._selected()
+        if not lead_id:
+            return
+        try:
+            leads_mail.pool_mark_sent(self.csv_path, self._key_of(lead_id), "manual")
+        except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
+            messagebox.showwarning("Пул горячих", str(exc), parent=self)
+            return
+        self.refresh()
+        self.hub.toast("отмечено: написал вручную")
+
+    def remove(self) -> None:
+        lead_id = self._selected()
+        if not lead_id:
+            return
+        if not messagebox.askyesno("Пул горячих", "Убрать лида из пула?", parent=self):
+            return
+        try:
+            leads_mail.pool_remove(self.csv_path, self._key_of(lead_id))
+        except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
+            messagebox.showwarning("Пул горячих", str(exc), parent=self)
+            return
+        self.refresh()
+
+    def open_mail(self) -> None:
+        if not MAIL_OK:
+            messagebox.showerror("Рассылка ИИ", "Нет модуля рассылки.", parent=self)
+            return
+        if not self.csv_path.exists():
+            messagebox.showwarning("Рассылка ИИ", "Сначала собери лидов.", parent=self)
+            return
+        MailWindow(self.hub, self.csv_path)
+
+    def _menu(self, event) -> None:
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=ACCENT,
+                       activeforeground="#0d1117", bd=0)
+        for title, url in self._links.get(iid, []):
+            menu.add_command(label=f"{title}: {url}",
+                             command=lambda u=url: webbrowser.open(u))
+        if not self._links.get(iid):
+            menu.add_command(label="ссылок нет — только телефон", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="Написал вручную", command=self.mark_manual)
+        menu.add_command(label="Убрать из пула", command=self.remove)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+
+class MailWindow(tk.Toplevel):
+    """Рассылка ИИ по горячим лидам: настройки, генерация, очередь, отправка."""
+
+    def __init__(self, hub, csv_path) -> None:
+        super().__init__(hub)
+        self.hub = hub
+        self.csv_path = Path(csv_path)
+        self.settings_path = self.csv_path.with_name("leads_mail_settings.json")
+        self.state_path = self.csv_path.with_name("leads_mail_state.json")
+        self.title("Рассылка ИИ — Лиды 2GIS")
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        win_w = min(px(1000), sw - px(30))
+        win_h = min(px(760), sh - px(70))
+        self.geometry(
+            f"{win_w}x{win_h}+{max(0, (sw - win_w) // 2)}+{max(0, (sh - win_h) // 3)}")
+        self.minsize(min(px(760), win_w), min(px(560), win_h))
+        self.configure(bg=BG)
+        self.option_add("*Font", ("Segoe UI", 9))
+        apply_dark_theme(self)
+
+        self.settings = leads_mail.load_settings(self.settings_path)
+        self.state = leads_mail.MailState(self.state_path)
+        self.leads: list[dict] = []
+        self.stop_event = threading.Event()
+        self.mailer = None
+        self.vars: dict[str, tk.StringVar] = {}
+        self.texts: dict[str, tk.Text] = {}
+
+        self._build()
+        enable_input_paste(self)
+        self._load_leads()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.after(80, self._activate)
+
+    def _activate(self) -> None:
+        """Окно сразу активно: иначе первый клик/набор уходит «в никуда»."""
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    # -- разметка ---------------------------------------------------------- #
+    def _build(self) -> None:
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=px(10), pady=px(10))
+
+        holder = ttk.Frame(nb)
+        queue = ttk.Frame(nb)
+        nb.add(holder, text="  Настройки  ")
+        nb.add(queue, text="  Очередь  ")
+
+        # настройки не влезают по высоте — делаем прокрутку
+        canvas = tk.Canvas(holder, bg=BG, highlightthickness=0, bd=0)
+        vbar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+
+        cfg = ttk.Frame(canvas)
+        cfg_id = canvas.create_window((0, 0), window=cfg, anchor="nw")
+
+        def _fit(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(cfg_id, width=canvas.winfo_width())
+
+        cfg.bind("<Configure>", _fit)
+        canvas.bind("<Configure>", _fit)
+
+        def _wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        left = ttk.Frame(cfg)
+        left.grid(row=0, column=0, sticky="nsew", padx=(px(6), px(18)), pady=px(8))
+        right = ttk.Frame(cfg)
+        right.grid(row=0, column=1, sticky="nsew", padx=(0, px(6)), pady=px(8))
+        cfg.columnconfigure(0, weight=1)
+        cfg.columnconfigure(1, weight=1)
+
+        def field(parent, row, label, key, *, show=None, width=34):
+            ttk.Label(parent, text=label, style="Muted.TLabel").grid(
+                row=row, column=0, sticky="w", pady=px(3))
+            var = self.vars.setdefault(key, tk.StringVar(value=str(self.settings.get(key, ""))))
+            entry = ttk.Entry(parent, textvariable=var, width=width, show=show or "")
+            entry.grid(row=row, column=1, sticky="ew", pady=px(3))
+            return entry
+
+        def area(parent, row, label, key, height=4):
+            ttk.Label(parent, text=label, style="Muted.TLabel").grid(
+                row=row, column=0, columnspan=2, sticky="w", pady=(px(8), px(2)))
+            text = dark_text(parent, height=height)
+            text.insert("1.0", str(self.settings.get(key, "")))
+            text.grid(row=row + 1, column=0, columnspan=2, sticky="ew")
+            self.texts[key] = text
+
+        # ИИ
+        ttk.Label(left, text="Нейросеть", foreground=ACCENT).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, px(6)))
+        field(left, 1, "API URL", "ai_url")
+        field(left, 2, "Модель", "ai_model")
+        field(left, 3, "API-ключ", "ai_key", show="*")
+        area(left, 4, "Идея предложения (что продаём)", "idea", 3)
+        area(left, 8, "Как писать (обучение ИИ)", "style", 3)
+        left.columnconfigure(1, weight=1)
+
+        # Каналы
+        ttk.Label(right, text="Каналы", foreground=ACCENT).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, px(6)))
+        field(right, 1, "MAX API URL", "max_url")
+        field(right, 2, "MAX токен", "max_token", show="*")
+        field(right, 3, "MAX — мой чат (ответы)", "max_self")
+        field(right, 4, "TG api_id", "api_id")
+        field(right, 5, "TG api_hash", "api_hash")
+        field(right, 6, "TG номер телефона", "tg_phone")
+        field(right, 7, "TG сессия (файл)", "tg_session_file")
+        tgbox = ttk.Frame(right)
+        tgbox.grid(row=8, column=0, columnspan=2, sticky="w", pady=(px(4), px(8)))
+        flat_button(tgbox, "Войти в TG", self._auth_tg, kind="primary").pack(side="left")
+        flat_button(tgbox, "Выйти из TG", self._logout_tg, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(tgbox, "my.telegram.org", lambda: webbrowser.open(
+            "https://my.telegram.org/apps"), kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        field(right, 9, "VK token", "vk_token", show="*")
+        vkbox = ttk.Frame(right)
+        vkbox.grid(row=10, column=0, columnspan=2, sticky="w", pady=(0, px(8)))
+        flat_button(vkbox, "VK: где взять токен", lambda: webbrowser.open(
+            "https://vkhost.github.io/"), kind="ghost").pack(side="left")
+        flat_button(vkbox, "сайт не открылся", lambda: webbrowser.open(
+            "https://dev.vk.com/ru/apps"), kind="ghost").pack(
+            side="left", padx=(px(6), 0))
+        field(right, 11, "SMTP хост", "smtp_host")
+        field(right, 12, "SMTP порт", "smtp_port")
+        field(right, 13, "SMTP логин", "smtp_user")
+        field(right, 14, "SMTP пароль", "smtp_pass", show="*")
+        field(right, 15, "Почта отправителя", "smtp_from")
+        field(right, 16, "Тема письма", "mail_subject")
+        right.columnconfigure(1, weight=1)
+
+        rules = ttk.Frame(cfg)
+        rules.grid(row=1, column=0, columnspan=2, sticky="w", padx=px(6), pady=(0, px(8)))
+        ttk.Label(rules, text="Дней до смены канала", style="Muted.TLabel").pack(side="left")
+        ttk.Entry(rules, textvariable=self.vars.setdefault(
+            "followup_days", tk.StringVar(value=str(self.settings.get("followup_days", "5")))),
+            width=6).pack(side="left", padx=(px(6), px(20)))
+        ttk.Label(rules, text="Дней в пуле горячих", style="Muted.TLabel").pack(side="left")
+        ttk.Entry(rules, textvariable=self.vars.setdefault(
+            "pool_days", tk.StringVar(value=str(self.settings.get("pool_days", "5")))),
+            width=6).pack(side="left", padx=(px(6), px(20)))
+        ttk.Label(rules, text="Пауза между сообщениями, сек", style="Muted.TLabel").pack(side="left")
+        ttk.Entry(rules, textvariable=self.vars.setdefault(
+            "pacing", tk.StringVar(value=str(self.settings.get("pacing", "60")))),
+            width=6).pack(side="left", padx=(px(6), px(20)))
+        self.dry_var = tk.BooleanVar(value=bool(self.settings.get("dry_run", False)))
+        dark_check(rules, "тестовый режим (не отправлять)", self.dry_var).pack(side="left")
+
+        # очередь
+        bar = ttk.Frame(queue)
+        bar.pack(fill="x", padx=px(8), pady=(px(8), px(4)))
+        flat_button(bar, "Сгенерировать тексты", self._generate, kind="primary").pack(side="left")
+        flat_button(bar, "Отправить (подтвердить)", self._send, kind="primary").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(bar, "Стоп всё", self._stop_all, kind="ghost").pack(side="left", padx=(px(8), 0))
+        flat_button(bar, "Обновить список", self._load_leads, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(bar, "Остановить лид", lambda: self._mark("stopped"), kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(bar, "Ответил", lambda: self._mark("replied"), kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(bar, "Прочитал", lambda: self._mark("read"), kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(bar, "Написал вручную", self._mark_manual, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(bar, "Открыть контакт", self._open_link, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(bar, "Сбросить ошибки", self._reset_failed, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+
+        table = ttk.Frame(queue)
+        table.pack(fill="both", expand=True, padx=px(8), pady=px(4))
+        cols = ("name", "target", "channel", "status", "text")
+        self.tree = ttk.Treeview(table, columns=cols, show="headings", height=12)
+        for col, title, width in (
+            ("name", "Лид", 200), ("target", "Куда (ссылка)", 250),
+            ("channel", "Канал", 90), ("status", "Статус", 90), ("text", "Текст", 300),
+        ):
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=px(width), anchor="w")
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        table.rowconfigure(0, weight=1)
+        table.columnconfigure(0, weight=1)
+        self.tree.bind("<<TreeviewSelect>>", self._show_text)
+        self.tree.bind("<Double-1>", self._open_link)
+
+        ttk.Label(queue, text="Текст выбранного лида", style="Muted.TLabel").pack(
+            anchor="w", padx=px(10), pady=(px(6), 0))
+        self.preview = dark_text(queue, height=4)
+        self.preview.pack(fill="x", padx=px(8), pady=(px(2), px(6)))
+
+        self.log = dark_text(queue, height=6)
+        self.log.tag_configure("ok", foreground=OK)
+        self.log.tag_configure("warn", foreground=WARN)
+        self.log.tag_configure("error", foreground=DANGER)
+        self.log.pack(fill="both", expand=True, padx=px(8), pady=(0, px(8)))
+
+        self.status_var = tk.StringVar(value="Готово")
+        ttk.Label(self, textvariable=self.status_var, style="Muted.TLabel").pack(
+            anchor="w", padx=px(14), pady=(0, px(8)))
+
+    # -- данные ------------------------------------------------------------ #
+    def _load_leads(self) -> None:
+        if not self.csv_path.exists():
+            self._log(f"нет файла: {self.csv_path}", "error")
+            return
+        days = self._pool_days()
+        # добираем в пул горячих из leads.csv — pool_add дедуплицирует сам
+        synced = gone = filled = 0
+        try:
+            synced = leads_mail.pool_sync(self.csv_path)
+            gone = leads_mail.pool_purge(self.csv_path, days)
+            filled = leads_mail.pool_refresh(self.csv_path)
+        except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
+            self._log(f"пул: {exc}", "warn")
+        if synced:
+            self._log(f"пул: добавлено из CSV — {synced}", "ok")
+        if gone:
+            self._log(f"из пула удалено просроченных: {gone}", "warn")
+        if filled:
+            self._log(f"пул: дозаполнено контактов из CSV — {filled}", "ok")
+
+        self.leads = leads_mail.load_hot_leads(self.csv_path)
+        self._refresh_tree()
+        stats = leads_mail.pool_stats(self.csv_path, days)
+        tail = f", истекают сегодня: {stats['expiring']}" if stats["expiring"] else ""
+        self._log(f"горячих в пуле: {len(self.leads)}{tail} · срок {days:g} дн.", "ok")
+
+    def _pool_days(self) -> float:
+        try:
+            return max(1.0, float(str(self.vars.get("pool_days").get()).replace(",", ".")))
+        except (AttributeError, TypeError, ValueError):
+            return 5.0
+
+    def _refresh_tree(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._links: dict[str, str] = {}
+        for index, row in enumerate(self.leads):
+            lead_id = leads_mail.row_id(row) or f"row{index}"
+            st = self.state.get(lead_id)
+            avail = leads_mail.channels_of(row)
+            channel = st.get("channel") or next(
+                (c for c in leads_mail.PRIORITY if c in avail), "")
+            link = ""
+            if channel in avail:
+                link = leads_mail.contact_link(channel, avail[channel])
+                target = st.get("target") or leads_mail.contact_display(channel, avail[channel])
+            else:
+                target = st.get("target") or ""
+            self._links[lead_id] = link
+            status = st.get("status") or "—"
+            text = (st.get("text") or "").replace("\n", " ")
+            self.tree.insert("", "end", iid=lead_id, values=(
+                row.get("name", ""), link or target, channel, status, text[:90]))
+
+    def _open_link(self, _event=None) -> None:
+        """Открывает ссылку на контакт выбранного лида в браузере."""
+        sel = self.tree.selection()
+        if not sel:
+            self._log("выбери лида в таблице", "warn")
+            return
+        url = getattr(self, "_links", {}).get(sel[0], "")
+        if not url:
+            self._log(f"{sel[0]}: ссылки на контакт нет (телефон или пустой канал)", "warn")
+            return
+        webbrowser.open(url)
+        self._log(f"открыто: {url}", "ok")
+
+    def _show_text(self, _event=None) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            return
+        st = self.state.get(sel[0])
+        self.preview.delete("1.0", "end")
+        self.preview.insert("1.0", st.get("text") or "")
+
+    # -- настройки --------------------------------------------------------- #
+    def _collect(self) -> dict:
+        data = dict(self.settings)
+        for key, var in self.vars.items():
+            data[key] = var.get()
+        for key, text in self.texts.items():
+            data[key] = text.get("1.0", "end").strip()
+        data["dry_run"] = bool(self.dry_var.get())
+        return data
+
+    # -- действия ---------------------------------------------------------- #
+    def _generate(self) -> None:
+        if not self.leads:
+            self._log("нечего генерировать: нет горячих лидов", "warn")
+            return
+        self.settings = self._collect()
+        leads_mail.save_settings(self.settings_path, self.settings)
+        self.stop_event.clear()
+        self.status_var.set("Генерирую тексты…")
+
+        def work():
+            return leads_mail.generate_texts(
+                self.leads, self.settings, self.state,
+                lambda text, tag=None: self._post_log(text, tag),
+                lambda text: self.hub.post(lambda: self.status_var.set(text)),
+                self.stop_event,
+            )
+
+        self.hub.run_bg(work, self._generated, self._failed)
+
+    def _generated(self, count) -> None:
+        self.status_var.set(f"Готово: текстов {count}")
+        self._refresh_tree()
+        self._log(f"тексты готовы: {count}", "ok")
+
+    def _send(self) -> None:
+        if not self.leads:
+            self._log("нечего отправлять", "warn")
+            return
+        pending = [r for r in self.leads
+                   if self.state.get(leads_mail.row_id(r)).get("status")
+                   not in ("replied", "stopped", "read", "seen", "closed", "failed")]
+        if not pending:
+            self._log("все лиды уже обработаны", "warn")
+            return
+        if not messagebox.askyesno(
+            "Подтвердить рассылку",
+            f"Отправить сообщения {len(pending)} горячим лидам?\n\n"
+            "По одному в минуту. Через 5 дней без ответа — следующий канал.",
+            parent=self,
+        ):
+            return
+
+        self.settings = self._collect()
+        leads_mail.save_settings(self.settings_path, self.settings)
+        self.stop_event.clear()
+        self.status_var.set("Рассылка идёт…")
+
+        mailer = leads_mail.Mailer(
+            self.leads, self.settings, self.state,
+            lambda text, tag=None: self._post_log(text, tag),
+            lambda _event: self.hub.post(self._refresh_tree),
+            csv_path=self.csv_path,
+        )
+        self.mailer = mailer
+        threading.Thread(target=mailer.run_forever, args=(self.stop_event,), daemon=True).start()
+
+        if not self.settings.get("dry_run"):
+            watcher = leads_mail.Poller(
+                self.leads, self.settings, self.state,
+                lambda text, tag=None: self._post_log(text, tag), self.stop_event,
+                csv_path=self.csv_path,
+            )
+            threading.Thread(target=watcher.run_forever, daemon=True).start()
+        self._log("отправка запущена в фоне", "ok")
+
+    def _stop_all(self) -> None:
+        self.stop_event.set()
+        self.status_var.set("Остановлено")
+        self._log("остановлено вручную", "warn")
+
+    def _mark(self, status: str) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            self._log("выбери лида в таблице", "warn")
+            return
+        st = self.state.get(sel[0])
+        st["status"] = status
+        st["closed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.state.save()
+        try:
+            leads_mail.pool_mark_status(self.csv_path, sel[0], status)
+        except (OSError, leads_mail.PoolBusy) as exc:
+            self._log(f"пул: {exc}", "warn")
+        self._refresh_tree()
+        self._log(f"{sel[0]}: {status}", "ok")
+
+    def _mark_manual(self) -> None:
+        """Я написал этому лиду сам — из пула он больше не выпадет."""
+        sel = self.tree.selection()
+        if not sel:
+            self._log("выбери лида в таблице", "warn")
+            return
+        lead_id = sel[0]
+        st = self.state.get(lead_id)
+        st["status"] = "awaiting"
+        st["sent_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        st["channel"] = st.get("channel") or "manual"
+        self.state.save()
+        try:
+            leads_mail.pool_mark_sent(self.csv_path, lead_id, "manual")
+        except (OSError, leads_mail.PoolBusy) as exc:
+            self._log(f"пул: {exc}", "warn")
+        self._refresh_tree()
+        self._log(f"{lead_id}: отмечено «написал вручную»", "ok")
+
+    def _reset_failed(self) -> None:
+        count = self.state.reset_failed()
+        self._refresh_tree()
+        self._log(f"сброшено ошибок: {count}", "ok" if count else "warn")
+
+    # -- логи -------------------------------------------------------------- #
+    def _log(self, text: str, tag: str | None = None) -> None:
+        self.log.insert("end", text + "\n", tag or ())
+        self.log.see("end")
+
+    def _post_log(self, text: str, tag: str | None = None) -> None:
+        self.hub.post(lambda: self._log(text, tag) if self.winfo_exists() else None)
+
+    def _failed(self, exc: Exception) -> None:
+        self.status_var.set("Ошибка")
+        self._log(f"ошибка: {exc}", "error")
+
+    # -- Telethon-авторизация (без консоли) ------------------------------- #
+    def _auth_tg(self) -> None:
+        if not MAIL_OK:
+            self._log("модуль рассылки не загружен", "error")
+            return
+        self.settings = self._collect()
+        leads_mail.save_settings(self.settings_path, self.settings)
+        phone = (self.settings.get("tg_phone") or "").strip()
+        if not phone:
+            self._log("сначала введи номер телефона (TG номер телефона)", "warn")
+            return
+        try:
+            leads_mail.gui_auth(
+                self.settings, phone, parent=self, on_log=self._log)
+            self._log("TG: аккаунт привязан, сессия сохранена", "ok")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"TG: {exc}", "error")
+
+    def _logout_tg(self) -> None:
+        self.settings = self._collect()
+        leads_mail.save_settings(self.settings_path, self.settings)
+        try:
+            self._log(leads_mail.tg_logout(self.settings), "warn")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"TG: {exc}", "error")
+
+    def _close(self) -> None:
+        self.stop_event.set()
+        self.settings = self._collect()
+        leads_mail.save_settings(self.settings_path, self.settings)
+        self.destroy()
+
+
 NAV = (
     ("autoclicker", "AutoClicker", "клики по экрану"),
     ("clean", "Пустые файлы", "0 байт и пустые папки"),
@@ -6154,6 +7388,8 @@ NAV = (
     ("cleanup", "Очистка Windows", "кэши · корзина"),
     ("github", "GitHub", "бэкап проектов"),
     ("bypass", "Bypass", "обход DPI: глобально и по приложениям"),
+    ("leads", "Лиды 2GIS", "контакты без сайта"),
+    ("hot", "Горячие", "пул на 5 дней"),
 )
 
 HEADERS = {
@@ -6180,6 +7416,14 @@ HEADERS = {
     "bypass": (
         "Bypass",
         "Обход DPI: весь трафик или только выбранные программы. Happ и GoodbyeDPI.",
+    ),
+    "leads": (
+        "Лиды 2GIS",
+        "Организации из выдачи 2GIS: телефон, e-mail, сайт, мессенджеры и приоритет под аутрич.",
+    ),
+    "hot": (
+        "Горячие лиды",
+        "Пул на 5 дней: не написал — лид уходит. Двойной клик открывает контакт.",
     ),
 }
 
@@ -6261,6 +7505,8 @@ class Hub(tk.Tk):
             "cleanup": lambda: CleanupPanel(self.content, self),
             "github": lambda: GitHubPanel(self.content, self),
             "bypass": lambda: BypassPanel(self.content, self),
+            "leads": lambda: LeadsPanel(self.content, self),
+            "hot": lambda: HotPoolPanel(self.content, self),
         }
 
         self._build()
@@ -6346,10 +7592,20 @@ class Hub(tk.Tk):
     # -- разделы ----------------------------------------------------------- #
     def show(self, key: str) -> None:
         panel = self.panels.get(key)
-        if panel is None:
+        fresh = panel is None
+        if fresh:
             panel = self.factories[key]()
             panel.grid(row=0, column=0, sticky="nsew")
             self.panels[key] = panel
+            enable_input_paste(panel)
+        if not fresh:
+            # вкладка уже создана — обновляем данные при каждом показе
+            hook = getattr(panel, "on_show", None)
+            if hook is not None:
+                try:
+                    hook()
+                except Exception:  # noqa: BLE001 - показ вкладки не должен падать
+                    pass
         panel.tkraise()
         self.current = key
         for item_key, item in self.nav_items.items():
