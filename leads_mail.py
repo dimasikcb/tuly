@@ -10,12 +10,22 @@
 Telegram — user-аккаунт (Telethon). Каждая операция идёт под общим lock'ом,
 клиент подключается и отключается в одной и той же нити: файл сессии SQLite
 никогда не открыт двумя клиентами одновременно, event loop создаётся на поток.
+
+Устройство проекта (слои снизу вверх):
+
+    leads_contacts  — чистые функции: ник ↔ ссылка, каналы, формат телефона
+    leads_pool      — CSV пула: загрузка, дедуп, срок жизни, миграция
+    leads_mail      — этот файл: ИИ-тексты и отправка по каналам
+    leads2gis       — парсер 2ГИС
+    tools.pyw       — GUI
+
+Имена пула и контактов реэкспортируются отсюда: `leads_mail.pool_add` и т.п.
+продолжают работать, поэтому GUI и тесты не пришлось переписывать.
 """
 
 from __future__ import annotations
 
 import asyncio
-import csv
 import imaplib
 import json
 import random
@@ -28,13 +38,66 @@ from email import message_from_bytes
 from email.message import EmailMessage
 from pathlib import Path
 
+from leads_contacts import (  # noqa: F401 - часть публичного API модуля
+    CHANNEL_TITLE,
+    TARGET_TITLE,
+    channel_label,
+    channels_of,
+    contact_display,
+    contact_link,
+    format_phone,
+    messenger_links,
+    targets_of,
+)
+from leads_contacts import from_link as _from_link
+from leads_contacts import num as _num
+from leads_contacts import pick_contact as _pick_contact
+from leads_contacts import short as _short
+from leads_contacts import to_link as _to_link
+from leads_pool import (  # noqa: F401 - реэкспорт: GUI и тесты зовут leads_mail.*
+    LEGACY_EXTRAS,
+    LEGACY_NAME,
+    LEGACY_SUFFIX,
+    POOL_COLUMNS,
+    POOL_KEEP_STATUS,
+    POOL_NAME,
+    RU_CITIES,
+    PoolBusy,
+    _lead_to_pool_row,
+    _now,
+    _parse_dt,
+    _pool_save,
+    _pool_value,
+    _read_csv,
+    _tier_of,
+    default_pool_path,
+    is_hot,
+    load_hot_leads,
+    migrate_legacy,
+    pool_add,
+    pool_key,
+    pool_load,
+    pool_mark_sent,
+    pool_mark_status,
+    pool_path,
+    pool_purge,
+    pool_refresh,
+    pool_remove,
+    pool_stats,
+    pool_sync,
+    row_id,
+)
+
 PRIORITY = ("max", "telegram", "vk", "email")
-CHANNEL_TITLE = {"max": "MAX", "telegram": "Telegram", "vk": "ВК", "email": "Почта"}
 DAY = 86400.0
 STATUSES = ("replied", "stopped", "read", "seen", "closed", "failed")
 
 # Один lock на весь Telegram: сессия SQLite и один аккаунт.
 TG_LOCK = threading.Lock()
+
+# Клиенты каналов (VK и пр.) создаются один раз на процесс.
+_CLIENTS: dict = {}
+_CLIENTS_LOCK = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
@@ -84,604 +147,6 @@ def save_settings(path, settings: dict) -> None:
         pass
 
 
-# --------------------------------------------------------------------------- #
-#  Лиды и каналы
-# --------------------------------------------------------------------------- #
-
-# --------------------------------------------------------------------------- #
-#  Пул горячих лидов
-# --------------------------------------------------------------------------- #
-#
-#  leads.csv перезаписывается при каждом сборе, поэтому горячие лиды копятся
-#  отдельно — в hot_pool.csv рядом с CSV. У каждой записи есть found_at: если
-#  за pool_days (по умолчанию 5) ни ты, ни скрипт не написали — запись удаляется.
-
-POOL_NAME = "hot_pool.csv"
-# В файле лежат готовые ссылки на контакты, а не ники: так таблицу можно открыть
-# в Excel и сразу кликнуть. Числового id 2GIS в пуле нет — Excel превращал его
-# в 7.0000001087E+16, а для дедупликации хватает названия и телефона.
-POOL_COLUMNS = (
-    "name", "telegram", "max", "vk", "email", "phone", "city",
-    "topic", "card", "found_at", "sent_at", "channel", "status",
-)
-POOL_KEEP_STATUS = ("replied", "seen", "awaiting", "manual")
-
-# 2ГИС-слаги крупных городов для режима «вся Россия».
-RU_CITIES = (
-    "moscow", "spb", "ekaterinburg", "novosibirsk", "kazan", "n_novgorod",
-    "samara", "omsk", "chelyabinsk", "rostov",
-    "ufa", "krasnoyarsk", "voronezh", "perm", "volgograd",
-)
-
-# Старое хозяйство: GUI раньше писал все лиды в leads.csv. Файл больше не нужен,
-# но у пользователя он уже есть — при первом запуске переливаем его в пул и
-# убираем в архив, чтобы не мешал.
-LEGACY_NAME = "leads.csv"
-LEGACY_EXTRAS = ("leads.jsonl", "leads_new.csv", "leads_new.jsonl")
-LEGACY_SUFFIX = ".migrated"
-
-
-class PoolBusy(RuntimeError):
-    """hot_pool.csv занят другой программой (Excel, LibreOffice)."""
-
-
-def default_pool_path(dir_path) -> Path:
-    """Единственный файл данных: <папка приложения>/hot_pool.csv."""
-    return Path(dir_path) / POOL_NAME
-
-
-def pool_path(csv_file) -> Path:
-    """По умолчанию файла пула по пути к CSV."""
-    return Path(csv_file).parent / POOL_NAME
-
-
-def _now() -> datetime:
-    return datetime.now()
-
-
-def _parse_dt(value: str) -> datetime | None:
-    try:
-        return datetime.fromisoformat(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-
-
-def _to_link(channel: str, value) -> str:
-    """Ник/e-mail → готовая ссылка. Уже ссылку возвращает как есть."""
-    value = str(value or "").strip()
-    if not value:
-        return ""
-    if value.lower().startswith(("http://", "https://", "mailto:")):
-        return value
-    if channel == "telegram":
-        digits = re.sub(r"\D", "", value)
-        if re.fullmatch(r"[\d\s\-()+]+", value) and len(digits) >= 7:
-            return "https://t.me/+" + digits  # диплинк по номеру, как у 2ГИС
-        return "https://t.me/" + value.lstrip("@").strip("/")
-    if channel == "max":
-        return "https://max.ru/" + value.lstrip("@").strip("/")
-    if channel == "vk":
-        return "https://vk.com/" + value.strip("/")
-    if channel == "email":
-        return "mailto:" + value
-    return ""
-
-
-def _from_link(channel: str, value) -> str:
-    """Ссылка → ник/e-mail, с которым работают отправка и поиск в TG/ВК."""
-    value = str(value or "").strip()
-    if not value:
-        return ""
-    low = value.lower()
-    if channel == "telegram" and "t.me/" in low:
-        return value[low.index("t.me/") + 5:].strip("/")
-    if channel == "max" and "max.ru/" in low:
-        return value[low.index("max.ru/") + 7:].strip("/")
-    if channel == "vk" and "vk.com/" in low:
-        return value[low.index("vk.com/") + 6:].strip("/")
-    if channel == "email" and low.startswith("mailto:"):
-        return value[7:].strip()
-    return value
-
-
-def _pool_value(channel: str, value) -> str:
-    """Значение для колонки пула: ссылка, если её можно построить, иначе сырое."""
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    return _to_link(channel, raw) or raw
-
-
-def pool_key(row: dict) -> str:
-    """Ключ записи для дедупликации и правок: название + цифры телефона."""
-    name = re.sub(r"\s+", " ", str(row.get("name") or "")).strip().lower()
-    digits = re.sub(r"\D", "", str(row.get("phone") or ""))
-    if not name and not digits:
-        return ""
-    return f"{name}|{digits}"
-
-
-def row_id(row: dict) -> str:
-    """Ключ лида для журнала отправок: id 2GIS, если есть, иначе название+телефон."""
-    return str(row.get("id") or "").strip() or pool_key(row)
-
-
-def _tier_of(lead: dict) -> str:
-    """hot/warm/cold: поле tier → префикс reason → score."""
-    tier = str(lead.get("tier") or "").strip().lower()
-    if tier:
-        return tier
-    reason = str(lead.get("reason") or "").strip().lower()
-    for name in ("hot", "warm", "cold"):
-        if reason.startswith(name):
-            return name
-    return "hot" if _num(lead.get("score")) >= 70 else ""
-
-
-def pool_load(pool_file) -> list[dict]:
-    """Все записи пула (в порядке добавления). Старый формат приводится к новому."""
-    path = Path(pool_file)
-    rows: list[dict] = []
-    try:
-        with path.open(encoding="utf-8-sig", newline="") as fh:
-            for row in csv.DictReader(fh):
-                item = {key: str(row.get(key) or "").strip() for key in POOL_COLUMNS}
-                if not item["name"] and not item["phone"]:
-                    continue
-                for channel in ("telegram", "max", "vk", "email"):
-                    item[channel] = _pool_value(channel, item[channel])
-                rows.append(item)
-    except (OSError, csv.Error):
-        return []
-    return rows
-
-
-def _pool_save(pool_file, rows: list[dict]) -> None:
-    """Пишет пул через временный файл — занятый Excel не портит данные.
-
-    Если файл открыт в таблице, Windows не даёт его заменить: тогда честно
-    сообщаем об этом, иначе новые горячие лиды молча теряются.
-    """
-    path = Path(pool_file)
-    tmp = path.with_name(path.name + ".tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=POOL_COLUMNS)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({key: row.get(key, "") for key in POOL_COLUMNS})
-    except OSError as exc:
-        raise PoolBusy(f"не записался {path.name}: {exc}") from exc
-
-    for attempt in range(10):
-        try:
-            tmp.replace(path)
-            return
-        except OSError:
-            if attempt < 9:
-                time.sleep(0.2)
-    # файл занят: не теряем пачку, кладём рядом и говорим, куда смотреть
-    spare = path.with_name(f"{path.stem}_new{path.suffix}")
-    try:
-        tmp.replace(spare)
-        where = f", свежие записи — в {spare.name}"
-    except OSError:
-        where = ""
-    raise PoolBusy(
-        f"{path.name} открыт в другой программе — закрой его и нажми «Обновить»{where}")
-
-
-def _lead_to_pool_row(lead: dict, found_at: str) -> dict:
-    return {
-        "name": lead.get("name", ""),
-        "telegram": _pool_value("telegram", _pick_contact(lead, "telegram")),
-        "max": _pool_value("max", _pick_contact(lead, "max")),
-        "vk": _pool_value("vk", _pick_contact(lead, "vk")),
-        "email": _pool_value("email", _pick_contact(lead, "email")),
-        "phone": lead.get("phone", ""),
-        "city": lead.get("city", ""),
-        "topic": str(lead.get("topic") or lead.get("query") or "").strip(),
-        "card": str(lead.get("url") or lead.get("card") or "").strip(),
-        "found_at": found_at,
-        "sent_at": "",
-        "channel": "",
-        "status": "",
-    }
-
-
-def pool_sync(csv_file) -> int:
-    """Синхронизирует горячих лидов из CSV в пул. Возвращает число добавленных."""
-    pool_file = pool_path(csv_file)
-    rows = _read_csv(csv_file)
-    return pool_add(pool_file, rows)
-
-
-def pool_refresh(pool_file) -> int:
-    """Обновляет контакты в пуле из CSV. Возвращает число обновлённых."""
-    csv_file = Path(pool_file).parent / "leads.csv"
-    pool_rows = pool_load(pool_file)
-    csv_rows = {pool_key(r): r for r in _read_csv(csv_file)}
-    updated = 0
-    for row in pool_rows:
-        key = pool_key(row)
-        src = csv_rows.get(key)
-        if not src:
-            continue
-        for channel in ("telegram", "max", "vk", "email"):
-            if not (row.get(channel) or "").strip():
-                value = _pool_value(channel, _pick_contact(src, channel))
-                if value:
-                    row[channel] = value
-                    updated += 1
-        # Дозаполнить тему и карточку 2ГИС
-        if not (row.get("topic") or "").strip() and (src.get("query") or src.get("topic")):
-            row["topic"] = str(src.get("query") or src.get("topic")).strip()
-            updated += 1
-        if not (row.get("card") or "").strip() and (src.get("url") or src.get("card")):
-            row["card"] = str(src.get("url") or src.get("card")).strip()
-            updated += 1
-    if updated:
-        _pool_save(pool_file, pool_rows)
-    return updated
-
-
-def pool_add(pool_file, leads: list[dict]) -> int:
-    """Добавляет горячих лидов в пул. Возвращает число новых."""
-    hot = [l for l in leads if is_hot(l)]
-    if not hot:
-        return 0
-    rows = pool_load(pool_file)
-    known = {pool_key(row) for row in rows}
-    stamp = _now().isoformat(timespec="seconds")
-    added = 0
-    by_key = {pool_key(row): row for row in rows}
-    for lead in hot:
-        key = pool_key(lead)
-        if not key:
-            continue
-        if key in by_key:
-            existing = by_key[key]
-            # Дозаполняем card, topic или контакты, если в существующей записи они пустые
-            new_card = str(lead.get("url") or lead.get("card") or "").strip()
-            if not (existing.get("card") or "").strip() and new_card:
-                existing["card"] = new_card
-                added += 1
-            new_topic = str(lead.get("topic") or lead.get("query") or "").strip()
-            if not (existing.get("topic") or "").strip() and new_topic:
-                existing["topic"] = new_topic
-            for ch in ("telegram", "max", "vk", "email"):
-                if not (existing.get(ch) or "").strip():
-                    val = _pool_value(ch, _pick_contact(lead, ch))
-                    if val:
-                        existing[ch] = val
-            continue
-        new_row = _lead_to_pool_row(lead, stamp)
-        rows.append(new_row)
-        by_key[key] = new_row
-        added += 1
-    if added:
-        _pool_save(pool_file, rows)
-    return added
-
-
-def pool_purge(pool_file, days: float = 5) -> int:
-    """Удаляет записи, которым больше `days` и по которым не было отправки."""
-    rows = pool_load(pool_file)
-    if not rows:
-        return 0
-    limit = _now() - timedelta(days=days)
-    kept: list[dict] = []
-    removed = 0
-    for row in rows:
-        found = _parse_dt(row.get("found_at"))
-        status = (row.get("status") or "").strip().lower()
-        touched = bool((row.get("sent_at") or "").strip()) or status in POOL_KEEP_STATUS
-        if found is not None and found < limit and not touched:
-            removed += 1
-            continue
-        kept.append(row)
-    if removed:
-        _pool_save(pool_file, kept)
-    return removed
-
-
-def pool_mark_sent(pool_file, key, channel: str, when: datetime | None = None) -> bool:
-    """Отмечает, что по лиду написали: срок жизни больше не действует."""
-    rows = pool_load(pool_file)
-    stamp = (when or _now()).isoformat(timespec="seconds")
-    changed = False
-    for row in rows:
-        if pool_key(row) == str(key):
-            row["sent_at"] = stamp
-            row["channel"] = channel
-            row["status"] = "manual" if channel == "manual" else "awaiting"
-            changed = True
-            break
-    if changed:
-        _pool_save(pool_file, rows)
-    return changed
-
-
-def pool_remove(pool_file, key) -> bool:
-    """Убирает лида из пула совсем."""
-    rows = pool_load(pool_file)
-    kept = [row for row in rows if pool_key(row) != str(key)]
-    if len(kept) == len(rows):
-        return False
-    _pool_save(pool_file, kept)
-    return True
-
-
-def pool_mark_status(pool_file, key, status: str) -> bool:
-    rows = pool_load(pool_file)
-    changed = False
-    for row in rows:
-        if pool_key(row) == str(key):
-            row["status"] = status
-            changed = True
-            break
-    if changed:
-        _pool_save(pool_file, rows)
-    return changed
-
-
-def _read_csv(path) -> list[dict]:
-    try:
-        with open(path, encoding="utf-8-sig", newline="") as fh:
-            return list(csv.DictReader(fh))
-    except (OSError, csv.Error):
-        return []
-
-
-def migrate_legacy(dir_path) -> dict:
-    """Разовый переезд: старый leads.csv доливается в пул и уезжает в архив.
-
-    GUI раньше писал все лиды в leads.csv; теперь единственный файл — пул.
-    Повторный вызов ничего не делает: файла уже нет (он переименован).
-    Возвращает {"added": int, "filled": int, "archived": str}.
-    """
-    base = Path(dir_path)
-    out = {"added": 0, "filled": 0, "archived": ""}
-    legacy = base / LEGACY_NAME
-    if not legacy.exists():
-        return out
-
-    pool_file = default_pool_path(base)
-    rows = _read_csv(legacy)
-    out["added"] = pool_add(pool_file, rows)          # только hot, дедуп по pool_key
-
-    source = {pool_key(r): r for r in rows}
-    current = pool_load(pool_file)
-    for row in current:
-        src = source.get(pool_key(row))
-        if not src:
-            continue
-        for channel in ("telegram", "max", "vk", "email"):
-            if not (row.get(channel) or "").strip():
-                value = _pool_value(channel, _pick_contact(src, channel))
-                if value:
-                    row[channel] = value
-                    out["filled"] += 1
-        # Перенести тему и ссылку на карточку 2ГИС из leads.csv
-        if not (row.get("topic") or "").strip():
-            val = str(src.get("query") or src.get("topic") or "").strip()
-            if val:
-                row["topic"] = val
-                out["filled"] += 1
-        if not (row.get("card") or "").strip():
-            val = str(src.get("url") or src.get("card") or "").strip()
-            if val:
-                row["card"] = val
-                out["filled"] += 1
-    if out["filled"]:
-        _pool_save(pool_file, current)
-
-    for name in (LEGACY_NAME,) + LEGACY_EXTRAS:
-        src = base / name
-        if not src.exists():
-            continue
-        try:
-            src.replace(base / (name + LEGACY_SUFFIX))
-            if name == LEGACY_NAME:
-                out["archived"] = LEGACY_NAME + LEGACY_SUFFIX
-        except OSError:
-            pass  # файл открыт в Excel — переедет при следующем запуске
-    return out
-
-
-def pool_stats(pool_file, days: float = 5) -> dict:
-    """Сколько в пуле всего и сколько истекает в ближайшие сутки."""
-    rows = pool_load(pool_file)
-    now = _now()
-    expiring = 0
-    for row in rows:
-        if (row.get("sent_at") or "").strip():
-            continue
-        if (row.get("status") or "").strip().lower() in POOL_KEEP_STATUS:
-            continue
-        found = _parse_dt(row.get("found_at"))
-        if found is None:
-            continue
-        left = (found + timedelta(days=days)) - now
-        if left <= timedelta(days=1):
-            expiring += 1
-    return {"total": len(rows), "expiring": expiring}
-
-
-def load_hot_leads(csv_file) -> list[dict]:
-    """Горячие лиды из пула, свежие сверху. Пула нет — читаем CSV и фильтруем по reason."""
-    pool_file = pool_path(csv_file)
-    rows: list[dict] = []
-    if pool_file.exists():
-        for row in pool_load(pool_file):
-            item = dict(row)
-            item["tier"] = "hot"
-            rows.append(item)
-    else:
-        for row in _read_csv(csv_file):
-            if is_hot(row):
-                item = dict(row)
-                item["tier"] = "hot"
-                rows.append(item)
-    rows.sort(key=lambda r: str(r.get("found_at") or ""), reverse=True)
-    return rows
-
-
-def _num(value, default: float = 0.0) -> float:
-    try:
-        return float(str(value).replace(",", "."))
-    except (TypeError, ValueError):
-        return default
-
-
-def _phone_to_e164(phone: str) -> str:
-    digits = re.sub(r"[^\d+]", "", str(phone).strip())
-    if digits.startswith("+"):
-        return digits
-    if len(digits) == 11 and digits[0] in "78":
-        return "+7" + digits[1:]
-    if len(digits) == 10:
-        return "+7" + digits
-    return "+" + digits
-
-
-def _pick_contact(row: dict, channel: str) -> str:
-    """Контакт канала: прямое поле, иначе запись вида «telegram:ник» в messengers."""
-    direct = str(row.get(channel) or "").strip()
-    if direct:
-        return direct
-    raw = row.get("messengers") or ""
-    items = raw if isinstance(raw, (list, tuple)) else str(raw).split(";")
-    for item in items:
-        text = str(item or "").strip()
-        if text.startswith(channel + ":"):
-            return text.split(":", 1)[1].strip()
-    return ""
-
-
-def channels_of(row: dict) -> dict:
-    """Доступные у лида каналы: {канал: (contact, kind)}.
-
-    Контакты могут лежать и ником, и готовой ссылкой (в пуле — ссылкой),
-    поэтому значение сначала приводится к нику: отправка работает с ним.
-    """
-    out: dict[str, tuple[str, str]] = {}
-    mx = _from_link("max", _pick_contact(row, "max"))
-    if mx:
-        out["max"] = (mx, "username")
-    tg = _from_link("telegram", _pick_contact(row, "telegram"))
-    if tg:
-        t = tg.strip()
-        digits = re.sub(r"\D", "", t)
-        if t and re.fullmatch(r"[\d\s\-()+]+", t) and len(digits) >= 7:
-            out["telegram"] = (_phone_to_e164(t), "phone")
-        elif t:
-            out["telegram"] = (t.lstrip("@"), "username")
-    vk = _from_link("vk", _pick_contact(row, "vk"))
-    if vk:
-        out["vk"] = (vk, "screen")
-    em = _from_link("email", _pick_contact(row, "email"))
-    if em:
-        out["email"] = (em, "email")
-    return out
-
-
-def contact_display(ch, contact: tuple[str, str]) -> str:
-    c, kind = contact
-    if ch == "telegram" and kind == "username":
-        return "@" + c
-    return c
-
-
-def contact_link(ch: str, contact: tuple[str, str]) -> str:
-    """Кликабельная ссылка на контакт; "" если ссылку не построить."""
-    value, kind = contact
-    value = str(value).strip()
-    if not value:
-        return ""
-    if value.lower().startswith(("http://", "https://", "mailto:")):
-        return value
-    if ch == "telegram":
-        if kind == "phone":
-            digits = re.sub(r"\D", "", value)
-            return "https://t.me/+" + digits if digits else ""
-        return "https://t.me/" + value.lstrip("@").strip("/")
-    if ch == "max":
-        return "https://max.ru/" + value.lstrip("@").strip("/")
-    if ch == "vk":
-        return "https://vk.com/" + value.strip("/")
-    if ch == "email":
-        return "mailto:" + value
-    return ""
-
-
-def channel_label(ch: str) -> str:
-    return CHANNEL_TITLE.get(ch, ch)
-
-
-# --- как показывать контакты в таблице -------------------------------------- #
-
-TARGET_TITLE = {**CHANNEL_TITLE, "phone": "Телефон"}
-
-
-def format_phone(phone) -> str:
-    """+7 906 026-34-84; «—», если цифр нет."""
-    digits = re.sub(r"\D", "", str(phone or ""))
-    if len(digits) == 11 and digits[0] in "78":
-        return f"+7 {digits[1:4]} {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
-    return str(phone or "—") if digits else "—"
-
-
-def _short(url: str) -> str:
-    """Ссылка без схемы — влезает в колонку и всё равно читается как ссылка."""
-    text = str(url or "").strip()
-    if text.lower().startswith("mailto:"):
-        return text[7:]
-    return re.sub(r"^https?://", "", text).rstrip("/")
-
-
-def _same_number(a, b) -> bool:
-    da, db = re.sub(r"\D", "", str(a or "")), re.sub(r"\D", "", str(b or ""))
-    return bool(da) and bool(db) and da[-10:] == db[-10:]
-
-
-def targets_of(row: dict) -> list[tuple[str, str, str]]:
-    """Все точки контакта по приоритету: (канал, что показать, куда вести).
-
-    Telegram-диплинк на тот же номер (t.me/+79060263484) — это телефон, а не
-    отдельный канал: показываем номер один раз, а ссылка ведёт в чат.
-    """
-    out: list[tuple[str, str, str]] = []
-    phone = format_phone(row.get("phone"))
-    tg = _to_link("telegram", row.get("telegram"))
-    tg_is_phone = bool(tg) and phone != "—" and _same_number(tg, row.get("phone"))
-    if tg and not tg_is_phone:
-        out.append(("telegram", _short(tg), tg))
-    for channel in ("vk", "max", "email"):
-        link = _to_link(channel, row.get(channel))
-        if link:
-            out.append((channel, _short(link), link))
-    if phone != "—":
-        out.append(("phone", phone, tg if tg_is_phone else ""))
-    return out
-
-
-def target_of(row: dict) -> tuple[str, str, str]:
-    """Куда писать: TG → VK → MAX → почта → телефон. Нет контактов — («», «—», «»)."""
-    items = targets_of(row)
-    return items[0] if items else ("", "—", "")
-
-
-def is_hot(lead) -> bool:
-    """Горячий лид: поле tier, иначе префикс reason, иначе score ≥ 70."""
-    return _tier_of(lead) == "hot"
-
-
-# --------------------------------------------------------------------------- #
-#  Состояние
-# --------------------------------------------------------------------------- #
-
 class MailState:
     """Журнал по каждому лиду: канал, sent_id, статус, история попыток."""
 
@@ -715,10 +180,6 @@ class MailState:
             self.save()
         return count
 
-
-# --------------------------------------------------------------------------- #
-#  ИИ
-# --------------------------------------------------------------------------- #
 
 def fallback_text(row: dict, idea: str) -> str:
     """Текст без ИИ — чтобы предпросмотр работал до настройки ключа."""
@@ -778,10 +239,6 @@ def ai_generate(settings: dict, row: dict, idea: str) -> str:
     return (data["choices"][0]["message"]["content"] or "").strip()
 
 
-# --------------------------------------------------------------------------- #
-#  Почта
-# --------------------------------------------------------------------------- #
-
 def _send_email(settings: dict, to: str, text: str) -> None:
     host = settings.get("smtp_host") or ""
     user = settings.get("smtp_user") or ""
@@ -805,10 +262,6 @@ def _send_email(settings: dict, to: str, text: str) -> None:
             srv.login(user, pwd)
             srv.send_message(msg)
 
-
-# --------------------------------------------------------------------------- #
-#  Telegram (user-аккаунт, Telethon.sync)
-# --------------------------------------------------------------------------- #
 
 def _ensure_loop() -> None:
     """В фоновой нити event loop нет — Telethon.sync упадёт без него."""
@@ -874,13 +327,6 @@ def _tg_send(client, contact: str, kind: str, text: str) -> dict:
 
 def tg_send(settings: dict, contact: str, kind: str, text: str) -> dict:
     return _tg_call(settings, lambda c: _tg_send(c, contact, kind, text))
-
-
-def tg_authorized(settings: dict) -> bool:
-    try:
-        return bool(_tg_call(settings, lambda c: True))
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def gui_auth(settings: dict, phone: str, parent=None, on_log=None) -> None:
@@ -954,10 +400,6 @@ def tg_logout(settings: dict) -> str:
     return "TG: сессия удалена"
 
 
-# --------------------------------------------------------------------------- #
-#  VK (user-токен, vk_api, v=5.199)
-# --------------------------------------------------------------------------- #
-
 class VKClient:
     """VK через vk_api с правами user: пишет первым по ID/домену, видит out_read/in_read."""
 
@@ -1024,10 +466,6 @@ class VKClient:
         return ""
 
 
-# --------------------------------------------------------------------------- #
-#  MAX (url + token)
-# --------------------------------------------------------------------------- #
-
 def _send_max(settings: dict, target: str, text: str) -> None:
     import urllib.request
 
@@ -1043,14 +481,6 @@ def _send_max(settings: dict, target: str, text: str) -> None:
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         resp.read()
-
-
-# --------------------------------------------------------------------------- #
-#  Отправка: единая точка
-# --------------------------------------------------------------------------- #
-
-_CLIENTS: dict = {}
-_CLIENTS_LOCK = threading.Lock()
 
 
 def _vk_client(settings: dict) -> VKClient:
@@ -1080,10 +510,6 @@ def dispatch(channel: str, settings: dict, contact: str, kind: str, text: str) -
     raise RuntimeError(f"неизвестный канал: {channel}")
 
 
-# --------------------------------------------------------------------------- #
-#  Генерация текстов
-# --------------------------------------------------------------------------- #
-
 def generate_texts(leads: list[dict], settings: dict, state: MailState,
                    on_log, on_progress, stop_event) -> int:
     idea = settings.get("idea") or ""
@@ -1106,10 +532,6 @@ def generate_texts(leads: list[dict], settings: dict, state: MailState,
         on_progress(f"тексты {index}/{len(leads)}")
     return done
 
-
-# --------------------------------------------------------------------------- #
-#  Основной цикл отправки
-# --------------------------------------------------------------------------- #
 
 class Mailer:
     def __init__(self, leads: list[dict], settings: dict, state: MailState,
@@ -1227,19 +649,6 @@ class Mailer:
             else:
                 stop_event.wait(20)
         self.on_log("рассылка остановлена", "warn")
-
-
-# --------------------------------------------------------------------------- #
-#  Ответы клиентов + статус прочтения -> пересылка в MAX
-# --------------------------------------------------------------------------- #
-
-def _parse_dt(value) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
 
 
 class Poller:

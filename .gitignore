@@ -38,3 +38,8 @@ ffmpeg*/
 leads.csv
 leads.jsonl
 out/
+*.migrated
+archive/
+buildout/
+build_*.log
+.tmp_*

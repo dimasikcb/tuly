@@ -29,6 +29,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
+from leads_contacts import messenger_links as _contact_links
+
 
 def _load_deps(install: bool = False) -> bool:
     """Импортирует зависимости; при install=True доставляет их в текущий Python."""
@@ -122,45 +124,13 @@ SOCIAL_HINTS = {
 
 
 def messenger_links(lead: dict) -> dict[str, str]:
-    """Кликабельные ссылки на контакты лида: telegram / max / vk / email."""
+    """Кликабельные ссылки на контакты лида: telegram / max / vk / email.
 
-    def pick(channel: str) -> str:
-        direct = str(lead.get(channel) or "").strip()
-        if direct:
-            return direct
-        # старые CSV: заполнен только общий список messengers
-        raw = lead.get("messengers") or []
-        items = raw if isinstance(raw, (list, tuple)) else str(raw).split(";")
-        for item in items:
-            text = str(item or "").strip()
-            if text.startswith(channel + ":"):
-                return text.split(":", 1)[1].strip()
-        return ""
+    Тонкая обёртка: правила построения ссылок живут в `leads_contacts`, чтобы
+    парсер и рассылка не расходились в трактовке телефона/ника.
+    """
+    return _contact_links(lead)
 
-    out: dict[str, str] = {}
-
-    tg = pick("telegram")
-    if tg:
-        handle = tg.lstrip("@")
-        digits = re.sub(r"\D", "", handle)
-        if re.fullmatch(r"[\d\s\-()+]+", handle) and len(digits) >= 7:
-            # в поле телефон: 2ГИС даёт диплинк t.me/+7… — он открывает чат
-            out["telegram"] = "https://t.me/+" + digits
-        elif handle:
-            out["telegram"] = "https://t.me/" + handle
-
-    mx = pick("max")
-    if mx:
-        out["max"] = "https://max.ru/" + mx.lstrip("@").strip("/")
-
-    vk = pick("vk")
-    if vk:
-        out["vk"] = "https://vk.com/" + vk.strip("/")
-
-    email = str(lead.get("email") or "").strip()
-    if email:
-        out["email"] = "mailto:" + email
-    return out
 
 
 COLUMNS = [

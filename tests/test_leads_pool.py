@@ -692,6 +692,62 @@ def test_ru_cities_constant_exists() -> None:
     assert "ekaterinburg" in cities
     assert len(cities) >= 10
 
+def test_contacts_module_is_single_source() -> None:
+    """Ссылки строит только leads_contacts: парсер и рассылка не расходятся."""
+    import leads_contacts as C
+    from leads2gis import messenger_links
+
+    lead = {"telegram": "https://t.me/barber_a", "max": "", "vk": "club1",
+            "email": "a@b.ru", "messengers": "vk:club1; max:shop2"}
+    assert messenger_links(lead) == C.messenger_links(lead)
+    assert M._to_link("telegram", "barber_a") == C.to_link("telegram", "barber_a")
+    assert M._from_link("vk", "https://vk.com/club1") == "club1"
+
+
+def test_pool_module_owns_pool_api() -> None:
+    """Пул живёт в leads_pool, а leads_mail отдаёт те же объекты (реэкспорт)."""
+    import leads_pool as P
+
+    assert M.pool_add is P.pool_add
+    assert M.pool_load is P.pool_load
+    assert M.POOL_COLUMNS == P.POOL_COLUMNS
+    assert M.RU_CITIES == P.RU_CITIES
+    assert M.PoolBusy is P.PoolBusy
+
+
+def test_contacts_link_rules() -> None:
+    """Телефон в telegram → диплинк t.me/+7…, ник → обычная ссылка."""
+    import leads_contacts as C
+
+    assert C.to_link("telegram", "+7 900 111-22-33") == "https://t.me/+79001112233"
+    assert C.to_link("telegram", "@barber_a") == "https://t.me/barber_a"
+    assert C.to_link("email", "a@b.ru") == "mailto:a@b.ru"
+    assert C.to_link("telegram", "https://t.me/x") == "https://t.me/x"
+    assert C.to_link("vk", "") == ""
+
+
+def test_pool_layers_have_no_upward_imports() -> None:
+    """Нижние слои не тянут верхние: contacts ← pool ← mail."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+
+    def imported(path: Path) -> set[str]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names.add(node.module.split(".")[0])
+        return names
+
+    assert "leads_mail" not in imported(root / "leads_contacts.py")
+    assert "leads_pool" not in imported(root / "leads_contacts.py")
+    assert "leads_mail" not in imported(root / "leads_pool.py")
+
+
 if __name__ == "__main__":
     for name, func in list(globals().items()):
         if name.startswith("test_") and callable(func):

@@ -34,7 +34,7 @@ import urllib.request
 import webbrowser
 import zipfile
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
@@ -355,24 +355,6 @@ def _short_link(url: str) -> str:
     if text.lower().startswith("mailto:"):
         return text[7:]
     return re.sub(r"^https?://", "", text).rstrip("/")
-
-
-def _score(value) -> float:
-    try:
-        return float(str(value).replace(",", "."))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _is_hot(row) -> bool:
-    """Горячий лид: поле tier, иначе префикс reason, иначе score ≥ 70."""
-    tier = str(row.get("tier") or "").strip().lower()
-    if tier:
-        return tier == "hot"
-    reason = str(row.get("reason") or "").strip().lower()
-    if reason:
-        return reason.startswith("hot")
-    return _score(row.get("score")) >= 70
 
 
 def fmt_size(size: float | None) -> str:
@@ -4389,6 +4371,31 @@ def proxifyre_stop() -> dict:
     return {"ok": True, "detail": "Обход по программам выключен"}
 
 
+def _wait_port(port: int, timeout: float = 25.0) -> bool:
+    """Ждёт, пока Happ поднимет локальный SOCKS (после connect это не мгновенно)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if port_open(port):
+            return True
+        time.sleep(0.5)
+    return port_open(port)
+
+
+def _force_apps_mode() -> bool:
+    """Гасит TUN и системный прокси Happ, если он включил их сам.
+
+    С включённым TUN весь трафик идёт в туннель, и обход «по программам»
+    фактически становится обходом «всего трафика». True — настройки меняли.
+    """
+    current = happ_mode_read()
+    if not (current["tun"] or current["system_proxy"]):
+        return False
+    happ_mode_write(tun=False, system_proxy=False)
+    if _image_pids(Path(bypass_cfg()["happ_path"]).name):
+        happ_tunnel_restart()
+    return True
+
+
 def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
     """Единая точка применения: весь трафик или только выбранные программы."""
     cfg = bypass_cfg()
@@ -4435,13 +4442,23 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
     if mode == "happ":
         add(bypass_happ_start())
         if scope == "apps":
+            if _force_apps_mode():
+                notes.append("Happ: TUN был включён — выключил, иначе через туннель "
+                             "шёл бы весь трафик")
             port = happ_socks_port()
-            if not port_open(port):
+            if not _wait_port(port):
                 raise RuntimeError(
                     f"Локальный SOCKS Happ не отвечает на 127.0.0.1:{port} — "
                     "обход по программам не заработает. Проверьте, что Happ подключён."
                 )
             add(proxifyre_start(cfg["apps"], port))
+            after = happ_mode_read()
+            if after["tun"] or after["system_proxy"]:
+                notes.append(
+                    "Внимание: Happ снова включил TUN/системный прокси — "
+                    "весь трафик идёт в туннель, а не только выбранные программы. "
+                    "Выключите TUN в самом Happ."
+                )
         else:
             add(proxifyre_stop())
     else:
@@ -5679,6 +5696,7 @@ class BypassPanel(Panel):
         self.query = ""
         self.only_running = False
         self._offline_noted = False
+        self._apply_job = None
         self._build()
         self.load_catalog()
         self.refresh_now()
@@ -5932,6 +5950,7 @@ class BypassPanel(Panel):
             self.selected_apps.discard(key)
         self._save_cfg()
         self._update_controls()
+        self._schedule_apply()
 
     def _clear_apps(self) -> None:
         self.selected_apps.clear()
@@ -5939,6 +5958,32 @@ class BypassPanel(Panel):
             row.set_selected(False)
         self._save_cfg()
         self._update_controls()
+        self._schedule_apply()
+
+    def _schedule_apply(self) -> None:
+        """Список программ применяется сам — иначе ProxiFyre работает по старому."""
+        if self._apply_job is not None:
+            try:
+                self.after_cancel(self._apply_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._apply_job = self.after(700, self._apply_apps_now)
+
+    def _apply_apps_now(self) -> None:
+        self._apply_job = None
+        if self.busy or not self.winfo_exists():
+            return
+        if self.mode != "happ" or self.scope != "apps":
+            return
+        if not (self.state.get("proxyfyre") or {}).get("running"):
+            return  # служба выключена — конфиг применится при включении
+        apps = self._selected_exe()
+        if not apps:
+            self._run(proxifyre_stop, "Программы: список пуст, выключаю обход…",
+                      "ProxiFyre: программ не осталось — выключаю перенаправление")
+            return
+        self._run(lambda: proxifyre_start(apps), "Программы: применяю список…",
+                  f"ProxiFyre: перенастраиваю на {len(apps)} программ…")
 
     def _selected_exe(self) -> list[str]:
         result = []
@@ -6170,6 +6215,26 @@ class BypassPanel(Panel):
 
         if self.scope == "apps":
             if happ.get("connected") and proxyfyre.get("running"):
+                if not happ.get("socks_ok"):
+                    return (
+                        "ProxiFyre работает, но SOCKS Happ не отвечает",
+                        f"127.0.0.1:{port} закрыт — выбранные программы останутся "
+                        "без интернета. Включите VPN в Happ.",
+                        WARN,
+                    )
+                if (happ.get("mode") or {}).get("tun"):
+                    return (
+                        "Обход по программам, но в Happ включён TUN",
+                        "TUN гонит в туннель весь трафик — распределения по "
+                        "программам нет. Выключите TUN в самом Happ.",
+                        WARN,
+                    )
+                if proxyfyre.get("pending"):
+                    return (
+                        "Обход по программам включён",
+                        "список программ изменён — применяю настройки…",
+                        WARN,
+                    )
                 return (
                     "Обход по программам включён",
                     f"{len(proxyfyre.get('apps') or [])} программ через "
