@@ -151,8 +151,8 @@ def apply_dark_theme(root: tk.Misc) -> None:
     )
     style.configure("TEntry", fieldbackground=FIELD, foreground=FG, insertcolor=FG, padding=px(6), bordercolor=BORDER)
     style.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)])
-    style.configure("TSpinbox", fieldbackground=FIELD, foreground=FG, insertcolor=FG, arrowcolor=FG, padding=px(4))
-    style.configure("TCombobox", fieldbackground=FIELD, foreground=FG, arrowcolor=FG, padding=px(4))
+    style.configure("TSpinbox", fieldbackground=FIELD, foreground=FG, insertcolor=FG, arrowcolor=FG, padding=px(4), arrowsize=22)
+    style.configure("TCombobox", fieldbackground=FIELD, foreground=FG, arrowcolor=FG, padding=px(4), arrowsize=22)
     style.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)])
     root.option_add("*TCombobox*Listbox.background", FIELD)
     root.option_add("*TCombobox*Listbox.foreground", FG)
@@ -3755,7 +3755,9 @@ PROXIFYRE_DIR = (Path(os.environ.get("LOCALAPPDATA") or str(Path.home()))
 PROXIFYRE_EXE = PROXIFYRE_DIR / "ProxiFyre.exe"
 PROXIFYRE_CONFIG = PROXIFYRE_DIR / "app-config.json"
 PROXIFYRE_LOG_DIR = PROXIFYRE_DIR / "logs"
-PROXIFYRE_SERVICE = "ProxiFyre"
+PROXIFYRE_SERVICE = "ProxiFyreService"
+PROXIFYRE_SERVICE_ALIASES = ("ProxiFyreService", "ProxiFyre")
+_PROXIFYRE_SERVICE_NAME: str | None = None
 PACKET_FILTER_DRIVER = "ndisrd"   # Windows Packet Filter — нужен ProxiFyre
 
 SVC_STOPPED = 1
@@ -4247,6 +4249,23 @@ def _svc_stop(name: str, wait: float = 12.0) -> bool:
     return _svc_state(name) == SVC_STOPPED
 
 
+def proxifyre_service_name() -> str:
+    """Реальное имя службы ProxiFyre.
+
+    Разные сборки регистрируют её как ProxiFyreService или как ProxiFyre:
+    с неверным именем состояние всегда «не установлена», и обход по
+    программам молча не включается.
+    """
+    global _PROXIFYRE_SERVICE_NAME
+    if _PROXIFYRE_SERVICE_NAME:
+        return _PROXIFYRE_SERVICE_NAME
+    for name in PROXIFYRE_SERVICE_ALIASES:
+        if _svc_state(name) is not None:
+            _PROXIFYRE_SERVICE_NAME = name
+            return name
+    return PROXIFYRE_SERVICE
+
+
 def proxifyre_config_data(apps, port: int) -> dict:
     return {
         "logLevel": "INFO",
@@ -4277,7 +4296,7 @@ def proxifyre_driver_ok() -> bool:
 
 
 def proxifyre_status() -> dict:
-    state = _svc_state(PROXIFYRE_SERVICE)
+    state = _svc_state(proxifyre_service_name())
     apps: list[str] = []
     try:
         data = json.loads(PROXIFYRE_CONFIG.read_text("utf-8"))
@@ -4286,12 +4305,16 @@ def proxifyre_status() -> dict:
                 apps.extend(normalize_apps(proxy.get("appNames")))
     except (OSError, ValueError, AttributeError):
         pass
+    configured = normalize_apps(apps)
+    wanted = normalize_apps(bypass_cfg()["apps"])
     return {
         "installed": PROXIFYRE_EXE.exists(),
         "driver": proxifyre_driver_ok(),
         "service": state,
         "running": state == SVC_RUNNING,
-        "apps": normalize_apps(apps),
+        "apps": configured,
+        "pending": {name.lower() for name in wanted}
+        != {name.lower() for name in configured},
     }
 
 
@@ -4311,7 +4334,7 @@ def _proxifyre_install() -> bool:
             return False
     for _ in range(40):
         time.sleep(0.5)
-        if _svc_state(PROXIFYRE_SERVICE) is not None:
+        if _svc_state(proxifyre_service_name()) is not None:
             return True
     return False
 
@@ -4331,18 +4354,20 @@ def proxifyre_start(apps=None, port: int | None = None) -> dict:
             "обход по программам без него невозможен"
         )
     changed = proxifyre_write_config(names, port)
-    state = _svc_state(PROXIFYRE_SERVICE)
+    service = proxifyre_service_name()
+    state = _svc_state(service)
     if state is None:
         if not _proxifyre_install():
             raise RuntimeError(
                 "Служба ProxiFyre не установлена: подтвердите запрос прав администратора"
             )
-        state = _svc_state(PROXIFYRE_SERVICE)
+        service = proxifyre_service_name()
+        state = _svc_state(service)
     if state == SVC_RUNNING and not changed:
         return {"ok": True, "detail": f"Обход уже включён для {len(names)} программ"}
     if state == SVC_RUNNING:
-        _svc_stop(PROXIFYRE_SERVICE)
-    if not _svc_start(PROXIFYRE_SERVICE):
+        _svc_stop(service)
+    if not _svc_start(service):
         raise RuntimeError(
             "Не удалось запустить службу ProxiFyre — нужны права администратора"
         )
@@ -4353,12 +4378,13 @@ def proxifyre_start(apps=None, port: int | None = None) -> dict:
 
 
 def proxifyre_stop() -> dict:
-    state = _svc_state(PROXIFYRE_SERVICE)
+    service = proxifyre_service_name()
+    state = _svc_state(service)
     if state is None:
         return {"ok": True, "detail": ""}
     if state != SVC_RUNNING:
         return {"ok": True, "detail": "Обход по программам уже выключен"}
-    if not _svc_stop(PROXIFYRE_SERVICE):
+    if not _svc_stop(service):
         raise RuntimeError("Не удалось остановить службу ProxiFyre")
     return {"ok": True, "detail": "Обход по программам выключен"}
 
@@ -6287,6 +6313,11 @@ LEADS_DIR = (
     else Path(__file__).resolve().parent
 )
 
+# Единственный файл данных — пул горячих. Настройки и журнал рассылки лежат рядом.
+POOL_FILE = LEADS_DIR / "hot_pool.csv"
+MAIL_SETTINGS_PATH = LEADS_DIR / "leads_mail_settings.json"
+MAIL_STATE_PATH = LEADS_DIR / "leads_mail_state.json"
+
 try:
     import leads_mail
 
@@ -6309,46 +6340,83 @@ def _leads_client():
     return client
 
 
-def leads_collect(city: str, query: str, pages: int, only_no_site: bool,
-                  min_reviews: int | None, output: str, on_progress, on_log, stop) -> dict:
-    """Обходит выдачу и карточки, пишет CSV+JSONL. Возвращает счётчики."""
+
+def _city_list(city: str) -> list[str]:
+    """Разбирает строку городов; «russia/вся россия» → список RU_CITIES."""
+    if city.strip().lower() in ("russia", "вся россия", "всяроссия", "ru"):
+        try:
+            return list(leads_mail.RU_CITIES)
+        except AttributeError:
+            return ["moscow"]
+    return [c.strip() for c in city.split(",") if c.strip()]
+
+def leads_collect(city: str, query: str, cards: int, only_no_site: bool,
+                  min_reviews: int | None, on_progress, on_log, stop) -> dict:
+    """Обходит выдачу и карточки, горячих кладёт в пул. Возвращает счётчики."""
     if not LEADS_OK:
         raise RuntimeError(LEADS_ERROR or "нет requests/selectolax")
+    if not MAIL_OK:
+        raise RuntimeError("нет модуля leads_mail — сохранять некуда")
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     client = leads_engine.TwoGisClient(timeout=30, delay=0.4)
 
-    cards: list[dict] = []
+    try:
+        want = max(1, int(cards))
+    except (TypeError, ValueError):
+        want = leads_engine.CARDS_PER_PAGE * 5
+
+    cities = _city_list(city)
+    if not cities:
+        cities = [city.strip() or "moscow"]
+    want_share = max(1, want // len(cities))
+
+    all_cards: list[dict] = []
     seen: set[str] = set()
-    last_page = 1
-    for page in range(1, pages + 1):
-        if stop.is_set() or page > last_page:
+    for ci, cur_city in enumerate(cities, 1):
+        if stop.is_set():
             break
-        found, last_page = client.search_page(city, query, page)
-        fresh = [card for card in found if card["id"] not in seen]
-        for card in fresh:
-            seen.add(card["id"])
-        cards.extend(fresh)
-        on_progress(f"страница {page}/{last_page} · карточек {len(cards)}")
-        if not fresh:
-            break
+        pages = leads_engine.pages_for(want_share)
+        city_cards: list[dict] = []
+        for page in range(1, pages + 1):
+            if stop.is_set() or len(city_cards) >= want_share:
+                break
+            try:
+                found, _last_page = client.search_page(cur_city, query, page)
+            except Exception as exc:
+                on_log(f"{cur_city}: ошибка поиска ({exc})")
+                break
+            fresh = [c for c in found if c["id"] not in seen]
+            for c in fresh:
+                seen.add(c["id"])
+            city_cards.extend(fresh)
+            on_progress(f"город {ci}/{len(cities)} {cur_city} стр.{page}/{pages} · {len(city_cards)}/{want_share}")
+            if not fresh:
+                break
+        city_cards = city_cards[:want_share]
+        all_cards.extend(city_cards)
+        on_log(f"{cur_city} / {query}: карточек {len(city_cards)}")
 
-    on_log(f"{city} / {query}: карточек {len(cards)}")
-    if not cards:
-        return {"checked": 0, "saved": 0, "file": output, "top": []}
+    if not all_cards:
+        return {"checked": 0, "found": 0, "hot": 0, "pooled": 0,
+                "total": len(leads_mail.pool_load(POOL_FILE)), "rows": []}
 
-    def one(firm_id: str) -> dict | None:
+    def one(card_info: tuple) -> dict | None:
+        cur_city, firm_id = card_info
         try:
-            html = _leads_client().firm_html(city, firm_id)
+            html = _leads_client().firm_html(cur_city, firm_id)
         except Exception:  # noqa: BLE001 - битая карточка не рушит прогон
             return None
-        return leads_engine.parse_firm(html, city, firm_id, query)
+        return leads_engine.parse_firm(html, cur_city, firm_id, query)
+
+    # parse_search уже кладёт city в каждую карточку — восстанавливать не нужно
+    card_infos = [(c.get("city") or cities[0], c["id"]) for c in all_cards]
 
     parsed: list[dict] = []
-    total = len(cards)
+    total = len(card_infos)
     with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = [pool.submit(one, card["id"]) for card in cards]
+        futures = [pool.submit(one, ci) for ci in card_infos]
         for index, future in enumerate(as_completed(futures), 1):
             if stop.is_set():
                 break
@@ -6361,6 +6429,7 @@ def leads_collect(city: str, query: str, pages: int, only_no_site: bool,
     for lead in parsed:
         if ratings.get(lead["id"]) is not None:
             lead["rating"] = ratings[lead["id"]]
+        lead["topic"] = query
         lead["score"], lead["reason"] = leads_engine.score(lead)
 
     dropped = leads_engine.drop_boilerplate_domains(parsed)
@@ -6378,25 +6447,21 @@ def leads_collect(city: str, query: str, pages: int, only_no_site: bool,
         reverse=True,
     )
 
-    saved = 0
-    with leads_engine.Store(Path(output)) as store:
-        for lead in selected:
-            if store.add(lead):
-                saved += 1
-
     pooled = 0
     if MAIL_OK:
         try:
-            pooled = leads_mail.pool_add(output, selected)
+            pooled = leads_mail.pool_add(POOL_FILE, selected)
         except Exception as exc:  # noqa: BLE001 - пул не должен валить сбор
             on_log(f"пул горячих: {exc}")
 
-    on_log(f"в файл: {saved} из {len(parsed)}")
     if pooled:
         on_log(f"в пул горячих добавлено: {pooled}")
+    else:
+        on_log("горячих новых нет — всё уже в пуле")
     return {
-        "checked": len(parsed), "saved": saved, "file": output,
-        "pooled": pooled, "top": selected[:5], "rows": selected[:300],
+        "checked": len(parsed), "pooled": pooled,
+        "total": len(leads_mail.pool_load(POOL_FILE)),
+        "top": selected[:5], "rows": selected[:300],
     }
 
 
@@ -6419,11 +6484,9 @@ class LeadsPanel(Panel):
 
         self.city_var = tk.StringVar(value="moscow")
         self.query_var = tk.StringVar(value="барбершоп")
-        self.pages_var = tk.StringVar(value="5")
+        self.cards_var = tk.StringVar(value="60")
         self.reviews_var = tk.StringVar(value="")
-        self.output_var = tk.StringVar(value=str(LEADS_DIR / "leads.csv"))
         self.no_site_var = tk.BooleanVar(value=True)
-        self.open_var = tk.BooleanVar(value=True)
 
         def caption(row: int, column: int, text: str) -> None:
             tk.Label(body, text=text, bg=CARD, fg=MUTED, anchor="w",
@@ -6431,30 +6494,30 @@ class LeadsPanel(Panel):
                 row=row, column=column, sticky="w", padx=(0, px(8)), pady=px(5))
 
         caption(0, 0, "Город")
-        ttk.Entry(body, textvariable=self.city_var, width=20).grid(
-            row=0, column=1, sticky="ew", pady=px(5))
+        _city_opts = ["russia — вся Россия"] + [
+            c for c in (leads_mail.RU_CITIES if MAIL_OK and hasattr(leads_mail, "RU_CITIES") else [])
+        ]
+        _city_cb = ttk.Combobox(
+            body, textvariable=self.city_var, values=_city_opts, width=20
+        )
+        _city_cb.grid(row=0, column=1, sticky="ew", pady=px(5))
         caption(0, 2, "Что искать")
         ttk.Entry(body, textvariable=self.query_var).grid(
             row=0, column=3, sticky="ew", padx=(px(16), 0), pady=px(5))
 
-        caption(1, 0, "Страниц")
-        ttk.Spinbox(body, from_=1, to=50, width=6, textvariable=self.pages_var).grid(
+        caption(1, 0, "Карточек")
+        ttk.Spinbox(body, from_=12, to=600, increment=12, width=6,
+                    textvariable=self.cards_var).grid(
             row=1, column=1, sticky="w", pady=px(5))
         caption(1, 2, "Мин. отзывов")
         ttk.Entry(body, textvariable=self.reviews_var, width=8).grid(
             row=1, column=3, sticky="w", padx=(px(16), 0), pady=px(5))
-
-        caption(2, 0, "Файл")
-        ttk.Entry(body, textvariable=self.output_var).grid(
-            row=2, column=1, columnspan=2, sticky="ew", pady=px(5))
-        flat_button(body, "Обзор…", self.pick_file, kind="ghost").grid(
-            row=2, column=3, sticky="w", padx=(px(16), 0))
+        tk.Label(body, text="12 фирм на страницу выдачи 2ГИС", bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 8)).grid(row=2, column=0, columnspan=4, sticky="w")
 
         options = tk.Frame(body, bg=CARD)
         options.grid(row=3, column=0, columnspan=4, sticky="w", pady=(px(8), 0))
         dark_check(options, "только без сайта", self.no_site_var, bg=CARD).pack(side="left")
-        dark_check(options, "открыть CSV после", self.open_var, bg=CARD).pack(
-            side="left", padx=(px(18), 0))
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", pady=(px(14), 0))
@@ -6462,7 +6525,11 @@ class LeadsPanel(Panel):
         self.start_btn.pack(side="left")
         self.stop_btn = flat_button(actions, "Стоп", self.stop_run, kind="ghost")
         self.stop_btn.pack(side="left", padx=(px(8), 0))
-        flat_button(actions, "Открыть CSV", self.open_file, kind="ghost").pack(
+        flat_button(actions, "Обновить", self.refresh, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(actions, "Заполнить тему", self.fill_topics, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(actions, "Написал вручную", self.mark_manual, kind="ghost").pack(
             side="left", padx=(px(8), 0))
         flat_button(actions, "Рассылка ИИ", self.open_mail, kind="primary").pack(
             side="left", padx=(px(8), 0))
@@ -6471,12 +6538,12 @@ class LeadsPanel(Panel):
 
         table_frame = ttk.Frame(self)
         table_frame.pack(fill="both", expand=True, pady=(px(10), 0))
-        cols = ("name", "tg", "max", "vk", "mail", "phone")
+        cols = ("name", "topic", "contact", "gis")
         self.result_tree = ttk.Treeview(
             table_frame, columns=cols, show="headings", height=9)
         for col, title, width in (
-            ("name", "Название", 210), ("tg", "Telegram", 165), ("max", "MAX", 140),
-            ("vk", "ВКонтакте", 150), ("mail", "Почта", 175), ("phone", "Телефон", 130),
+            ("name", "Название", 220), ("topic", "Тема", 150),
+            ("contact", "Контакты", 230), ("gis", "2ГИС", 120),
         ):
             self.result_tree.heading(col, text=title)
             self.result_tree.column(col, width=px(width), anchor="w")
@@ -6491,39 +6558,19 @@ class LeadsPanel(Panel):
         self.result_tree.bind("<Button-3>", self._row_menu)
         self._row_links: dict[str, list[tuple[str, str]]] = {}
         self._row_urls: dict[str, str] = {}
+        self._row_phones: dict[str, str] = {}
 
         log_frame, self.log_box = self.make_log(self, height=6)
         log_frame.pack(fill="both", expand=True, pady=(px(10), 0))
         self.append_log(
             self.log_box,
             "Город — слаг 2GIS: moscow, spb, kazan, ekb, nsk. "
-            "Главный сигнал лида — отсутствие сайта.",
+            "Главный сигнал лида — отсутствие сайта. Горячие копятся в пуле на 5 дней.",
         )
         self._set_buttons(running=False)
-        self.load_last()
+        self.refresh()
 
     # -- действия ---------------------------------------------------------- #
-    def pick_file(self) -> None:
-        path = filedialog.asksaveasfilename(
-            parent=self,
-            title="Куда сохранить лиды",
-            defaultextension=".csv",
-            initialfile=Path(self.output_var.get()).name or "leads.csv",
-            filetypes=[("CSV", "*.csv")],
-        )
-        if path:
-            self.output_var.set(path)
-
-    def open_file(self) -> None:
-        path = Path(self.output_var.get())
-        if not path.exists():
-            messagebox.showwarning("Лиды 2GIS", "Файла ещё нет — сначала собери лидов.", parent=self)
-            return
-        try:
-            os.startfile(str(path.resolve()))  # noqa: S606 - Windows
-        except OSError as exc:
-            messagebox.showerror("Лиды 2GIS", f"Не открылся файл:\n{exc}", parent=self)
-
     def open_mail(self) -> None:
         if not MAIL_OK:
             messagebox.showerror(
@@ -6531,12 +6578,7 @@ class LeadsPanel(Panel):
                 parent=self,
             )
             return
-        path = Path(self.output_var.get().strip() or (LEADS_DIR / "leads.csv"))
-        if not path.exists():
-            messagebox.showwarning(
-                "Рассылка ИИ", "Сначала собери лидов — CSV ещё нет.", parent=self)
-            return
-        MailWindow(self.hub, path)
+        MailWindow(self.hub, POOL_FILE)
 
     def start(self) -> None:
         if self.busy:
@@ -6550,24 +6592,22 @@ class LeadsPanel(Panel):
             )
             return
 
-        city = self.city_var.get().strip().lower()
+        city = self.city_var.get().strip()
+        if city.lower().startswith("russia"):  # «russia — вся Россия» → «russia»
+            city = "russia".lower()
         query = self.query_var.get().strip()
         if not city or not query:
             messagebox.showwarning("Лиды 2GIS", "Нужны город и поисковый запрос.", parent=self)
             return
 
         try:
-            pages = max(1, min(50, int(self.pages_var.get())))
+            cards = max(12, min(600, int(self.cards_var.get())))
         except ValueError:
-            pages = 5
+            cards = 60
         try:
             min_reviews = int(self.reviews_var.get()) if self.reviews_var.get().strip() else None
         except ValueError:
             min_reviews = None
-
-        output = self.output_var.get().strip() or str(LEADS_DIR / "leads.csv")
-        # Значения Tk-переменных читаем только в главном потоке: из рабочего
-        # это даёт "main thread is not in main loop".
         only_no_site = bool(self.no_site_var.get())
 
         self.stop_event.clear()
@@ -6576,16 +6616,11 @@ class LeadsPanel(Panel):
         self.status_var.set("Собираю…")
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
-        self.append_log(self.log_box, f"старт: {city} / {query}, страниц {pages}")
+        self.append_log(self.log_box, f"старт: {city} / {query}, карточек {cards}")
 
         def work() -> dict:
             return leads_collect(
-                city,
-                query,
-                pages,
-                only_no_site,
-                min_reviews,
-                output,
+                city, query, cards, only_no_site, min_reviews,
                 lambda text: self.hub.post(lambda text=text: self.status_var.set(text)),
                 lambda text: self.hub.post(lambda text=text: self.append_log(self.log_box, text)),
                 self.stop_event,
@@ -6600,80 +6635,144 @@ class LeadsPanel(Panel):
         self.status_var.set("Останавливаю…")
         self.append_log(self.log_box, "остановка по кнопке")
 
-    # -- результат --------------------------------------------------------- #
-    def _done(self, result: dict) -> None:
-        self.busy = False
-        self._set_buttons(running=False)
-        self.status_var.set(f"Готово: {result['saved']} лидов")
+    # -- данные ------------------------------------------------------------ #
+    def _pool_days(self) -> float:
+        settings = leads_mail.load_settings(MAIL_SETTINGS_PATH)
+        try:
+            return max(1.0, float(str(settings.get("pool_days", "5")).replace(",", ".")))
+        except (TypeError, ValueError):
+            return 5.0
 
-        if not result["saved"]:
-            self.append_log(
-                self.log_box,
-                "ничего не подошло под фильтры — попробуй снять «только без сайта»",
-                "error",
-            )
+    def _contact_links(self, row: dict) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for channel, title in (("telegram", "Telegram"), ("vk", "ВКонтакте"),
+                               ("max", "MAX"), ("email", "Почта")):
+            url = leads_mail._to_link(channel, row.get(channel))
+            if url:
+                out.append((title, url))
+        return out
+
+    def _contact_primary(self, row: dict) -> str:
+        """Самый приоритетный канал — одной строкой, без дублей номера."""
+        for channel, title in (("telegram", "Telegram"), ("vk", "ВКонтакте"),
+                               ("max", "MAX"), ("email", "Почта")):
+            raw = str(row.get(channel) or "").strip()
+            if raw:
+                return f"{title}: {_short_link(leads_mail._to_link(channel, raw))}"
+        phone = str(row.get("phone") or "").strip()
+        if phone:
+            return "Телефон: " + _fmt_phone(phone)
+        return "—"
+
+    def fill_topics(self) -> None:
+        """Заполняет пустой topic у записей пула текущим поисковым запросом."""
+        query = self.query_var.get().strip()
+        if not query:
+            self.status_var.set("Введите «Что искать» перед заполнением темы")
             return
-
-        rows = result.get("rows") or result.get("top") or []
-        self._fill_results(rows)
-        self.append_log(
-            self.log_box,
-            f"готово: {result['saved']} лидов, в таблице {len(rows)}; "
-            f"двойной клик по строке открывает контакт",
-            "ok",
-        )
-        self.hub.toast(f"Лиды: {result['saved']} → {Path(result['file']).name}")
-
-        if self.open_var.get():
+        if not MAIL_OK:
+            return
+        rows = leads_mail.pool_load(POOL_FILE)
+        changed = 0
+        for row in rows:
+            if not (row.get("topic") or "").strip():
+                row["topic"] = query
+                changed += 1
+        if changed:
             try:
-                os.startfile(str(Path(result["file"]).resolve()))  # noqa: S606 - Windows
-            except OSError:
-                pass
+                leads_mail._pool_save(POOL_FILE, rows)
+                self.status_var.set(f"Тема «{query}» → {changed} записей")
+                self.refresh()
+            except leads_mail.PoolBusy:
+                self.status_var.set("Файл занят — закрой Excel")
+        else:
+            self.status_var.set("Все записи уже имеют тему")
 
-    def _append_link(self, url: str) -> None:
-        """Ссылка на контакт в логе — кликабельная."""
-        tag = f"link:{url}"
-        if tag not in self.log_box.tag_names():
-            self.log_box.tag_configure(tag, foreground=ACCENT, underline=True)
-            self.log_box.tag_bind(tag, "<Button-1>", lambda _e, u=url: webbrowser.open(u))
-            self.log_box.tag_bind(tag, "<Enter>",
-                                  lambda _e: self.log_box.configure(cursor="hand2"))
-            self.log_box.tag_bind(tag, "<Leave>",
-                                  lambda _e: self.log_box.configure(cursor=""))
-        self.log_box.insert("end", f"      {url}\n", tag)
-        self.log_box.see("end")
+    def refresh(self) -> None:
+        if not MAIL_OK:
+            self.status_var.set("нет модуля рассылки")
+            return
+        days = self._pool_days()
+        busy = ""
+        try:
+            leads_mail.pool_purge(POOL_FILE, days)
+        except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
+            busy = str(exc)
+        self._fill_pool()
+        stats = leads_mail.pool_stats(POOL_FILE, days)
+        tail = f" · {busy}" if busy else ""
+        self.status_var.set(
+            f"в пуле: {stats['total']} · истекают сегодня: {stats['expiring']} · "
+            f"срок {days:g} дн.{tail}")
 
-    def _fill_results(self, leads: list[dict]) -> None:
-        """Таблица результатов сбора: контакты — готовыми ссылками."""
+    on_show = refresh
+
+    def _fill_pool(self) -> None:
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
         self._row_links.clear()
         self._row_urls.clear()
-        for index, lead in enumerate(leads):
-            links = leads_engine.messenger_links(lead)
-            iid = str(lead.get("id") or f"r{index}")
-            self._row_links[iid] = [
-                (title, links[key])
-                for key, title in (("telegram", "Telegram"), ("max", "MAX"),
-                                   ("vk", "ВКонтакте"), ("email", "Почта"))
-                if links.get(key)
-            ]
-            self._row_urls[iid] = str(lead.get("url") or "")
+        self._row_phones.clear()
+        rows = leads_mail.pool_load(POOL_FILE)
+        for index, row in enumerate(rows):
+            iid = f"r{index}"
+            self._row_links[iid] = self._contact_links(row)
+            self._row_urls[iid] = str(row.get("card") or "").strip()
+            self._row_phones[iid] = str(row.get("phone") or "").strip()
+            topic = str(row.get("topic") or "").strip() or "—"
+            gis = "2ГИС" if self._row_urls[iid] else "—"
             self.result_tree.insert("", "end", iid=iid, values=(
-                lead.get("name", ""), links.get("telegram", ""), links.get("max", ""),
-                links.get("vk", ""), links.get("email", ""), _fmt_phone(lead.get("phone")),
+                row.get("name", ""), topic, self._contact_primary(row), gis,
             ))
 
-    def _open_row_link(self, _event=None) -> None:
+    # -- результат сбора --------------------------------------------------- #
+    def _done(self, result: dict) -> None:
+        self.busy = False
+        self._set_buttons(running=False)
+        self.status_var.set(f"Готово: в пуле {result['total']}")
+        self.append_log(
+            self.log_box,
+            f"готово: проверено {result['checked']}, новых горячих {result['pooled']} "
+            f"(в пуле всего {result['total']})",
+            "ok",
+        )
+        self.hub.toast(f"Горячих в пуле: {result['total']}")
+        self.refresh()
+
+    def _fail(self, exc: Exception) -> None:
+        self.busy = False
+        self._set_buttons(running=False)
+        self.status_var.set("Ошибка")
+        self.append_log(self.log_box, f"ошибка: {exc}", "error")
+        messagebox.showerror("Лиды 2GIS", str(exc), parent=self)
+
+    def _set_buttons(self, *, running: bool) -> None:
+        self.start_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
+
+    # -- контекст ---------------------------------------------------------- #
+    def _open_row_link(self, event=None) -> None:
         sel = self.result_tree.selection()
         if not sel:
             return
-        items = self._row_links.get(sel[0], [])
-        if not items:
-            self.append_log(self.log_box, "у лида нет ссылок — только телефон", "warn")
-            return
-        webbrowser.open(items[0][1])
-        self.append_log(self.log_box, f"открыто: {items[0][1]}", "ok")
+        iid = sel[0]
+        # Если кликнули по колонке 2ГИС — сразу открываем карточку 2ГИС
+        if event is not None:
+            try:
+                col_id = self.result_tree.identify_column(event.x)
+                col_name = self.result_tree.column(col_id, option="id") if col_id else ""
+                if col_name == "gis":
+                    url = self._row_urls.get(iid, "")
+                    if url:
+                        webbrowser.open(url)
+                    return
+            except Exception:
+                pass
+        links = self._row_links.get(iid, [])
+        if links:
+            webbrowser.open(links[0][1])
+        elif self._row_urls.get(iid):
+            webbrowser.open(self._row_urls[iid])
 
     def _open_2gis(self, iid: str) -> None:
         url = self._row_urls.get(iid, "")
@@ -6685,252 +6784,53 @@ class LeadsPanel(Panel):
         if not iid:
             return
         self.result_tree.selection_set(iid)
-        items = self._row_links.get(iid, [])
         menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=ACCENT,
                        activeforeground="#0d1117", bd=0)
-        if not items:
-            menu.add_command(label="ссылок нет — только телефон", state="disabled")
-        for title, url in items:
+        for title, url in self._row_links.get(iid, []):
             menu.add_command(label=f"{title}: {url}",
                              command=lambda u=url: webbrowser.open(u))
+        if not self._row_links.get(iid):
+            menu.add_command(label="ссылок нет — только телефон", state="disabled")
         menu.add_separator()
-        menu.add_command(label="Открыть карточку в 2GIS",
-                         command=lambda: self._open_2gis(iid))
+        if self._row_urls.get(iid):
+            menu.add_command(label="Открыть карточку в 2ГИС",
+                             command=lambda: self._open_2gis(iid))
+        menu.add_command(label="Написал вручную (удалить)", command=self.mark_manual)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
-
-    def _fail(self, exc: Exception) -> None:
-        self.busy = False
-        self._set_buttons(running=False)
-        self.status_var.set("Ошибка")
-        self.append_log(self.log_box, f"ошибка: {exc}", "error")
-        busy = isinstance(exc, getattr(leads_engine, "LeadsFileBusy", ()))
-        title = "Лиды 2GIS — файл занят" if busy else "Лиды 2GIS"
-        messagebox.showerror(title, str(exc), parent=self)
-
-    def _set_buttons(self, *, running: bool) -> None:
-        self.start_btn.configure(state="disabled" if running else "normal")
-        self.stop_btn.configure(state="normal" if running else "disabled")
-
-    def load_last(self) -> None:
-        """Показывает в таблице прошлый сбор из CSV — он не должен пропадать."""
-        if self.busy:
-            return
-        path = Path(self.output_var.get().strip() or (LEADS_DIR / "leads.csv"))
-        if not path.exists():
-            return
-        try:
-            with path.open(encoding="utf-8-sig", newline="") as fh:
-                rows = list(csv.DictReader(fh))
-        except (OSError, csv.Error):
-            return
-        rows.sort(key=lambda r: _score(r.get("score")), reverse=True)
-        self._fill_results(rows[:300])
-        hot = sum(1 for r in rows if _is_hot(r))
-        self.status_var.set(f"в файле: {len(rows)} (горячих {hot})")
-
-    on_show = load_last
-
-
-class HotPoolPanel(Panel):
-    """Пул горячих лидов: что лежит в hot_pool.csv и сколько ему осталось жить."""
-
-    def __init__(self, master: tk.Misc, hub) -> None:
-        super().__init__(master, hub)
-        self.csv_path = LEADS_DIR / "leads.csv"
-        self._links: dict[str, list[tuple[str, str]]] = {}
-        self._rows: dict[str, dict] = {}
-        self._build()
-        self.refresh()
-
-    def _build(self) -> None:
-        actions = ttk.Frame(self)
-        actions.pack(fill="x")
-        flat_button(actions, "Обновить", self.refresh, kind="primary").pack(side="left")
-        flat_button(actions, "Открыть контакт", self.open_link, kind="ghost").pack(
-            side="left", padx=(px(8), 0))
-        flat_button(actions, "Написал вручную", self.mark_manual, kind="ghost").pack(
-            side="left", padx=(px(8), 0))
-        flat_button(actions, "Убрать из пула", self.remove, kind="danger").pack(
-            side="left", padx=(px(8), 0))
-        flat_button(actions, "Рассылка ИИ", self.open_mail, kind="primary").pack(
-            side="left", padx=(px(8), 0))
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(actions, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
-
-        frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True, pady=(px(10), 0))
-        cols = ("name", "tg", "max", "vk", "mail", "phone", "left")
-        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
-        for col, title, width in (
-            ("name", "Название", 190), ("tg", "Telegram", 165), ("max", "MAX", 140),
-            ("vk", "ВКонтакте", 150), ("mail", "Почта", 175), ("phone", "Телефон", 130),
-            ("left", "Осталось", 90),
-        ):
-            self.tree.heading(col, text=title)
-            self.tree.column(col, width=px(width), anchor="w")
-        vscroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vscroll.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vscroll.grid(row=0, column=1, sticky="ns")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-        self.tree.bind("<Double-1>", self.open_link)
-        self.tree.bind("<Button-3>", self._menu)
-
-    # -- данные ------------------------------------------------------------ #
-    def _pool_days(self) -> float:
-        settings = leads_mail.load_settings(
-            self.csv_path.with_name("leads_mail_settings.json"))
-        try:
-            return max(1.0, float(str(settings.get("pool_days", "5")).replace(",", ".")))
-        except (TypeError, ValueError):
-            return 5.0
-
-    def refresh(self) -> None:
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        self._links.clear()
-        self._rows.clear()
-        if not MAIL_OK:
-            self.status_var.set("нет модуля рассылки")
-            return
-        if not self.csv_path.exists():
-            self.status_var.set("нет leads.csv — сначала собери лидов")
-            return
-
-        days = self._pool_days()
-        synced = 0
-        busy = ""
-        try:
-            synced = leads_mail.pool_sync(self.csv_path)
-            leads_mail.pool_purge(self.csv_path, days)
-            leads_mail.pool_refresh(self.csv_path)
-        except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
-            busy = str(exc)
-        rows = leads_mail.pool_load(self.csv_path)
-        stats = leads_mail.pool_stats(self.csv_path, days)
-        now = datetime.now()
-
-        for index, row in enumerate(rows):
-            links = []
-            for channel, title in (("telegram", "Telegram"), ("max", "MAX"),
-                                   ("vk", "ВКонтакте"), ("email", "Почта")):
-                url = leads_mail._to_link(channel, row.get(channel))
-                if url:
-                    links.append((title, url))
-            iid = f"r{index}"
-            self._links[iid] = links
-            self._rows[iid] = row
-
-            found = leads_mail._parse_dt(row.get("found_at"))
-            left = "—"
-            if found is not None and not (row.get("sent_at") or "").strip():
-                rest = (found + timedelta(days=days)) - now
-                left = "просрочен" if rest.total_seconds() <= 0 else f"{rest.days} дн."
-            urls = {title: _short_link(url) for title, url in links}
-            self.tree.insert("", "end", iid=iid, values=(
-                row.get("name", ""), urls.get("Telegram", ""), urls.get("MAX", ""),
-                urls.get("ВКонтакте", ""), urls.get("Почта", ""),
-                _fmt_phone(row.get("phone")), left,
-            ))
-
-        tail = f" · из CSV +{synced}" if synced else ""
-        if busy:
-            tail = f" · {busy}"
-        self.status_var.set(
-            f"в пуле: {stats['total']} · истекают сегодня: {stats['expiring']} · "
-            f"срок {days:g} дн.{tail}")
-
-    on_show = refresh
-
-    # -- действия ---------------------------------------------------------- #
-    def _selected(self) -> str:
-        sel = self.tree.selection()
-        if not sel:
-            self.hub.toast("выбери лида в таблице")
-            return ""
-        return sel[0]
-
-    def _key_of(self, iid: str) -> str:
-        return leads_mail.pool_key(self._rows.get(iid, {}))
-
-    def open_link(self, _event=None) -> None:
-        lead_id = self._selected()
-        if not lead_id:
-            return
-        links = self._links.get(lead_id, [])
-        if not links:
-            self.hub.toast("у лида нет ссылок — только телефон")
-            return
-        webbrowser.open(links[0][1])
 
     def mark_manual(self) -> None:
-        lead_id = self._selected()
-        if not lead_id:
+        sel = self.result_tree.selection()
+        if not sel:
+            self.hub.toast("выбери лида в таблице")
+            return
+        iid = sel[0]
+        row = {"name": self.result_tree.set(iid, "name"),
+               "phone": self._row_phones.get(iid, "")}
+        key = leads_mail.pool_key(row)
+        if not messagebox.askyesno(
+                "Пул горячих", "Отметить «написал вручную»?\nЛид будет удалён из пула.",
+                parent=self):
             return
         try:
-            leads_mail.pool_mark_sent(self.csv_path, self._key_of(lead_id), "manual")
+            leads_mail.pool_remove(POOL_FILE, key)
         except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
             messagebox.showwarning("Пул горячих", str(exc), parent=self)
             return
         self.refresh()
-        self.hub.toast("отмечено: написал вручную")
-
-    def remove(self) -> None:
-        lead_id = self._selected()
-        if not lead_id:
-            return
-        if not messagebox.askyesno("Пул горячих", "Убрать лида из пула?", parent=self):
-            return
-        try:
-            leads_mail.pool_remove(self.csv_path, self._key_of(lead_id))
-        except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
-            messagebox.showwarning("Пул горячих", str(exc), parent=self)
-            return
-        self.refresh()
-
-    def open_mail(self) -> None:
-        if not MAIL_OK:
-            messagebox.showerror("Рассылка ИИ", "Нет модуля рассылки.", parent=self)
-            return
-        if not self.csv_path.exists():
-            messagebox.showwarning("Рассылка ИИ", "Сначала собери лидов.", parent=self)
-            return
-        MailWindow(self.hub, self.csv_path)
-
-    def _menu(self, event) -> None:
-        iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
-        self.tree.selection_set(iid)
-        menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=ACCENT,
-                       activeforeground="#0d1117", bd=0)
-        for title, url in self._links.get(iid, []):
-            menu.add_command(label=f"{title}: {url}",
-                             command=lambda u=url: webbrowser.open(u))
-        if not self._links.get(iid):
-            menu.add_command(label="ссылок нет — только телефон", state="disabled")
-        menu.add_separator()
-        menu.add_command(label="Написал вручную", command=self.mark_manual)
-        menu.add_command(label="Убрать из пула", command=self.remove)
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        self.hub.toast("лид удалён из пула")
 
 
 class MailWindow(tk.Toplevel):
     """Рассылка ИИ по горячим лидам: настройки, генерация, очередь, отправка."""
 
-    def __init__(self, hub, csv_path) -> None:
+    def __init__(self, hub, _pool_file=None) -> None:
         super().__init__(hub)
         self.hub = hub
-        self.csv_path = Path(csv_path)
-        self.settings_path = self.csv_path.with_name("leads_mail_settings.json")
-        self.state_path = self.csv_path.with_name("leads_mail_state.json")
+        self.settings_path = MAIL_SETTINGS_PATH
+        self.state_path = MAIL_STATE_PATH
         self.title("Рассылка ИИ — Лиды 2GIS")
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         win_w = min(px(1000), sw - px(30))
@@ -7141,28 +7041,24 @@ class MailWindow(tk.Toplevel):
 
     # -- данные ------------------------------------------------------------ #
     def _load_leads(self) -> None:
-        if not self.csv_path.exists():
-            self._log(f"нет файла: {self.csv_path}", "error")
-            return
         days = self._pool_days()
         # добираем в пул горячих из leads.csv — pool_add дедуплицирует сам
         synced = gone = filled = 0
         try:
-            synced = leads_mail.pool_sync(self.csv_path)
-            gone = leads_mail.pool_purge(self.csv_path, days)
-            filled = leads_mail.pool_refresh(self.csv_path)
+            migrated = leads_mail.migrate_legacy(LEADS_DIR)
+            self._log(f"архив: горячих перенесено {migrated['added']}, "
+                      f"контактов дозаполнено {migrated['filled']}", "ok")
+            if migrated.get("archived"):
+                self._log(f"старий файл {migrated['archived']} больше не нужен", "ok")
+            gone = leads_mail.pool_purge(POOL_FILE, days)
         except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
             self._log(f"пул: {exc}", "warn")
-        if synced:
-            self._log(f"пул: добавлено из CSV — {synced}", "ok")
         if gone:
             self._log(f"из пула удалено просроченных: {gone}", "warn")
-        if filled:
-            self._log(f"пул: дозаполнено контактов из CSV — {filled}", "ok")
 
-        self.leads = leads_mail.load_hot_leads(self.csv_path)
+        self.leads = leads_mail.load_hot_leads(POOL_FILE)
         self._refresh_tree()
-        stats = leads_mail.pool_stats(self.csv_path, days)
+        stats = leads_mail.pool_stats(POOL_FILE, days)
         tail = f", истекают сегодня: {stats['expiring']}" if stats["expiring"] else ""
         self._log(f"горячих в пуле: {len(self.leads)}{tail} · срок {days:g} дн.", "ok")
 
@@ -7277,7 +7173,7 @@ class MailWindow(tk.Toplevel):
             self.leads, self.settings, self.state,
             lambda text, tag=None: self._post_log(text, tag),
             lambda _event: self.hub.post(self._refresh_tree),
-            csv_path=self.csv_path,
+            pool_file=POOL_FILE,
         )
         self.mailer = mailer
         threading.Thread(target=mailer.run_forever, args=(self.stop_event,), daemon=True).start()
@@ -7286,7 +7182,7 @@ class MailWindow(tk.Toplevel):
             watcher = leads_mail.Poller(
                 self.leads, self.settings, self.state,
                 lambda text, tag=None: self._post_log(text, tag), self.stop_event,
-                csv_path=self.csv_path,
+                pool_file=POOL_FILE,
             )
             threading.Thread(target=watcher.run_forever, daemon=True).start()
         self._log("отправка запущена в фоне", "ok")
@@ -7306,7 +7202,7 @@ class MailWindow(tk.Toplevel):
         st["closed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         self.state.save()
         try:
-            leads_mail.pool_mark_status(self.csv_path, sel[0], status)
+            leads_mail.pool_mark_status(POOL_FILE, sel[0], status)
         except (OSError, leads_mail.PoolBusy) as exc:
             self._log(f"пул: {exc}", "warn")
         self._refresh_tree()
@@ -7325,7 +7221,7 @@ class MailWindow(tk.Toplevel):
         st["channel"] = st.get("channel") or "manual"
         self.state.save()
         try:
-            leads_mail.pool_mark_sent(self.csv_path, lead_id, "manual")
+            leads_mail.pool_mark_sent(POOL_FILE, lead_id, "manual")
         except (OSError, leads_mail.PoolBusy) as exc:
             self._log(f"пул: {exc}", "warn")
         self._refresh_tree()
@@ -7389,7 +7285,6 @@ NAV = (
     ("github", "GitHub", "бэкап проектов"),
     ("bypass", "Bypass", "обход DPI: глобально и по приложениям"),
     ("leads", "Лиды 2GIS", "контакты без сайта"),
-    ("hot", "Горячие", "пул на 5 дней"),
 )
 
 HEADERS = {
@@ -7419,11 +7314,7 @@ HEADERS = {
     ),
     "leads": (
         "Лиды 2GIS",
-        "Организации из выдачи 2GIS: телефон, e-mail, сайт, мессенджеры и приоритет под аутрич.",
-    ),
-    "hot": (
-        "Горячие лиды",
-        "Пул на 5 дней: не написал — лид уходит. Двойной клик открывает контакт.",
+        "Организации из выдачи 2GIS: телефон, e-mail, сайт, мессенджеры и приоритет под аутрич. Горячие копятся в пуле на 5 дней.",
     ),
 }
 
@@ -7506,7 +7397,6 @@ class Hub(tk.Tk):
             "github": lambda: GitHubPanel(self.content, self),
             "bypass": lambda: BypassPanel(self.content, self),
             "leads": lambda: LeadsPanel(self.content, self),
-            "hot": lambda: HotPoolPanel(self.content, self),
         }
 
         self._build()

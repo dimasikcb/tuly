@@ -102,17 +102,37 @@ POOL_NAME = "hot_pool.csv"
 # в 7.0000001087E+16, а для дедупликации хватает названия и телефона.
 POOL_COLUMNS = (
     "name", "telegram", "max", "vk", "email", "phone", "city",
-    "found_at", "sent_at", "channel", "status",
+    "topic", "card", "found_at", "sent_at", "channel", "status",
 )
 POOL_KEEP_STATUS = ("replied", "seen", "awaiting", "manual")
+
+# 2ГИС-слаги крупных городов для режима «вся Россия».
+RU_CITIES = (
+    "moscow", "spb", "ekaterinburg", "novosibirsk", "kazan", "n_novgorod",
+    "samara", "omsk", "chelyabinsk", "rostov",
+    "ufa", "krasnoyarsk", "voronezh", "perm", "volgograd",
+)
+
+# Старое хозяйство: GUI раньше писал все лиды в leads.csv. Файл больше не нужен,
+# но у пользователя он уже есть — при первом запуске переливаем его в пул и
+# убираем в архив, чтобы не мешал.
+LEGACY_NAME = "leads.csv"
+LEGACY_EXTRAS = ("leads.jsonl", "leads_new.csv", "leads_new.jsonl")
+LEGACY_SUFFIX = ".migrated"
 
 
 class PoolBusy(RuntimeError):
     """hot_pool.csv занят другой программой (Excel, LibreOffice)."""
 
 
-def pool_path(csv_path) -> Path:
-    return Path(csv_path).with_name(POOL_NAME)
+def default_pool_path(dir_path) -> Path:
+    """Единственный файл данных: <папка приложения>/hot_pool.csv."""
+    return Path(dir_path) / POOL_NAME
+
+
+def pool_path(csv_file) -> Path:
+    """По умолчанию файла пула по пути к CSV."""
+    return Path(csv_file).parent / POOL_NAME
 
 
 def _now() -> datetime:
@@ -136,7 +156,7 @@ def _to_link(channel: str, value) -> str:
     if channel == "telegram":
         digits = re.sub(r"\D", "", value)
         if re.fullmatch(r"[\d\s\-()+]+", value) and len(digits) >= 7:
-            return ""  # по номеру профиль не открыть — оставляем телефон как есть
+            return "https://t.me/+" + digits  # диплинк по номеру, как у 2ГИС
         return "https://t.me/" + value.lstrip("@").strip("/")
     if channel == "max":
         return "https://max.ru/" + value.lstrip("@").strip("/")
@@ -198,9 +218,9 @@ def _tier_of(lead: dict) -> str:
     return "hot" if _num(lead.get("score")) >= 70 else ""
 
 
-def pool_load(csv_path) -> list[dict]:
+def pool_load(pool_file) -> list[dict]:
     """Все записи пула (в порядке добавления). Старый формат приводится к новому."""
-    path = pool_path(csv_path)
+    path = Path(pool_file)
     rows: list[dict] = []
     try:
         with path.open(encoding="utf-8-sig", newline="") as fh:
@@ -216,13 +236,13 @@ def pool_load(csv_path) -> list[dict]:
     return rows
 
 
-def _pool_save(csv_path, rows: list[dict]) -> None:
+def _pool_save(pool_file, rows: list[dict]) -> None:
     """Пишет пул через временный файл — занятый Excel не портит данные.
 
     Если файл открыт в таблице, Windows не даёт его заменить: тогда честно
     сообщаем об этом, иначе новые горячие лиды молча теряются.
     """
-    path = pool_path(csv_path)
+    path = Path(pool_file)
     tmp = path.with_name(path.name + ".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,12 +261,15 @@ def _pool_save(csv_path, rows: list[dict]) -> None:
         except OSError:
             if attempt < 9:
                 time.sleep(0.2)
+    # файл занят: не теряем пачку, кладём рядом и говорим, куда смотреть
+    spare = path.with_name(f"{path.stem}_new{path.suffix}")
     try:
-        tmp.unlink()
+        tmp.replace(spare)
+        where = f", свежие записи — в {spare.name}"
     except OSError:
-        pass
+        where = ""
     raise PoolBusy(
-        f"{path.name} открыт в другой программе — закрой его и нажми «Обновить»")
+        f"{path.name} открыт в другой программе — закрой его и нажми «Обновить»{where}")
 
 
 def _lead_to_pool_row(lead: dict, found_at: str) -> dict:
@@ -258,6 +281,8 @@ def _lead_to_pool_row(lead: dict, found_at: str) -> dict:
         "email": _pool_value("email", _pick_contact(lead, "email")),
         "phone": lead.get("phone", ""),
         "city": lead.get("city", ""),
+        "topic": str(lead.get("topic") or lead.get("query") or "").strip(),
+        "card": str(lead.get("url") or lead.get("card") or "").strip(),
         "found_at": found_at,
         "sent_at": "",
         "channel": "",
@@ -265,30 +290,84 @@ def _lead_to_pool_row(lead: dict, found_at: str) -> dict:
     }
 
 
-def pool_add(csv_path, leads: list[dict]) -> int:
+def pool_sync(csv_file) -> int:
+    """Синхронизирует горячих лидов из CSV в пул. Возвращает число добавленных."""
+    pool_file = pool_path(csv_file)
+    rows = _read_csv(csv_file)
+    return pool_add(pool_file, rows)
+
+
+def pool_refresh(pool_file) -> int:
+    """Обновляет контакты в пуле из CSV. Возвращает число обновлённых."""
+    csv_file = Path(pool_file).parent / "leads.csv"
+    pool_rows = pool_load(pool_file)
+    csv_rows = {pool_key(r): r for r in _read_csv(csv_file)}
+    updated = 0
+    for row in pool_rows:
+        key = pool_key(row)
+        src = csv_rows.get(key)
+        if not src:
+            continue
+        for channel in ("telegram", "max", "vk", "email"):
+            if not (row.get(channel) or "").strip():
+                value = _pool_value(channel, _pick_contact(src, channel))
+                if value:
+                    row[channel] = value
+                    updated += 1
+        # Дозаполнить тему и карточку 2ГИС
+        if not (row.get("topic") or "").strip() and (src.get("query") or src.get("topic")):
+            row["topic"] = str(src.get("query") or src.get("topic")).strip()
+            updated += 1
+        if not (row.get("card") or "").strip() and (src.get("url") or src.get("card")):
+            row["card"] = str(src.get("url") or src.get("card")).strip()
+            updated += 1
+    if updated:
+        _pool_save(pool_file, pool_rows)
+    return updated
+
+
+def pool_add(pool_file, leads: list[dict]) -> int:
     """Добавляет горячих лидов в пул. Возвращает число новых."""
-    hot = [l for l in leads if _tier_of(l) == "hot"]
+    hot = [l for l in leads if is_hot(l)]
     if not hot:
         return 0
-    rows = pool_load(csv_path)
+    rows = pool_load(pool_file)
     known = {pool_key(row) for row in rows}
     stamp = _now().isoformat(timespec="seconds")
     added = 0
+    by_key = {pool_key(row): row for row in rows}
     for lead in hot:
         key = pool_key(lead)
-        if not key or key in known:
+        if not key:
             continue
-        rows.append(_lead_to_pool_row(lead, stamp))
-        known.add(key)
+        if key in by_key:
+            existing = by_key[key]
+            # Дозаполняем card, topic или контакты, если в существующей записи они пустые
+            new_card = str(lead.get("url") or lead.get("card") or "").strip()
+            if not (existing.get("card") or "").strip() and new_card:
+                existing["card"] = new_card
+                added += 1
+            new_topic = str(lead.get("topic") or lead.get("query") or "").strip()
+            if not (existing.get("topic") or "").strip() and new_topic:
+                existing["topic"] = new_topic
+            for ch in ("telegram", "max", "vk", "email"):
+                if not (existing.get(ch) or "").strip():
+                    val = _pool_value(ch, _pick_contact(lead, ch))
+                    if val:
+                        existing[ch] = val
+            continue
+        new_row = _lead_to_pool_row(lead, stamp)
+        rows.append(new_row)
+        by_key[key] = new_row
         added += 1
     if added:
-        _pool_save(csv_path, rows)
+        _pool_save(pool_file, rows)
     return added
 
 
-def pool_purge(csv_path, days: float = 5) -> int:
+def pool_purge(pool_file, days: float = 5) -> int:
     """Удаляет записи, которым больше `days` и по которым не было отправки."""
-    rows = pool_load(csv_path)
+    rows = pool_load(pool_file)
     if not rows:
         return 0
     limit = _now() - timedelta(days=days)
@@ -303,13 +382,13 @@ def pool_purge(csv_path, days: float = 5) -> int:
             continue
         kept.append(row)
     if removed:
-        _pool_save(csv_path, kept)
+        _pool_save(pool_file, kept)
     return removed
 
 
-def pool_mark_sent(csv_path, key, channel: str, when: datetime | None = None) -> bool:
+def pool_mark_sent(pool_file, key, channel: str, when: datetime | None = None) -> bool:
     """Отмечает, что по лиду написали: срок жизни больше не действует."""
-    rows = pool_load(csv_path)
+    rows = pool_load(pool_file)
     stamp = (when or _now()).isoformat(timespec="seconds")
     changed = False
     for row in rows:
@@ -320,22 +399,22 @@ def pool_mark_sent(csv_path, key, channel: str, when: datetime | None = None) ->
             changed = True
             break
     if changed:
-        _pool_save(csv_path, rows)
+        _pool_save(pool_file, rows)
     return changed
 
 
-def pool_remove(csv_path, key) -> bool:
+def pool_remove(pool_file, key) -> bool:
     """Убирает лида из пула совсем."""
-    rows = pool_load(csv_path)
+    rows = pool_load(pool_file)
     kept = [row for row in rows if pool_key(row) != str(key)]
     if len(kept) == len(rows):
         return False
-    _pool_save(csv_path, kept)
+    _pool_save(pool_file, kept)
     return True
 
 
-def pool_mark_status(csv_path, key, status: str) -> bool:
-    rows = pool_load(csv_path)
+def pool_mark_status(pool_file, key, status: str) -> bool:
+    rows = pool_load(pool_file)
     changed = False
     for row in rows:
         if pool_key(row) == str(key):
@@ -343,23 +422,38 @@ def pool_mark_status(csv_path, key, status: str) -> bool:
             changed = True
             break
     if changed:
-        _pool_save(csv_path, rows)
+        _pool_save(pool_file, rows)
     return changed
 
 
-def pool_refresh(csv_path) -> int:
-    """Дополняет пустые контакты в пуле данными из leads.csv (название + телефон)."""
-    rows = pool_load(csv_path)
-    if not rows:
-        return 0
+def _read_csv(path) -> list[dict]:
     try:
-        with open(csv_path, encoding="utf-8-sig", newline="") as fh:
-            source = {pool_key(r): r for r in csv.DictReader(fh)}
+        with open(path, encoding="utf-8-sig", newline="") as fh:
+            return list(csv.DictReader(fh))
     except (OSError, csv.Error):
-        return 0
+        return []
 
-    changed = 0
-    for row in rows:
+
+def migrate_legacy(dir_path) -> dict:
+    """Разовый переезд: старый leads.csv доливается в пул и уезжает в архив.
+
+    GUI раньше писал все лиды в leads.csv; теперь единственный файл — пул.
+    Повторный вызов ничего не делает: файла уже нет (он переименован).
+    Возвращает {"added": int, "filled": int, "archived": str}.
+    """
+    base = Path(dir_path)
+    out = {"added": 0, "filled": 0, "archived": ""}
+    legacy = base / LEGACY_NAME
+    if not legacy.exists():
+        return out
+
+    pool_file = default_pool_path(base)
+    rows = _read_csv(legacy)
+    out["added"] = pool_add(pool_file, rows)          # только hot, дедуп по pool_key
+
+    source = {pool_key(r): r for r in rows}
+    current = pool_load(pool_file)
+    for row in current:
         src = source.get(pool_key(row))
         if not src:
             continue
@@ -368,25 +462,37 @@ def pool_refresh(csv_path) -> int:
                 value = _pool_value(channel, _pick_contact(src, channel))
                 if value:
                     row[channel] = value
-                    changed += 1
-    if changed:
-        _pool_save(csv_path, rows)
-    return changed
+                    out["filled"] += 1
+        # Перенести тему и ссылку на карточку 2ГИС из leads.csv
+        if not (row.get("topic") or "").strip():
+            val = str(src.get("query") or src.get("topic") or "").strip()
+            if val:
+                row["topic"] = val
+                out["filled"] += 1
+        if not (row.get("card") or "").strip():
+            val = str(src.get("url") or src.get("card") or "").strip()
+            if val:
+                row["card"] = val
+                out["filled"] += 1
+    if out["filled"]:
+        _pool_save(pool_file, current)
+
+    for name in (LEGACY_NAME,) + LEGACY_EXTRAS:
+        src = base / name
+        if not src.exists():
+            continue
+        try:
+            src.replace(base / (name + LEGACY_SUFFIX))
+            if name == LEGACY_NAME:
+                out["archived"] = LEGACY_NAME + LEGACY_SUFFIX
+        except OSError:
+            pass  # файл открыт в Excel — переедет при следующем запуске
+    return out
 
 
-def pool_sync(csv_path) -> int:
-    """Подтягивает в пул горячих, которые есть в leads.csv, но в пул не попали."""
-    try:
-        with open(csv_path, encoding="utf-8-sig", newline="") as fh:
-            rows = list(csv.DictReader(fh))
-    except (OSError, csv.Error):
-        return 0
-    return pool_add(csv_path, rows)
-
-
-def pool_stats(csv_path, days: float = 5) -> dict:
+def pool_stats(pool_file, days: float = 5) -> dict:
     """Сколько в пуле всего и сколько истекает в ближайшие сутки."""
-    rows = pool_load(csv_path)
+    rows = pool_load(pool_file)
     now = _now()
     expiring = 0
     for row in rows:
@@ -403,26 +509,22 @@ def pool_stats(csv_path, days: float = 5) -> dict:
     return {"total": len(rows), "expiring": expiring}
 
 
-def load_hot_leads(csv_path) -> list[dict]:
-    """Горячие лиды из пула; если пула ещё нет — из CSV парсера."""
-    if pool_path(csv_path).exists():
-        rows = []
-        for row in pool_load(csv_path):
-            row = dict(row)
-            row["tier"] = "hot"
-            rows.append(row)
-        rows.sort(key=lambda r: str(r.get("found_at") or ""), reverse=True)
-        return rows
-
-    rows = []
-    try:
-        with open(csv_path, encoding="utf-8-sig", newline="") as fh:
-            for row in csv.DictReader(fh):
-                if _tier_of(row) == "hot":
-                    rows.append(row)
-    except (OSError, csv.Error):
-        return []
-    rows.sort(key=lambda r: _num(r.get("score")), reverse=True)
+def load_hot_leads(csv_file) -> list[dict]:
+    """Горячие лиды из пула, свежие сверху. Пула нет — читаем CSV и фильтруем по reason."""
+    pool_file = pool_path(csv_file)
+    rows: list[dict] = []
+    if pool_file.exists():
+        for row in pool_load(pool_file):
+            item = dict(row)
+            item["tier"] = "hot"
+            rows.append(item)
+    else:
+        for row in _read_csv(csv_file):
+            if is_hot(row):
+                item = dict(row)
+                item["tier"] = "hot"
+                rows.append(item)
+    rows.sort(key=lambda r: str(r.get("found_at") or ""), reverse=True)
     return rows
 
 
@@ -502,7 +604,8 @@ def contact_link(ch: str, contact: tuple[str, str]) -> str:
         return value
     if ch == "telegram":
         if kind == "phone":
-            return ""  # по номеру ссылка на профиль не строится
+            digits = re.sub(r"\D", "", value)
+            return "https://t.me/+" + digits if digits else ""
         return "https://t.me/" + value.lstrip("@").strip("/")
     if ch == "max":
         return "https://max.ru/" + value.lstrip("@").strip("/")
@@ -515,6 +618,64 @@ def contact_link(ch: str, contact: tuple[str, str]) -> str:
 
 def channel_label(ch: str) -> str:
     return CHANNEL_TITLE.get(ch, ch)
+
+
+# --- как показывать контакты в таблице -------------------------------------- #
+
+TARGET_TITLE = {**CHANNEL_TITLE, "phone": "Телефон"}
+
+
+def format_phone(phone) -> str:
+    """+7 906 026-34-84; «—», если цифр нет."""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if len(digits) == 11 and digits[0] in "78":
+        return f"+7 {digits[1:4]} {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
+    return str(phone or "—") if digits else "—"
+
+
+def _short(url: str) -> str:
+    """Ссылка без схемы — влезает в колонку и всё равно читается как ссылка."""
+    text = str(url or "").strip()
+    if text.lower().startswith("mailto:"):
+        return text[7:]
+    return re.sub(r"^https?://", "", text).rstrip("/")
+
+
+def _same_number(a, b) -> bool:
+    da, db = re.sub(r"\D", "", str(a or "")), re.sub(r"\D", "", str(b or ""))
+    return bool(da) and bool(db) and da[-10:] == db[-10:]
+
+
+def targets_of(row: dict) -> list[tuple[str, str, str]]:
+    """Все точки контакта по приоритету: (канал, что показать, куда вести).
+
+    Telegram-диплинк на тот же номер (t.me/+79060263484) — это телефон, а не
+    отдельный канал: показываем номер один раз, а ссылка ведёт в чат.
+    """
+    out: list[tuple[str, str, str]] = []
+    phone = format_phone(row.get("phone"))
+    tg = _to_link("telegram", row.get("telegram"))
+    tg_is_phone = bool(tg) and phone != "—" and _same_number(tg, row.get("phone"))
+    if tg and not tg_is_phone:
+        out.append(("telegram", _short(tg), tg))
+    for channel in ("vk", "max", "email"):
+        link = _to_link(channel, row.get(channel))
+        if link:
+            out.append((channel, _short(link), link))
+    if phone != "—":
+        out.append(("phone", phone, tg if tg_is_phone else ""))
+    return out
+
+
+def target_of(row: dict) -> tuple[str, str, str]:
+    """Куда писать: TG → VK → MAX → почта → телефон. Нет контактов — («», «—», «»)."""
+    items = targets_of(row)
+    return items[0] if items else ("", "—", "")
+
+
+def is_hot(lead) -> bool:
+    """Горячий лид: поле tier, иначе префикс reason, иначе score ≥ 70."""
+    return _tier_of(lead) == "hot"
 
 
 # --------------------------------------------------------------------------- #
@@ -952,13 +1113,13 @@ def generate_texts(leads: list[dict], settings: dict, state: MailState,
 
 class Mailer:
     def __init__(self, leads: list[dict], settings: dict, state: MailState,
-                 on_log, on_event, csv_path=None) -> None:
+                 on_log, on_event, pool_file=None) -> None:
         self.leads = leads
         self.settings = settings
         self.state = state
         self.on_log = on_log
         self.on_event = on_event
-        self.csv_path = csv_path
+        self.pool_file = pool_file
 
     # -- один шаг: максимум одно сообщение -------------------------------- #
     def step(self) -> bool:
@@ -1042,9 +1203,9 @@ class Mailer:
         })
         st.pop("seen_at", None)
         self.state.save()
-        if self.csv_path:
+        if self.pool_file:
             try:
-                pool_mark_sent(self.csv_path, lead_id, ch)
+                pool_mark_sent(self.pool_file, lead_id, ch)
             except PoolBusy as exc:
                 self.on_log(f"пул: {exc}", "warn")
         self.on_log(f"→ {row.get('name', '')} · {channel_label(ch)} · {contact[0]}", "ok")
@@ -1090,13 +1251,13 @@ class Poller:
     """
 
     def __init__(self, leads: list[dict], settings: dict, state: MailState,
-                 on_log, stop_event, csv_path=None) -> None:
+                 on_log, stop_event, pool_file=None) -> None:
         self.leads = leads
         self.settings = settings
         self.state = state
         self.on_log = on_log
         self.stop_event = stop_event
-        self.csv_path = csv_path
+        self.pool_file = pool_file
 
     # -- пометки ----------------------------------------------------------- #
     def _mark_seen(self, row: dict) -> None:
@@ -1107,9 +1268,9 @@ class Poller:
         st["status"] = "seen"
         st["seen_at"] = datetime.now().isoformat(timespec="seconds")
         self.state.save()
-        if self.csv_path:
+        if self.pool_file:
             try:
-                pool_mark_status(self.csv_path, lead_id, "seen")
+                pool_mark_status(self.pool_file, lead_id, "seen")
             except PoolBusy as exc:
                 self.on_log(f"пул: {exc}", "warn")
         self.on_log(f"прочитано: {row.get('name', '')}", "warn")
@@ -1123,9 +1284,9 @@ class Poller:
         st["replied_at"] = datetime.now().isoformat(timespec="seconds")
         st["reply"] = text[:500]
         self.state.save()
-        if self.csv_path:
+        if self.pool_file:
             try:
-                pool_mark_status(self.csv_path, lead_id, "replied")
+                pool_mark_status(self.pool_file, lead_id, "replied")
             except PoolBusy as exc:
                 self.on_log(f"пул: {exc}", "warn")
         self.on_log(f"ответ: {row.get('name', '')} — {text[:80]}", "ok")

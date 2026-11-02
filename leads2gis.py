@@ -75,6 +75,19 @@ FIRM_RE = re.compile(r"/([a-z0-9_-]+)/firm/(\d+)")
 PAGE_RE = re.compile(r"/page/(\d+)")
 CAPTCHA_HINT = ("captcha.2gis", "2GIS Captcha", "Проверка на робота")
 
+# 2ГИС отдаёт 12 организаций на страницу выдачи — в интерфейсе просим карточки,
+# а не страницы, и считаем страницы сами.
+CARDS_PER_PAGE = 12
+
+
+def pages_for(cards) -> int:
+    """Сколько страниц выдачи нужно, чтобы проверить N карточек (ceil(N / 12))."""
+    try:
+        count = max(1, int(cards))
+    except (TypeError, ValueError):
+        count = CARDS_PER_PAGE
+    return max(1, -(-count // CARDS_PER_PAGE))
+
 # --- извлечение полей -------------------------------------------------------
 
 _LABEL = r"[a-z0-9\u0400-\u04ff](?:[a-z0-9\u0400-\u04ff-]{0,61}[a-z0-9\u0400-\u04ff])?"
@@ -130,10 +143,10 @@ def messenger_links(lead: dict) -> dict[str, str]:
     if tg:
         handle = tg.lstrip("@")
         digits = re.sub(r"\D", "", handle)
-        if re.fullmatch(r"[\d\s\-()+]+", handle):
-            # в поле телефон, а не ник — ссылка на профиль по номеру не строится
-            handle = "" if len(digits) >= 7 else handle
-        if handle:
+        if re.fullmatch(r"[\d\s\-()+]+", handle) and len(digits) >= 7:
+            # в поле телефон: 2ГИС даёт диплинк t.me/+7… — он открывает чат
+            out["telegram"] = "https://t.me/+" + digits
+        elif handle:
             out["telegram"] = "https://t.me/" + handle
 
     mx = pick("max")
@@ -220,6 +233,10 @@ def _messenger_from_url(url: str) -> tuple[str, str] | None:
         return None
     low = url.lower()
     if "t.me" in low or "telegram.me" in low or low.startswith("tg://"):
+        # t.me/+7916… — диплинк на номер: 2ГИС так отдаёт Telegram без ника
+        m = re.search(r"(?:t\.me/|telegram\.me/|tg://resolve\?domain=)(\+?\d{7,15})", low)
+        if m:
+            return ("telegram", "+" + m.group(1).lstrip("+"))
         m = re.search(r"(?:t\.me/|telegram\.me/|tg://resolve\?domain=)([A-Za-z0-9_]{3,32})", low)
         if m and not m.group(1).isdigit():
             return ("telegram", m.group(1))
@@ -244,6 +261,32 @@ def _split_messengers(messengers: list[str]) -> dict:
             plat, handle = item.split(":", 1)
             if plat in out and not out[plat]:
                 out[plat] = handle
+    return out
+
+
+# Контакты в JSON внутри страницы: у 2ГИС кнопки мессенджеров есть не в вёрстке,
+# а в данных — {"type":"telegram","value":"https://t.me/+79168573362"}. Без этого
+# карточки, где Telegram заведён на номер, оставались без контактов.
+CONTACT_JSON_RE = re.compile(r'\{[^{}]*"type":"(telegram|whatsapp|vk|max|email)"[^{}]*\}')
+JSON_VALUE_RE = re.compile(r'"value":"([^"]*)"')
+
+
+def _json_contacts(html: str) -> list[tuple[str, str]]:
+    """[(тип, значение)] из JSON страницы: telegram, whatsapp, vk, max, email."""
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for obj in CONTACT_JSON_RE.finditer(html):
+        found = JSON_VALUE_RE.search(obj.group(0))
+        if not found:
+            continue
+        value = found.group(1).strip()
+        if not value:
+            continue
+        item = (obj.group(1), value)
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
     return out
 
 
@@ -356,6 +399,21 @@ def parse_firm(html: str, city: str, firm_id: str, query: str = "") -> dict:
         if social and social not in socials:
             socials.append(social)
         messenger = _messenger_from_url(target) or _messenger_from_url(text)
+        if messenger:
+            key = f"{messenger[0]}:{messenger[1]}"
+            if key not in messengers:
+                messengers.append(key)
+
+    # кнопки мессенджеров 2ГИС держит в JSON страницы, а не в ссылках вёрстки
+    for kind, value in _json_contacts(html):
+        if kind == "whatsapp":
+            continue  # WhatsApp не используем
+        if kind == "email":
+            email = value.replace("mailto:", "").strip()
+            if email and "@" in email and email not in emails:
+                emails.append(email)
+            continue
+        messenger = _messenger_from_url(value)
         if messenger:
             key = f"{messenger[0]}:{messenger[1]}"
             if key not in messengers:
