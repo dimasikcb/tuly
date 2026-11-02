@@ -33,6 +33,15 @@
 
 > Слои: `contacts` ← `pool` ← `mail` ← `tools.pyw`. Нижний слой не импортирует
 > верхний. `leads2gis` использует только `leads_contacts`.
+
+**Логика остальных разделов живёт вне GUI** (правь модуль, не `tools.pyw`):
+
+| Файл | Что внутри |
+|------|------------|
+| `winbase.py` | пути, `config.json`, `ps_run`, `run_tool`, `is_admin` |
+| `apps_catalog.py` | каталог программ, поиск, `AppEntry` |
+| `bypass_core.py` | Happ/GoodbyeDPI/ProxiFyre: `bypass_apply`, `bypass_status`, службы |
+| `tests/test_arch.py` | проверяет, что GUI не дублирует эти функции и не тянет tkinter в логику |
 > Старый код вида `leads_mail.pool_add(...)` работает благодаря реэкспорту,
 > но новый код должен импортировать из модуля, где функция живёт.
 

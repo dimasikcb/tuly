@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import unittest
 
-from helpers import load_app
+from helpers import load_module
 
-app = load_app()
+app = load_module("apps_catalog")
 
 
 class AppCatalogTest(unittest.TestCase):

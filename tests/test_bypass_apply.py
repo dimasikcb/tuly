@@ -4,9 +4,9 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from helpers import load_app
+from helpers import load_module
 
-app = load_app()
+app = load_module("bypass_core")
 
 
 class ApplyTest(unittest.TestCase):

@@ -1,0 +1,1036 @@
+"""Bypass: Happ / GoodbyeDPI / ProxiFyre — состояние, запуск, применение настроек.
+
+Модуль без tkinter: только реестр, процессы, службы и файлы. GUI вызывает
+`bypass_status`, `bypass_apply`, `bypass_stop` и рисует ответ.
+
+Почему отдельно от `tools.pyw`: раньше эти строки жили в GUI-файле, и
+проверить логику «что включается и в каком порядке» без окна было нельзя.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+from apps_catalog import normalize_apps
+from winbase import NO_WINDOW, config_read, config_update, is_admin, ps_run, run_tool
+
+BYPASS_DIR = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / "Tools" / "bypass"
+BYPASS_GBD_DIR = BYPASS_DIR / "goodbyedpi"
+BYPASS_GBD_EXE = BYPASS_GBD_DIR / "goodbyedpi.exe"
+BYPASS_GBD_REPO = "ValdikSS/GoodbyeDPI"
+BYPASS_GBD_ASSET = r"goodbyedpi-\d[\w.]*\.zip"
+BYPASS_STATE_FILE = BYPASS_DIR / "state.json"
+HAPP_CORE_IMAGES = ("xray.exe", "sing-box.exe", "tun2proxy-bin.exe", "tun2proxy.exe")
+BYPASS_SCOPES = ("all", "apps")
+HAPP_SOCKS_DEFAULT = 10808
+HAPP_PREFS_KEY = r"Software\Happ\OrganizationDefaults\Preferences\AdvancedSettings"
+HAPP_CONFIG_FILE = (Path(os.environ.get("LOCALAPPDATA") or str(Path.home()))
+                    / "Happ" / "config.json")
+PROXIFYRE_DIR = (Path(os.environ.get("LOCALAPPDATA") or str(Path.home()))
+                 / "BypassManager" / "proxifyre")
+PROXIFYRE_EXE = PROXIFYRE_DIR / "ProxiFyre.exe"
+PROXIFYRE_CONFIG = PROXIFYRE_DIR / "app-config.json"
+PROXIFYRE_LOG_DIR = PROXIFYRE_DIR / "logs"
+PROXIFYRE_SERVICE = "ProxiFyreService"
+PROXIFYRE_SERVICE_ALIASES = ("ProxiFyreService", "ProxiFyre")
+_PROXIFYRE_SERVICE_NAME: str | None = None
+PACKET_FILTER_DRIVER = "ndisrd"
+SVC_STOPPED = 1
+SVC_RUNNING = 4
+
+
+def _find_happ() -> Path:
+    """Самостоятельно ищет установленный Happ."""
+    for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        candidate = Path(base) / "FlyFrogLLC" / "Happ" / "Happ.exe"
+        if candidate.exists():
+            return candidate
+    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    try:
+        for item in pf.glob("*/Happ/Happ.exe"):
+            return item
+    except Exception:  # noqa: BLE001
+        pass
+    return pf / "FlyFrogLLC" / "Happ" / "Happ.exe"
+
+
+BYPASS_HAPP_DEFAULT = str(_find_happ())
+
+
+def bypass_cfg() -> dict:
+    """Настройки обхода: движок, область (весь трафик / программы), список программ."""
+    base = config_read().get("bypass") or {}
+    mode = str(base.get("mode") or "happ").strip().lower()
+    if mode not in ("happ", "gbd"):
+        mode = "happ"
+    scope = str(base.get("scope") or "all").strip().lower()
+    if scope not in ("all", "apps"):
+        scope = "all"
+    happ_path = str(base.get("happ_path") or "").strip() or str(BYPASS_HAPP_DEFAULT)
+    try:
+        socks_port = int(base.get("socks_port") or HAPP_SOCKS_DEFAULT)
+    except (TypeError, ValueError):
+        socks_port = HAPP_SOCKS_DEFAULT
+    if not 0 < socks_port < 65536:
+        socks_port = HAPP_SOCKS_DEFAULT
+    return {
+        "gbd_args": str(base.get("gbd_args") or "-5").strip() or "-5",
+        "mode": mode,
+        "scope": scope,
+        "apps": normalize_apps(base.get("apps")),
+        "socks_port": socks_port,
+        "happ_path": happ_path,
+    }
+
+
+def bypass_cfg_save(**updates) -> None:
+    config_update(bypass={**bypass_cfg(), **updates})
+
+
+def bypass_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _bypass_track() -> dict:
+    try:
+        data = json.loads(BYPASS_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _track_save(data: dict) -> None:
+    BYPASS_DIR.mkdir(parents=True, exist_ok=True)
+    BYPASS_STATE_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+
+def _image_pids(image: str) -> list[int]:
+    try:
+        rc, out, _ = run_tool(
+            ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"], timeout=30,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    if rc != 0 or not out or "INFO:" in out.upper():
+        return []
+    pids: list[int] = []
+    for line in out.splitlines():
+        if '"' not in line:
+            continue
+        fields = line.strip().split('","')
+        if len(fields) >= 2:
+            try:
+                pids.append(int(fields[1]))
+            except ValueError:
+                continue
+    return pids
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        rc, out, _ = run_tool(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], timeout=30,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return rc == 0 and bool(out) and "INFO:" not in out.upper()
+
+
+def _pid_windows(pids) -> list[int]:
+    """Видимые top-level окна, принадлежащие перечисленным PID."""
+    user32 = ctypes.windll.user32
+    windows: list[int] = []
+    wanted = {int(pid) for pid in pids if pid}
+    if not wanted:
+        return windows
+    proto = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def on_window(hwnd, _lparam):
+        try:
+            owner = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value in wanted and user32.IsWindowVisible(hwnd):
+                windows.append(hwnd)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(proto(on_window), None)
+    except Exception:  # noqa: BLE001
+        pass
+    return windows
+
+
+def _minimize_happ_windows(pids, attempts: int = 8, delay: float = 0.4) -> int:
+    """Свёртывает окна запущенного Happ, чтобы окно не вылезало при включении VPN."""
+    user32 = ctypes.windll.user32
+    for _ in range(attempts):
+        minimized = 0
+        for hwnd in _pid_windows(pids):
+            if not user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+                minimized += 1
+        if minimized:
+            return minimized
+        time.sleep(delay)
+    return 0
+
+
+def _restore_happ_windows(pids) -> int:
+    """Развёртывает свёрнутые окна Happ — доступ нужен для смены сервера."""
+    user32 = ctypes.windll.user32
+    restored = 0
+    for hwnd in _pid_windows(pids):
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            restored += 1
+    return restored
+
+
+def _running_images() -> set[str]:
+    """Имена всех запущенных процессов одним вызовом tasklist."""
+    rc, out, _err = run_tool(["tasklist", "/FO", "CSV", "/NH"], timeout=30)
+    names: set[str] = set()
+    if rc != 0:
+        return names
+    for line in out.splitlines():
+        if '"' in line:
+            names.add(line.strip().split('","')[0].strip('"').lower())
+    return names
+
+
+def happ_system_proxy() -> tuple[bool, str]:
+    """Системный прокси Windows: (включён, адрес). Happ ставит сюда 127.0.0.1."""
+    try:
+        import winreg
+    except ImportError:
+        return False, ""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enable = int(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            try:
+                server = str(winreg.QueryValueEx(key, "ProxyServer")[0])
+            except FileNotFoundError:
+                server = ""
+        return bool(enable), server
+    except OSError:
+        return False, ""
+
+
+def happ_connected(images: set[str] | None = None) -> bool:
+    """VPN Happ включён: работает core-процесс или системный прокси смотрит в localhost."""
+    names = images if images is not None else _running_images()
+    if any(name in names for name in HAPP_CORE_IMAGES):
+        return True
+    enable, server = happ_system_proxy()
+    return bool(
+        enable and ("127.0.0.1" in server or "localhost" in server or "::1" in server)
+    )
+
+
+def happ_send(command: str) -> bool:
+    """Отправить команду Happ через зарегистрированную схему happ:// (connect/disconnect/open)."""
+    url = command if "://" in command else "happ://" + command
+    try:
+        code = ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 0)
+    except Exception:  # noqa: BLE001
+        return False
+    return code > 32
+
+
+def _tail(path: Path, limit: int = 400) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()[-limit:]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def bypass_status(_timeout: float = 1.5) -> dict:
+    """Полное состояние: движки, режим Happ, перенаправление по программам."""
+    cfg = bypass_cfg()
+    track = _bypass_track()
+    result: dict = {"admin": bypass_admin()}
+    images = _running_images()
+    port = happ_socks_port()
+    for key, image, exe in (
+        ("happ", Path(cfg["happ_path"]).name, Path(cfg["happ_path"])),
+        ("gbd", "goodbyedpi.exe", BYPASS_GBD_EXE),
+    ):
+        pids = _image_pids(image)
+        entry = track.get(key) if isinstance(track.get(key), dict) else {}
+        my_pid = int(entry.get("pid") or 0)
+        if my_pid and my_pid not in pids:  # наш процесс уже умер
+            track.pop(key, None)
+            _track_save(track)
+        result[key] = {
+            "on": bool(pids),
+            "mine": bool(my_pid and my_pid in pids),
+            "installed": exe.exists(),
+        }
+        if key == "happ":
+            result[key]["connected"] = happ_connected(images)
+            result[key]["tun"] = any(
+                name in images
+                for name in ("sing-box.exe", "tun2proxy-bin.exe", "tun2proxy.exe")
+            )
+            result[key]["socks_port"] = port
+            result[key]["socks_ok"] = port_open(port)
+            result[key]["mode"] = happ_mode_read()
+        if key == "gbd":
+            result[key]["args"] = cfg["gbd_args"]
+        if pids:
+            result[key]["pids"] = pids
+    result["track"] = {}
+    result["proxyfyre"] = proxifyre_status()
+    result["scope"] = cfg["scope"]
+    result["apps"] = cfg["apps"]
+    result["mode"] = cfg["mode"]
+    return result
+
+
+def bypass_gbd_start() -> dict:
+    if not BYPASS_GBD_EXE.exists():
+        raise RuntimeError("GoodbyeDPI не скачан — кнопка «Скачать GoodbyeDPI»")
+    cfg = bypass_cfg()
+    track = _bypass_track()
+    entry = track.get("gbd") if isinstance(track.get("gbd"), dict) else {}
+    my_pid = int(entry.get("pid") or 0)
+    pids = _image_pids("goodbyedpi.exe")
+    if my_pid and my_pid in pids:
+        return {"ok": True, "detail": f"GoodbyeDPI уже запущен (PID {my_pid})"}
+    if pids:
+        track["gbd"] = {"pid": pids[0], "started": time.time()}
+        _track_save(track)
+        return {"ok": True, "detail": f"GoodbyeDPI уже запущен (PID {pids[0]})"}
+    log_path = BYPASS_DIR / "goodbyedpi.log"
+    try:
+        log_path.unlink()  # старый лог не должен путать диагностику
+    except FileNotFoundError:
+        pass
+    exe = str(BYPASS_GBD_EXE)
+    args = cfg["gbd_args"]
+    if bypass_admin():
+        handle = open(log_path, "w", encoding="utf-8", errors="replace")
+        subprocess.Popen(
+            [exe, *args.split()],
+            cwd=str(BYPASS_GBD_DIR),
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            creationflags=NO_WINDOW,
+        )
+        handle.close()
+    else:
+        # GoodbyeDPI требует админ-прав: поднимаем cmd через UAC, вывод — в лог.
+        # Важно: cmd /s /c ""exe" args > "log" 2>&1" — без внешних кавычек cmd
+        # не выполняет перенаправление и лог не создаётся.
+        inner = f'""{exe}" {args} > "{log_path}" 2>&1"'
+        code = int(ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "cmd.exe", f"/s /c {inner}", str(BYPASS_GBD_DIR), 0,
+        ))
+        if code <= 32:
+            raise RuntimeError(
+                "GoodbyeDPI не запущен: окно UAC закрыто или отклонено.\n"
+                "Нажмите «Включить» ещё раз и подтвердите запрос прав администратора."
+            )
+    for _ in range(30):  # до ~15 сек: UAC + загрузка драйвера WinDivert
+        time.sleep(0.5)
+        alive = _image_pids("goodbyedpi.exe")
+        if alive:
+            track["gbd"] = {"pid": alive[0], "started": time.time()}
+            _track_save(track)
+            detail = f"GoodbyeDPI запущен (PID {alive[0]})"
+            if not bypass_admin():
+                detail += " · чтобы убрать окна UAC, нажмите «Перезапустить как админ»"
+            return {"ok": True, "detail": detail}
+    tail = _tail(log_path)
+    if tail:
+        raise RuntimeError("goodbyedpi.exe не запускается:\n" + tail)
+    raise RuntimeError(
+        "goodbyedpi.exe не запустился, лог пуст — скорее всего окно UAC было "
+        "закрыто без подтверждения.\nНажмите «Включить» ещё раз и выберите «Да». "
+        "Либо перезапустите тулзу кнопкой «Перезапустить как админ»."
+    )
+
+
+def bypass_stop(key: str) -> dict:
+    if key != "gbd":
+        # Happ не закрываем — отключаем VPN и снимаем перенаправление программ,
+        # иначе выбранные приложения останутся с мёртвым SOCKS и без интернета.
+        notes: list[str] = []
+        try:
+            notes.append(proxifyre_stop().get("detail") or "")
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"ProxiFyre: {exc}")
+        notes.append(bypass_happ_stop().get("detail") or "")
+        return {"ok": True, "detail": "\n".join(filter(None, notes))}
+    image, label, extra_images = "goodbyedpi.exe", "GoodbyeDPI", []
+    track = _bypass_track()
+    entry = track.get(key) if isinstance(track.get(key), dict) else {}
+    my_pid = int(entry.get("pid") or 0)
+    pids = _image_pids(image)
+    extras_alive = any(_image_pids(name) for name in extra_images)
+    if not pids and not extras_alive and not (my_pid and _pid_alive(my_pid)):
+        if my_pid:
+            track.pop(key, None)
+            _track_save(track)
+        return {"ok": True, "detail": f"{label} и так не был запущен"}
+    targets = [image, *extra_images]
+    # 1) вежливо: приложение само завершится и сохранит настройки
+    for name in targets:
+        run_tool(["taskkill", "/IM", name], timeout=30)
+    for _ in range(10):
+        time.sleep(0.4)
+        if not any(_image_pids(name) for name in targets):
+            break
+    # 2) жёстко, если закрыться само не захотело
+    if any(_image_pids(name) for name in targets):
+        for name in targets:
+            run_tool(["taskkill", "/F", "/IM", name], timeout=30)
+        for _ in range(5):
+            time.sleep(0.2)
+            if not any(_image_pids(name) for name in targets):
+                break
+    if any(_image_pids(name) for name in targets):
+        # скорее всего процесс от администратора — taskkill ещё раз через UAC
+        arguments = " ".join(f"/IM {name}" for name in targets)
+        code = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "taskkill.exe", f"/F {arguments}", None, 0,
+        )
+        if code <= 32:
+            raise RuntimeError(
+                f"{label} запущен от администратора — появится окно UAC, "
+                "подтвердите его, чтобы остановить."
+            )
+        for _ in range(20):
+            time.sleep(0.5)
+            if not any(_image_pids(name) for name in targets):
+                break
+        else:
+            raise RuntimeError(
+                f"{label} всё ещё запущен (UAC отклонён?). Закройте его вручную."
+            )
+    track.pop(key, None)
+    _track_save(track)
+    return {"ok": True, "detail": f"{label} остановлен"}
+
+
+def bypass_happ_start(visible: bool = False) -> dict:
+    """Включает VPN в Happ командой happ://connect — без открытия/закрытия окна."""
+    cfg = bypass_cfg()
+    exe = Path(cfg["happ_path"])
+    if not exe.exists():
+        raise RuntimeError(
+            f"Happ не найден: {exe}\nУкажите путь в «Путь Happ…»."
+        )
+    if happ_connected():
+        return {"ok": True, "detail": "VPN уже включён"}
+    pids = _image_pids(exe.name)
+    if not pids:
+        # клиент не запущен: поднимаем его, чтобы было кому выполнить команду
+        if visible:
+            subprocess.Popen([str(exe)], cwd=str(exe.parent))
+        else:
+            info = subprocess.STARTUPINFO()
+            info.dwFlags = subprocess.STARTF_USESHOWWINDOW
+            info.wShowWindow = 7  # SW_SHOWMINNOACTIVE
+            subprocess.Popen([str(exe)], cwd=str(exe.parent), startupinfo=info)
+        for _ in range(24):
+            time.sleep(0.25)
+            pids = _image_pids(exe.name)
+            if pids:
+                break
+        if not pids:
+            raise RuntimeError("Happ не запустился — проверьте путь в «Путь Happ…»")
+        track = _bypass_track()
+        track["happ"] = {"pid": pids[0], "started": time.time()}
+        _track_save(track)
+        if not visible:
+            _minimize_happ_windows(pids)
+    if not happ_send("connect"):
+        raise RuntimeError("Happ не принял команду подключения (happ://connect)")
+    for _ in range(30):  # до ~15 сек: выбор сервера по пингу и рукопожатие
+        time.sleep(0.5)
+        if happ_connected():
+            return {"ok": True, "detail": "VPN включён"}
+    raise RuntimeError(
+        "Happ не подключился за 15 секунд — нажмите «Показать Happ» "
+        "и проверьте подписку/сервер в самом Happ"
+    )
+
+
+def bypass_happ_stop() -> dict:
+    """Выключает VPN в Happ командой happ://disconnect — программа остаётся открытой."""
+    exe = Path(bypass_cfg()["happ_path"])
+    pids = _image_pids(exe.name)
+    if not pids:
+        return {"ok": True, "detail": "Happ не запущен — VPN и так выключен"}
+    if not happ_connected():
+        return {"ok": True, "detail": "VPN уже выключен"}
+    if not happ_send("disconnect"):
+        raise RuntimeError("Happ не принял команду отключения (happ://disconnect)")
+    for _ in range(20):
+        time.sleep(0.5)
+        if not happ_connected():
+            return {"ok": True, "detail": "VPN выключен"}
+    raise RuntimeError(
+        "Happ не отключил VPN — нажмите «Показать Happ» и выключите вручную"
+    )
+
+
+def bypass_happ_show() -> dict:
+    """Показать окно Happ (VPN не трогаем)."""
+    exe = Path(bypass_cfg()["happ_path"])
+    if not exe.exists():
+        raise RuntimeError(
+            f"Happ не найден: {exe}\nУкажите путь в «Путь Happ…»."
+        )
+    pids = _image_pids(exe.name)
+    if pids:
+        accepted = happ_send("open")
+        for _ in range(10):
+            time.sleep(0.2)
+            if sum(_restore_happ_windows([pid]) for pid in pids):
+                return {"ok": True, "detail": "Окно Happ показано"}
+        return {"ok": True, "detail": (
+            "Команда показа окна отправлена" if accepted
+            else "Окно не найдено — возможно, свёрнуто в трей"
+        )}
+    subprocess.Popen([str(exe)], cwd=str(exe.parent))
+    for _ in range(15):
+        time.sleep(0.2)
+        if _image_pids(exe.name):
+            return {"ok": True, "detail": "Happ запущен"}
+    raise RuntimeError("Happ не запустился — проверьте путь")
+
+
+def bypass_download(kind: str) -> dict:
+    """Скачивает и распаковывает GoodbyeDPI в %LOCALAPPDATA%\\Tools\\bypass."""
+    if kind != "gbd":
+        raise RuntimeError(f"неизвестный компонент {kind!r}")
+    dl_dir = BYPASS_DIR / "downloads"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    BYPASS_GBD_DIR.mkdir(parents=True, exist_ok=True)
+    zip_path = dl_dir / "gbd.zip"
+
+    script = "\n".join([
+        "$ProgressPreference = 'SilentlyContinue'",
+        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12",
+        f"$api = 'https://api.github.com/repos/{BYPASS_GBD_REPO}/releases/latest'",
+        "$rel = Invoke-RestMethod $api",
+        f"$asset = $rel.assets | Where-Object {{ $_.name -match '{BYPASS_GBD_ASSET}' }} "
+        "| Select-Object -First 1",
+        "if (-not $asset) { throw 'подходящий архив не найден в релизе' }",
+        f"Invoke-WebRequest $asset.browser_download_url -OutFile '{zip_path}' -UseBasicParsing",
+        "Write-Output $asset.name",
+    ])
+    name = ps_run(script, timeout=900)
+    if not zip_path.exists() or zip_path.stat().st_size == 0:
+        raise RuntimeError("архив не скачался")
+
+    tmp = dl_dir / "gbd-unzip"
+    if tmp.exists():
+        shutil.rmtree(tmp, ignore_errors=True)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(tmp)
+    found = list(tmp.rglob("goodbyedpi.exe"))
+    if not found:
+        raise RuntimeError("в архиве нет goodbyedpi.exe")
+    exe_dir = found[0].parent
+    for item in exe_dir.iterdir():
+        if item.is_dir():
+            shutil.copytree(item, BYPASS_GBD_DIR / item.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, BYPASS_GBD_DIR / item.name)
+    shutil.rmtree(tmp, ignore_errors=True)
+    if not BYPASS_GBD_EXE.exists():
+        raise RuntimeError("файлы не распакованы")
+    return {"ok": True, "detail": f"Скачан {name.strip() or 'GoodbyeDPI'}"}
+
+
+def happ_socks_port_from(data) -> int:
+    """Порт локального SOCKS Happ из его конфига (sing-box)."""
+    if not isinstance(data, dict):
+        return HAPP_SOCKS_DEFAULT
+    for outbound in data.get("outbounds") or []:
+        if not isinstance(outbound, dict):
+            continue
+        if str(outbound.get("type") or "").lower() not in ("socks", "socks5"):
+            continue
+        server = str(outbound.get("server") or "").strip()
+        if server not in ("127.0.0.1", "localhost", "::1"):
+            continue
+        try:
+            port = int(outbound.get("server_port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if 0 < port < 65536:
+            return port
+    return HAPP_SOCKS_DEFAULT
+
+
+def happ_socks_port(config_file: Path | None = None) -> int:
+    path = Path(config_file) if config_file else HAPP_CONFIG_FILE
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return HAPP_SOCKS_DEFAULT
+    return happ_socks_port_from(data)
+
+
+def port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.4) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            return sock.connect_ex((host, int(port))) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reg_get_int(key_path: str, name: str, default: int) -> int:
+    try:
+        import winreg
+    except ImportError:
+        return default
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+        return int(value)
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def _reg_set_int(key_path: str, name: str, value: int) -> bool:
+    try:
+        import winreg
+    except ImportError:
+        return False
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value))
+        return True
+    except OSError:
+        return False
+
+
+def happ_mode_read() -> dict:
+    """Как Happ сейчас пускает трафик: TUN-адаптер и системный прокси."""
+    return {
+        "tun": bool(_reg_get_int(HAPP_PREFS_KEY, "tun", 1)),
+        "system_proxy": bool(_reg_get_int(HAPP_PREFS_KEY, "system_proxy", 1)),
+    }
+
+
+def happ_mode_write(tun: bool | None = None, system_proxy: bool | None = None) -> dict:
+    if tun is not None and not _reg_set_int(HAPP_PREFS_KEY, "tun", 1 if tun else 0):
+        raise RuntimeError(
+            "Не удалось изменить настройку Happ (tun) в реестре HKCU\\Software\\Happ"
+        )
+    if system_proxy is not None and not _reg_set_int(
+        HAPP_PREFS_KEY, "system_proxy", 1 if system_proxy else 0
+    ):
+        raise RuntimeError(
+            "Не удалось изменить настройку Happ (systemProxy) в реестре HKCU\\Software\\Happ"
+        )
+    return happ_mode_read()
+
+
+def happ_tunnel_restart(timeout: float = 25.0) -> dict:
+    """Перезапуск туннеля Happ, чтобы он применил новые настройки."""
+    exe = Path(bypass_cfg()["happ_path"])
+    if not _image_pids(exe.name) or not happ_connected():
+        return bypass_happ_start()
+    happ_send("disconnect")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not happ_connected():
+            break
+        time.sleep(0.4)
+    return bypass_happ_start()
+
+
+class SERVICE_STATUS(ctypes.Structure):
+    _fields_ = [
+        ("dwServiceType", ctypes.c_ulong),
+        ("dwCurrentState", ctypes.c_ulong),
+        ("dwControlsAccepted", ctypes.c_ulong),
+        ("dwWin32ExitCode", ctypes.c_ulong),
+        ("dwServiceSpecificExitCode", ctypes.c_ulong),
+        ("dwCheckPoint", ctypes.c_ulong),
+        ("dwWaitHint", ctypes.c_ulong),
+    ]
+
+
+def _advapi():
+    global _ADVAPI_READY
+    api = ctypes.windll.advapi32
+    if not _ADVAPI_READY:
+        api.OpenSCManagerW.restype = ctypes.c_void_p
+        api.OpenSCManagerW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        api.OpenServiceW.restype = ctypes.c_void_p
+        api.OpenServiceW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        api.QueryServiceStatus.argtypes = [ctypes.c_void_p, ctypes.POINTER(SERVICE_STATUS)]
+        api.StartServiceW.restype = ctypes.c_int
+        api.StartServiceW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                      ctypes.POINTER(ctypes.c_wchar_p)]
+        api.ControlService.restype = ctypes.c_int
+        api.ControlService.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                       ctypes.POINTER(SERVICE_STATUS)]
+        api.CloseServiceHandle.argtypes = [ctypes.c_void_p]
+        _ADVAPI_READY = True
+    return api
+
+
+def _svc_state(name: str) -> int | None:
+    """Состояние службы/драйвера: 4 — работает, 1 — остановлена, None — нет такой."""
+    if sys.platform != "win32":
+        return None
+    try:
+        api = _advapi()
+        scm = api.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
+        if not scm:
+            return None
+        try:
+            handle = api.OpenServiceW(scm, name, 0x0004)  # SERVICE_QUERY_STATUS
+            if not handle:
+                return None
+            try:
+                status = SERVICE_STATUS()
+                if not api.QueryServiceStatus(handle, ctypes.byref(status)):
+                    return None
+                return int(status.dwCurrentState)
+            finally:
+                api.CloseServiceHandle(handle)
+        finally:
+            api.CloseServiceHandle(scm)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _svc_start(name: str, wait: float = 12.0) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        api = _advapi()
+        scm = api.OpenSCManagerW(None, None, 0x0001)
+        if not scm:
+            return False
+        try:
+            handle = api.OpenServiceW(scm, name, 0x0010 | 0x0004)
+            if not handle:
+                return False
+            try:
+                api.StartServiceW(handle, 0, None)
+            finally:
+                api.CloseServiceHandle(handle)
+        finally:
+            api.CloseServiceHandle(scm)
+    except Exception:  # noqa: BLE001
+        return False
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if _svc_state(name) == SVC_RUNNING:
+            return True
+        time.sleep(0.3)
+    return _svc_state(name) == SVC_RUNNING
+
+
+def _svc_stop(name: str, wait: float = 12.0) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        api = _advapi()
+        scm = api.OpenSCManagerW(None, None, 0x0001)
+        if not scm:
+            return False
+        try:
+            handle = api.OpenServiceW(scm, name, 0x0020 | 0x0004)
+            if not handle:
+                return False
+            try:
+                status = SERVICE_STATUS()
+                api.ControlService(handle, 1, ctypes.byref(status))  # SERVICE_CONTROL_STOP
+            finally:
+                api.CloseServiceHandle(handle)
+        finally:
+            api.CloseServiceHandle(scm)
+    except Exception:  # noqa: BLE001
+        return False
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if _svc_state(name) == SVC_STOPPED:
+            return True
+        time.sleep(0.3)
+    return _svc_state(name) == SVC_STOPPED
+
+
+def proxifyre_service_name() -> str:
+    """Реальное имя службы ProxiFyre.
+
+    Разные сборки регистрируют её как ProxiFyreService или как ProxiFyre:
+    с неверным именем состояние всегда «не установлена», и обход по
+    программам молча не включается.
+    """
+    global _PROXIFYRE_SERVICE_NAME
+    if _PROXIFYRE_SERVICE_NAME:
+        return _PROXIFYRE_SERVICE_NAME
+    for name in PROXIFYRE_SERVICE_ALIASES:
+        if _svc_state(name) is not None:
+            _PROXIFYRE_SERVICE_NAME = name
+            return name
+    return PROXIFYRE_SERVICE
+
+
+def proxifyre_config_data(apps, port: int) -> dict:
+    # ProxiFyre сопоставляет имена процессов; вариант без «.exe» понимают все версии.
+    names = [Path(name).stem for name in normalize_apps(apps)]
+    return {
+        "logLevel": "INFO",
+        "proxies": [{
+            "appNames": names,
+            "socks5ProxyEndpoint": f"127.0.0.1:{int(port)}",
+            "supportedProtocols": ["TCP", "UDP"],
+        }],
+    }
+
+
+def proxifyre_write_config(apps, port: int) -> bool:
+    """Пишет app-config.json. True — файл изменился (нужен перезапуск службы)."""
+    data = proxifyre_config_data(apps, port)
+    try:
+        current = json.loads(PROXIFYRE_CONFIG.read_text("utf-8"))
+    except (OSError, ValueError):
+        current = None
+    if current == data:
+        return False
+    PROXIFYRE_DIR.mkdir(parents=True, exist_ok=True)
+    PROXIFYRE_CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=4), "utf-8")
+    return True
+
+
+def proxifyre_driver_ok() -> bool:
+    return _svc_state(PACKET_FILTER_DRIVER) == SVC_RUNNING
+
+
+def normalize_app_names(values) -> list[str]:
+    """Имена из конфига ProxiFyre («browser» или «browser.exe») → список exe."""
+    result: list[str] = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        result.append(text if text.lower().endswith(".exe") else text + ".exe")
+    return normalize_apps(result)
+
+
+def proxifyre_status() -> dict:
+    state = _svc_state(proxifyre_service_name())
+    apps: list[str] = []
+    try:
+        data = json.loads(PROXIFYRE_CONFIG.read_text("utf-8"))
+        for proxy in data.get("proxies") or []:
+            if isinstance(proxy, dict):
+                apps.extend(normalize_app_names(proxy.get("appNames")))
+    except (OSError, ValueError, AttributeError):
+        pass
+    configured = normalize_apps(apps)
+    wanted = normalize_apps(bypass_cfg()["apps"])
+    configured_keys = {Path(name).stem.lower() for name in configured}
+    wanted_keys = {Path(name).stem.lower() for name in wanted}
+    return {
+        "installed": PROXIFYRE_EXE.exists(),
+        "driver": proxifyre_driver_ok(),
+        "service": state,
+        "running": state == SVC_RUNNING,
+        "apps": configured,
+        "pending": wanted_keys != configured_keys,
+    }
+
+
+def _proxifyre_install() -> bool:
+    if not PROXIFYRE_EXE.exists():
+        return False
+    if is_admin():
+        run_tool([str(PROXIFYRE_EXE), "install"], cwd=str(PROXIFYRE_DIR), timeout=120)
+    else:
+        try:
+            code = int(ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", str(PROXIFYRE_EXE), "install", str(PROXIFYRE_DIR), 0,
+            ))
+        except Exception:  # noqa: BLE001
+            return False
+        if code <= 32:
+            return False
+    for _ in range(40):
+        time.sleep(0.5)
+        if _svc_state(proxifyre_service_name()) is not None:
+            return True
+    return False
+
+
+def proxifyre_start(apps=None, port: int | None = None) -> dict:
+    """Включает перенаправление выбранных программ в SOCKS Happ."""
+    cfg = bypass_cfg()
+    names = normalize_apps(cfg["apps"] if apps is None else apps)
+    if not names:
+        raise RuntimeError("Не выбрано ни одной программы — отметьте их в списке")
+    port = int(port or cfg.get("socks_port") or happ_socks_port())
+    if not PROXIFYRE_EXE.exists():
+        raise RuntimeError(f"ProxiFyre не найден: {PROXIFYRE_EXE}")
+    if not proxifyre_driver_ok():
+        raise RuntimeError(
+            "Драйвер Windows Packet Filter (ndisrd) не запущен — "
+            "обход по программам без него невозможен"
+        )
+    changed = proxifyre_write_config(names, port)
+    service = proxifyre_service_name()
+    state = _svc_state(service)
+    if state is None:
+        if not _proxifyre_install():
+            raise RuntimeError(
+                "Служба ProxiFyre не установлена: подтвердите запрос прав администратора"
+            )
+        service = proxifyre_service_name()
+        state = _svc_state(service)
+    if state == SVC_RUNNING and not changed:
+        return {"ok": True, "detail": f"Обход уже включён для {len(names)} программ"}
+    if state == SVC_RUNNING:
+        _svc_stop(service)
+    if not _svc_start(service):
+        raise RuntimeError(
+            "Не удалось запустить службу ProxiFyre — нужны права администратора"
+        )
+    return {
+        "ok": True,
+        "detail": f"Обход включён для {len(names)} программ через SOCKS 127.0.0.1:{port}",
+    }
+
+
+def proxifyre_stop() -> dict:
+    service = proxifyre_service_name()
+    state = _svc_state(service)
+    if state is None:
+        return {"ok": True, "detail": ""}
+    if state != SVC_RUNNING:
+        return {"ok": True, "detail": "Обход по программам уже выключен"}
+    if not _svc_stop(service):
+        raise RuntimeError("Не удалось остановить службу ProxiFyre")
+    return {"ok": True, "detail": "Обход по программам выключен"}
+
+
+def _wait_port(port: int, timeout: float = 25.0) -> bool:
+    """Ждёт, пока Happ поднимет локальный SOCKS (после connect это не мгновенно)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if port_open(port):
+            return True
+        time.sleep(0.5)
+    return port_open(port)
+
+
+def _force_apps_mode() -> bool:
+    """Гасит TUN и системный прокси Happ, если он включил их сам.
+
+    С включённым TUN весь трафик идёт в туннель, и обход «по программам»
+    фактически становится обходом «всего трафика». True — настройки меняли.
+    """
+    current = happ_mode_read()
+    if not (current["tun"] or current["system_proxy"]):
+        return False
+    happ_mode_write(tun=False, system_proxy=False)
+    if _image_pids(Path(bypass_cfg()["happ_path"]).name):
+        happ_tunnel_restart()
+    return True
+
+
+def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
+    """Единая точка применения: весь трафик или только выбранные программы."""
+    cfg = bypass_cfg()
+    scope = str(scope or cfg["scope"]).lower()
+    mode = str(mode or cfg["mode"]).lower()
+    if scope not in BYPASS_SCOPES:
+        raise RuntimeError(f"неизвестная область обхода {scope!r}")
+    if mode not in ("happ", "gbd"):
+        raise RuntimeError(f"неизвестный режим {mode!r}")
+    if scope == "apps" and mode != "happ":
+        raise RuntimeError(
+            "Обход по программам работает только через Happ: "
+            "GoodbyeDPI правит пакеты и не различает процессы"
+        )
+    if scope == "apps" and not normalize_apps(cfg["apps"]):
+        raise RuntimeError("Не выбрано ни одной программы")
+
+    notes: list[str] = []
+
+    def add(result) -> None:
+        if isinstance(result, dict) and result.get("detail"):
+            notes.append(str(result["detail"]))
+
+    # 1. Гасим то, что противоречит выбранному режиму
+    if mode == "gbd" and (happ_connected() or _image_pids("xray.exe")):
+        add(bypass_happ_stop())
+    if mode == "happ" and _image_pids("goodbyedpi.exe"):
+        add(bypass_stop("gbd"))
+
+    # 2. Настройки Happ: TUN нужен только для «всего трафика»
+    if mode == "happ":
+        want_tun = scope == "all"
+        current = happ_mode_read()
+        if current["tun"] != want_tun or current["system_proxy"] != want_tun:
+            happ_mode_write(tun=want_tun, system_proxy=want_tun)
+            notes.append(
+                "Happ: весь трафик (TUN)" if want_tun
+                else "Happ: без TUN — только локальный SOCKS для выбранных программ"
+            )
+            if _image_pids(Path(cfg["happ_path"]).name):
+                add(happ_tunnel_restart())
+
+    # 3. Включаем движок
+    if mode == "happ":
+        add(bypass_happ_start())
+        if scope == "apps":
+            if _force_apps_mode():
+                notes.append("Happ: TUN был включён — выключил, иначе через туннель "
+                             "шёл бы весь трафик")
+            port = happ_socks_port()
+            if not _wait_port(port):
+                raise RuntimeError(
+                    f"Локальный SOCKS Happ не отвечает на 127.0.0.1:{port} — "
+                    "обход по программам не заработает. Проверьте, что Happ подключён."
+                )
+            add(proxifyre_start(cfg["apps"], port))
+            after = happ_mode_read()
+            if after["tun"] or after["system_proxy"]:
+                notes.append(
+                    "Внимание: Happ снова включил TUN/системный прокси — "
+                    "весь трафик идёт в туннель, а не только выбранные программы. "
+                    "Выключите TUN в самом Happ."
+                )
+        else:
+            add(proxifyre_stop())
+    else:
+        add(bypass_gbd_start())
+
+    bypass_cfg_save(mode=mode, scope=scope)
+    return {"ok": True, "detail": "\n".join(filter(None, notes))}

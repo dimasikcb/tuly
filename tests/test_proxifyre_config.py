@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import load_app
+from helpers import load_module
 
-app = load_app()
+app = load_module("bypass_core")
 
 
 class ProxiFyreConfigTest(unittest.TestCase):
@@ -32,14 +32,15 @@ class ProxiFyreConfigTest(unittest.TestCase):
         data = app.proxifyre_config_data(["Chrome.exe", "chrome.exe"], 10808)
         self.assertEqual(data["logLevel"], "INFO")
         proxy = data["proxies"][0]
-        self.assertEqual(proxy["appNames"], ["Chrome.exe"])
+        # ProxiFyre сопоставляет имена процессов: пишем без «.exe»
+        self.assertEqual(proxy["appNames"], ["Chrome"])
         self.assertEqual(proxy["socks5ProxyEndpoint"], "127.0.0.1:10808")
         self.assertEqual(proxy["supportedProtocols"], ["TCP", "UDP"])
 
     def test_write_creates_file_and_reports_change(self) -> None:
         self.assertTrue(app.proxifyre_write_config(["chrome.exe"], 10808))
         data = json.loads(self.config.read_text(encoding="utf-8"))
-        self.assertEqual(data["proxies"][0]["appNames"], ["chrome.exe"])
+        self.assertEqual(data["proxies"][0]["appNames"], ["chrome"])
 
     def test_second_write_is_noop(self) -> None:
         app.proxifyre_write_config(["chrome.exe"], 10808)

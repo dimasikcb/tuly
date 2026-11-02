@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import unittest
 
-from helpers import TempConfig, load_app
+from helpers import TempConfig, load_module
 
-app = load_app()
+app = load_module("bypass_core")
 
 
 class BypassConfigTest(unittest.TestCase):
@@ -82,24 +82,29 @@ class BypassConfigTest(unittest.TestCase):
 
 
 class NormalizeTest(unittest.TestCase):
+    """Нормализация имён программ — в apps_catalog, конфиг — в bypass_core."""
+
+    def setUp(self) -> None:
+        self.apps = load_module("apps_catalog")
+
     def test_normalize_app(self) -> None:
-        self.assertEqual(app.normalize_app(r"C:\Games\Steam\steam.exe"), "steam.exe")
-        self.assertEqual(app.normalize_app("  chrome.exe  "), "chrome.exe")
-        self.assertEqual(app.normalize_app('"C:/Program Files/App/app.exe"'), "app.exe")
-        self.assertEqual(app.normalize_app("readme.txt"), "")
-        self.assertEqual(app.normalize_app(""), "")
-        self.assertEqual(app.normalize_app(None), "")
+        self.assertEqual(self.apps.normalize_app(r"C:\Games\Steam\steam.exe"), "steam.exe")
+        self.assertEqual(self.apps.normalize_app("  chrome.exe  "), "chrome.exe")
+        self.assertEqual(self.apps.normalize_app('"C:/Program Files/App/app.exe"'), "app.exe")
+        self.assertEqual(self.apps.normalize_app("readme.txt"), "")
+        self.assertEqual(self.apps.normalize_app(""), "")
+        self.assertEqual(self.apps.normalize_app(None), "")
 
     def test_normalize_apps_dedupes_case_insensitive(self) -> None:
-        result = app.normalize_apps(["Chrome.exe", "chrome.exe", "CHROME.EXE",
+        result = self.apps.normalize_apps(["Chrome.exe", "chrome.exe", "CHROME.EXE",
                                      r"C:\x\Firefox.exe"])
         self.assertEqual(result, ["Chrome.exe", "Firefox.exe"])
 
     def test_pretty_app_name(self) -> None:
-        self.assertEqual(app.pretty_app_name("discord-desktop.exe"), "Discord Desktop")
-        self.assertEqual(app.pretty_app_name("chrome.exe"), "Chrome")
-        self.assertEqual(app.pretty_app_name("Code_x64.exe"), "Code")
-        self.assertEqual(app.pretty_app_name("telegram.exe"), "Telegram")
+        self.assertEqual(self.apps.pretty_app_name("discord-desktop.exe"), "Discord Desktop")
+        self.assertEqual(self.apps.pretty_app_name("chrome.exe"), "Chrome")
+        self.assertEqual(self.apps.pretty_app_name("Code_x64.exe"), "Code")
+        self.assertEqual(self.apps.pretty_app_name("telegram.exe"), "Telegram")
 
 
 if __name__ == "__main__":

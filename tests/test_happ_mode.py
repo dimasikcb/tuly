@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import load_app
+from helpers import load_module
 
-app = load_app()
+app = load_module("bypass_core")
 
 
 class HappModeTest(unittest.TestCase):

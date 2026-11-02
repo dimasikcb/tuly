@@ -329,17 +329,23 @@ def tg_send(settings: dict, contact: str, kind: str, text: str) -> dict:
     return _tg_call(settings, lambda c: _tg_send(c, contact, kind, text))
 
 
-def gui_auth(settings: dict, phone: str, parent=None, on_log=None) -> None:
-    """Вход в TG из главного потока Tk: код и 2FA спрашиваются через simpledialog."""
+def tg_login(settings: dict, phone: str, ask=None, on_log=None) -> None:
+    """Вход в TG. `ask(заголовок, вопрос, secret=False)` спрашивает код и 2FA.
+
+    Раньше функция звала tkinter.simpledialog напрямую, и модуль рассылки тянул
+    GUI. Теперь диалог передаёт вызывающая сторона (в приложении — MailWindow),
+    поэтому здесь нет ни одного импорта графической библиотеки.
+    """
     from telethon.errors import SessionPasswordNeededError
     from telethon.sync import TelegramClient
-    from tkinter import simpledialog
 
     api_id = int(str(settings.get("api_id") or "0").strip() or 0)
     api_hash = (settings.get("api_hash") or "").strip()
     phone = (phone or "").strip()
     if not (api_id and api_hash and phone):
         raise RuntimeError("нужны api_id, api_hash и номер телефона")
+    if ask is None:
+        raise RuntimeError("не передан диалог ввода кода")
 
     with TG_LOCK:
         _ensure_loop()
@@ -351,15 +357,13 @@ def gui_auth(settings: dict, phone: str, parent=None, on_log=None) -> None:
                     on_log("TG: аккаунт уже привязан", "ok")
                 return
             client.send_code_request(phone)
-            code = simpledialog.askstring(
-                "Telegram — код", f"Код из Telegram для {phone}:", parent=parent)
+            code = ask("Telegram — код", f"Код из Telegram для {phone}:")
             if not code:
                 raise RuntimeError("код не введён")
             try:
                 client.sign_in(phone=phone, code=code.strip())
             except SessionPasswordNeededError:
-                pwd = simpledialog.askstring(
-                    "Telegram — 2FA", "Облачный пароль:", parent=parent, show="*")
+                pwd = ask("Telegram — 2FA", "Облачный пароль:", True)
                 if not pwd:
                     raise RuntimeError("включён 2FA, пароль не введён")
                 client.sign_in(password=pwd)
