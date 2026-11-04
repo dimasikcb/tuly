@@ -20,7 +20,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from apps_catalog import normalize_apps
+from apps_catalog import expand_companions, normalize_apps, running_processes
 from winbase import NO_WINDOW, config_read, config_update, is_admin, ps_run, run_tool
 
 BYPASS_DIR = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / "Tools" / "bypass"
@@ -46,6 +46,7 @@ _PROXIFYRE_SERVICE_NAME: str | None = None
 PACKET_FILTER_DRIVER = "ndisrd"
 SVC_STOPPED = 1
 SVC_RUNNING = 4
+_ADVAPI_READY = False
 
 
 def _find_happ() -> Path:
@@ -302,7 +303,12 @@ def bypass_status(_timeout: float = 1.5) -> dict:
         if pids:
             result[key]["pids"] = pids
     result["track"] = {}
+    rescan = proxifyre_rescan()
+    # ProxiFyre запоминает процессы при старте службы. Если пользователь
+    # запустил выбранную программу позже, перезапускаем службу автоматически,
+    # чтобы она тоже попала под перенаправление.
     result["proxyfyre"] = proxifyre_status()
+    result["proxyfyre_rescan"] = rescan
     result["scope"] = cfg["scope"]
     result["apps"] = cfg["apps"]
     result["mode"] = cfg["mode"]
@@ -747,7 +753,12 @@ def _svc_start(name: str, wait: float = 12.0) -> bool:
         finally:
             api.CloseServiceHandle(scm)
     except Exception:  # noqa: BLE001
-        return False
+        pass
+    # Если запуск через Win32 API не прошёл, пробуем sc start / net start
+    try:
+        run_tool(["sc.exe", "start", name], timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
     deadline = time.time() + wait
     while time.time() < deadline:
         if _svc_state(name) == SVC_RUNNING:
@@ -776,7 +787,11 @@ def _svc_stop(name: str, wait: float = 12.0) -> bool:
         finally:
             api.CloseServiceHandle(scm)
     except Exception:  # noqa: BLE001
-        return False
+        pass
+    try:
+        run_tool(["sc.exe", "stop", name], timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
     deadline = time.time() + wait
     while time.time() < deadline:
         if _svc_state(name) == SVC_STOPPED:
@@ -804,7 +819,8 @@ def proxifyre_service_name() -> str:
 
 def proxifyre_config_data(apps, port: int) -> dict:
     # ProxiFyre сопоставляет имена процессов; вариант без «.exe» понимают все версии.
-    names = [Path(name).stem for name in normalize_apps(apps)]
+    expanded = expand_companions(normalize_apps(apps))
+    names = [Path(name).stem for name in expanded]
     return {
         "logLevel": "INFO",
         "proxies": [{
@@ -833,6 +849,66 @@ def proxifyre_driver_ok() -> bool:
     return _svc_state(PACKET_FILTER_DRIVER) == SVC_RUNNING
 
 
+# ProxiFyre 1.0.22 запоминает PID процессов в момент старта службы: программа,
+# запущенная позже, в SOCKS не попадает. Держим снимок PID и перезапускаем
+# службу, когда выбранная программа запустилась заново.
+_PROXIFYRE_PIDS: set[int] | None = None
+_PROXIFYRE_LAST_RESTART = 0.0
+RESCAN_COOLDOWN = 15.0
+
+
+def _selected_pids() -> set[int]:
+    expanded = expand_companions(bypass_cfg()["apps"])
+    wanted = {Path(name).stem.lower() for name in expanded}
+    if not wanted:
+        return set()
+    result: set[int] = set()
+    for pid, path in running_processes():
+        if Path(path).stem.lower() in wanted:
+            result.add(int(pid))
+    return result
+
+
+def proxifyre_snapshot() -> set[int]:
+    """Запомнить, какие процессы служба уже видит (после её старта)."""
+    global _PROXIFYRE_PIDS
+    _PROXIFYRE_PIDS = _selected_pids()
+    return _PROXIFYRE_PIDS
+
+
+def proxifyre_rescan() -> dict | None:
+    """Перезапускает службу, если появился новый процесс из списка обхода.
+
+    Возвращает None, когда делать нечего, иначе {ok, apps} — что перезапускали.
+    """
+    if _svc_state(proxifyre_service_name()) != SVC_RUNNING:
+        return None
+    wanted = {Path(name).stem.lower() for name in bypass_cfg()["apps"]}
+    if not wanted:
+        return None
+    current = _selected_pids()
+    global _PROXIFYRE_PIDS
+    if _PROXIFYRE_PIDS is None:
+        _PROXIFYRE_PIDS = current
+        return None
+    fresh = current - _PROXIFYRE_PIDS
+    if not fresh:
+        _PROXIFYRE_PIDS = current & _PROXIFYRE_PIDS if current else current
+        return None
+    # Программы плодят процессы (Electron: главный + рендереры), поэтому
+    # перезапускаем не чаще, чем раз в RESCAN_COOLDOWN секунд.
+    global _PROXIFYRE_LAST_RESTART
+    if time.time() - _PROXIFYRE_LAST_RESTART < RESCAN_COOLDOWN:
+        return None
+    _PROXIFYRE_LAST_RESTART = time.time()
+    service = proxifyre_service_name()
+    _svc_stop(service)
+    ok = _svc_start(service)
+    if ok:
+        proxifyre_snapshot()
+    return {"ok": ok, "apps": sorted(fresh)}
+
+
 def normalize_app_names(values) -> list[str]:
     """Имена из конфига ProxiFyre («browser» или «browser.exe») → список exe."""
     result: list[str] = []
@@ -855,7 +931,7 @@ def proxifyre_status() -> dict:
     except (OSError, ValueError, AttributeError):
         pass
     configured = normalize_apps(apps)
-    wanted = normalize_apps(bypass_cfg()["apps"])
+    wanted = expand_companions(normalize_apps(bypass_cfg()["apps"]))
     configured_keys = {Path(name).stem.lower() for name in configured}
     wanted_keys = {Path(name).stem.lower() for name in wanted}
     return {
@@ -914,17 +990,45 @@ def proxifyre_start(apps=None, port: int | None = None) -> dict:
         service = proxifyre_service_name()
         state = _svc_state(service)
     if state == SVC_RUNNING and not changed:
+        proxifyre_snapshot()
         return {"ok": True, "detail": f"Обход уже включён для {len(names)} программ"}
     if state == SVC_RUNNING:
         _svc_stop(service)
     if not _svc_start(service):
         raise RuntimeError(
-            "Не удалось запустить службу ProxiFyre — нужны права администратора"
+            "Не удалось запустить службу ProxiFyre"
         )
+    proxifyre_snapshot()
     return {
         "ok": True,
         "detail": f"Обход включён для {len(names)} программ через SOCKS 127.0.0.1:{port}",
     }
+
+
+def proxifyre_restart() -> dict:
+    """Перезапуск службы: ProxiFyre 1.0.22 иначе не видит новые процессы."""
+    service = proxifyre_service_name()
+    if not PROXIFYRE_EXE.exists():
+        raise RuntimeError(f"ProxiFyre не найден: {PROXIFYRE_EXE}")
+    state = _svc_state(service)
+    if state is None:
+        raise RuntimeError(
+            "Служба ProxiFyre не установлена: подтвердите запрос прав администратора"
+        )
+    if not proxifyre_driver_ok():
+        raise RuntimeError(
+            "Драйвер Windows Packet Filter (ndisrd) не запущен — "
+            "обход по программам без него невозможен"
+        )
+    if state == SVC_RUNNING:
+        _svc_stop(service)
+    if not _svc_start(service):
+        raise RuntimeError(
+            "Не удалось запустить службу ProxiFyre"
+        )
+    proxifyre_snapshot()
+    apps = normalize_apps(bypass_cfg()["apps"])
+    return {"ok": True, "detail": f"ProxiFyre перезапущен — подхвачено {len(apps)} программ"}
 
 
 def proxifyre_stop() -> dict:
@@ -965,7 +1069,12 @@ def _force_apps_mode() -> bool:
 
 
 def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
-    """Единая точка применения: весь трафик или только выбранные программы."""
+    """Единая точка применения: весь трафик или только выбранные программы.
+
+    Движки независимы: Happ (через ProxiFyre) можно держать для выбранных
+    программ, а GoodbyeDPI — включённым для остального трафика. Поэтому
+    применение одного движка больше не гасит второй.
+    """
     cfg = bypass_cfg()
     scope = str(scope or cfg["scope"]).lower()
     mode = str(mode or cfg["mode"]).lower()
@@ -973,11 +1082,6 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
         raise RuntimeError(f"неизвестная область обхода {scope!r}")
     if mode not in ("happ", "gbd"):
         raise RuntimeError(f"неизвестный режим {mode!r}")
-    if scope == "apps" and mode != "happ":
-        raise RuntimeError(
-            "Обход по программам работает только через Happ: "
-            "GoodbyeDPI правит пакеты и не различает процессы"
-        )
     if scope == "apps" and not normalize_apps(cfg["apps"]):
         raise RuntimeError("Не выбрано ни одной программы")
 
@@ -987,13 +1091,7 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
         if isinstance(result, dict) and result.get("detail"):
             notes.append(str(result["detail"]))
 
-    # 1. Гасим то, что противоречит выбранному режиму
-    if mode == "gbd" and (happ_connected() or _image_pids("xray.exe")):
-        add(bypass_happ_stop())
-    if mode == "happ" and _image_pids("goodbyedpi.exe"):
-        add(bypass_stop("gbd"))
-
-    # 2. Настройки Happ: TUN нужен только для «всего трафика»
+    # 1. Настройки Happ: TUN нужен только для «всего трафика»
     if mode == "happ":
         want_tun = scope == "all"
         current = happ_mode_read()
@@ -1006,7 +1104,7 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
             if _image_pids(Path(cfg["happ_path"]).name):
                 add(happ_tunnel_restart())
 
-    # 3. Включаем движок
+    # 2. Включаем движок (второй при этом не гасим)
     if mode == "happ":
         add(bypass_happ_start())
         if scope == "apps":
@@ -1031,6 +1129,11 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
             add(proxifyre_stop())
     else:
         add(bypass_gbd_start())
+        if happ_connected():
+            notes.append(
+                "GoodbyeDPI работает параллельно с Happ: выбранные программы "
+                "идут через туннель, остальной трафик правит DPI."
+            )
 
     bypass_cfg_save(mode=mode, scope=scope)
     return {"ok": True, "detail": "\n".join(filter(None, notes))}

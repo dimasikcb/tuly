@@ -132,6 +132,24 @@ class BypassPanelTest(unittest.TestCase):
         self.assertEqual(self.panel.selected_apps, set())
         self.assertEqual(self.saved["apps"], [])
 
+    def test_only_bypass_shows_selected_apps(self) -> None:
+        self.panel._toggle_only_bypass()
+        self.assertTrue(self.panel.only_bypass)
+        self.assertEqual(self._packed(), ["Discord.exe"])
+
+    def test_only_bypass_hint_when_nothing_selected(self) -> None:
+        self.panel._clear_apps()
+        self.panel._toggle_only_bypass()
+        self.assertEqual(self._packed(), [])
+        self.assertIn("Обход ни для одной программы", self.panel.empty_label.cget("text"))
+
+    def test_only_bypass_off_shows_all_again(self) -> None:
+        self.panel._toggle_only_bypass()
+        self.panel._toggle_only_bypass()
+        self.assertFalse(self.panel.only_bypass)
+        self.assertEqual(sorted(self._packed()),
+                         ["Discord.exe", "chrome.exe", "telegram.exe"])
+
     def test_engine_text_shows_socks_in_apps_mode(self) -> None:
         text = self.panel._engine_text("happ")
         self.assertIn("VPN включён", text)
@@ -157,20 +175,30 @@ class BypassPanelTest(unittest.TestCase):
         self.assertEqual(self.applied, [])
         self.assertTrue(any("Отметьте программы" in text for text in self.hub.toasts))
 
-    def test_gbd_switch_forces_global_scope(self) -> None:
+    def test_gbd_switch_keeps_apps_scope(self) -> None:
+        # GoodbyeDPI работает параллельно с Happ для остального трафика,
+        # поэтому область «только программы» больше не сбрасывается.
         self.panel._on_switch("gbd", True)
-        self.assertEqual(self.panel.scope, "all")
-        self.assertIn(("all", "gbd"), self.applied)
+        self.assertEqual(self.panel.scope, "apps")
+        self.assertIn(("apps", "gbd"), self.applied)
 
     def test_scope_switch_reapplies_when_running(self) -> None:
         self.panel._set_scope("all")
         self.assertEqual(self.panel.scope, "all")
         self.assertIn(("all", "happ"), self.applied)
 
-    def test_scope_control_disabled_for_gbd(self) -> None:
+    def test_scope_control_stays_enabled_for_gbd(self) -> None:
         self.panel.mode = "gbd"
         self.panel._update_controls()
-        self.assertFalse(self.panel.scope_control.enabled)
+        self.assertTrue(self.panel.scope_control.enabled)
+
+    def test_status_text_shows_both_engines(self) -> None:
+        self.panel.state = dict(STATE, gbd={"on": True, "installed": True,
+                                            "pids": [11, 22]})
+        headline, detail, color = self.panel._status_text()
+        self.assertIn("GoodbyeDPI", headline)
+        self.assertIn("остальной", detail)
+        self.assertEqual(color, app.OK)
 
     def test_apps_section_hidden_for_global_scope(self) -> None:
         self.panel._set_scope("all")

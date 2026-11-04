@@ -84,11 +84,13 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("pf_stop", self.calls)
         self.assertNotIn("pf_start:0:10808", self.calls)
 
-    def test_apps_scope_requires_happ(self) -> None:
+    def test_apps_scope_allows_gbd_alongside(self) -> None:
         self.cfg.update(scope="apps", apps=["chrome.exe"])
-        with self.assertRaises(RuntimeError) as ctx:
-            app.bypass_apply("apps", "gbd")
-        self.assertIn("GoodbyeDPI", str(ctx.exception))
+        result = app.bypass_apply("apps", "gbd")
+        self.assertTrue(result["ok"])
+        self.assertIn("gbd_start", self.calls)
+        self.assertNotIn("happ_stop", self.calls)
+        self.assertEqual(self.saved["scope"], "apps")
 
     def test_apps_scope_requires_apps(self) -> None:
         self.cfg.update(scope="apps", apps=[])
@@ -104,18 +106,19 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("SOCKS", str(ctx.exception))
         self.assertNotIn("pf_start:1:10808", self.calls)
 
-    def test_gbd_mode_stops_happ_and_starts_gbd(self) -> None:
+    def test_gbd_mode_keeps_happ_running(self) -> None:
+        # Движки независимы: GoodbyeDPI включается, не гася туннель Happ.
         self.happ_connected = True
         self.cfg.update(mode="gbd", scope="all")
         app.bypass_apply("all", "gbd")
-        self.assertIn("happ_stop", self.calls)
+        self.assertNotIn("happ_stop", self.calls)
         self.assertIn("gbd_start", self.calls)
         self.assertEqual(self.saved["mode"], "gbd")
 
-    def test_happ_mode_stops_gbd(self) -> None:
+    def test_happ_mode_keeps_gbd_running(self) -> None:
         self.gbd_running = True
         app.bypass_apply("all", "happ")
-        self.assertIn("stop:gbd", self.calls)
+        self.assertNotIn("stop:gbd", self.calls)
 
     def test_tunnel_restarted_only_when_settings_change(self) -> None:
         self.happ_connected = True

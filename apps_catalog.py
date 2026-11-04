@@ -16,6 +16,30 @@ from winbase import ps_run
 
 APP_SKIP_PREFIXES = ("unins", "setup", "install", "update", "vcredist", "dxsetup")
 
+APP_COMPANIONS: dict[str, list[str]] = {
+    "antigravity.exe": ["language_server.exe"],
+    "workbuddyai.exe": ["editor_sdk.exe", "betterleaks.exe", "node.exe"],
+    "cursor.exe": ["cursor-server.exe", "node.exe"],
+    "code.exe": ["node.exe"],
+}
+
+
+def expand_companions(apps) -> list[str]:
+    """Дополняет список программ зависимыми процессами (бэкендами).
+
+    Например, для Antigravity.exe автоматически добавляется language_server.exe,
+    а для WorkBuddyAI.exe — editor_sdk.exe, node.exe и betterleaks.exe.
+    """
+    result = list(normalize_apps(apps))
+    existing_lower = {Path(a).name.lower() for a in result}
+    for item in list(result):
+        key = Path(item).name.lower()
+        for comp in APP_COMPANIONS.get(key) or []:
+            if comp.lower() not in existing_lower:
+                result.append(comp)
+                existing_lower.add(comp.lower())
+    return result
+
 
 @dataclass(frozen=True)
 class AppEntry:
@@ -28,8 +52,19 @@ class AppEntry:
     source: str = ""
 
 
-def pretty_app_name(exe: str) -> str:
+def pretty_app_name(exe: str, path: str = "") -> str:
     """discord-desktop.exe → «Discord Desktop»."""
+    path_low = str(path or "").lower()
+    exe_low = str(exe or "").lower()
+    if exe_low == "language_server.exe" and "antigravity" in path_low:
+        return "Antigravity (Language Server)"
+    if exe_low == "editor_sdk.exe" and "workbuddy" in path_low:
+        return "WorkBuddy (Editor SDK)"
+    if exe_low == "betterleaks.exe" and "workbuddy" in path_low:
+        return "WorkBuddy (Sandbox)"
+    if exe_low == "node.exe" and "workbuddy" in path_low:
+        return "WorkBuddy (Node Backend)"
+
     stem = Path(str(exe or "")).stem
     stem = re.sub(r"(?i)([-_](x64|x86|amd64|setup|portable|bin))$", "", stem)
     words = [word for word in re.split(r"[-_\s]+", stem) if word]
@@ -120,18 +155,42 @@ def _usable_exe(path: str) -> bool:
 
 def _running_exe_paths() -> list[str]:
     """Пути запущенных процессов через ctypes — без PowerShell и без задержек."""
+    return [path for _pid, path in running_processes()]
+
+
+def running_processes() -> list[tuple[int, str]]:
+    """(pid, путь) для всех доступных процессов — один проход по psapi."""
     if sys.platform != "win32":
         return []
     try:
         kernel32 = ctypes.windll.kernel32
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        # Без argtypes/restype ctypes режет 64-битные HANDLE до int — OpenProcess
+        # возвращал «мусорный» handle, QueryFullProcessImageNameW падал, и список
+        # запущенных программ всегда был пустым.
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        # EnumProcesses живёт в psapi.dll (в kernel32 его нет — вызов падал).
+        psapi = ctypes.windll.psapi
+        psapi.EnumProcesses.restype = ctypes.c_int
+        psapi.EnumProcesses.argtypes = [
+            ctypes.POINTER(ctypes.c_ulong), ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
         count = 2048
         buffer = (ctypes.c_ulong * count)()
         needed = ctypes.c_ulong()
-        if not kernel32.EnumProcesses(buffer, ctypes.sizeof(buffer), ctypes.byref(needed)):
+        if not psapi.EnumProcesses(buffer, ctypes.sizeof(buffer), ctypes.byref(needed)):
             return []
         total = min(count, needed.value // ctypes.sizeof(ctypes.c_ulong))
-        paths: list[str] = []
+        paths: list[tuple[int, str]] = []
         for index in range(total):
             pid = int(buffer[index])
             if not pid:
@@ -146,7 +205,7 @@ def _running_exe_paths() -> list[str]:
                     handle, 0, name_buffer, ctypes.byref(size)
                 ):
                     if name_buffer.value:
-                        paths.append(name_buffer.value)
+                        paths.append((pid, name_buffer.value))
             finally:
                 kernel32.CloseHandle(handle)
         return paths
@@ -241,7 +300,7 @@ def app_catalog(running_paths=None, registry_paths=None,
         if not _usable_exe(path):
             continue
         entries[key_of(path)] = AppEntry(
-            exe=Path(path).name, name=pretty_app_name(Path(path).name),
+            exe=Path(path).name, name=pretty_app_name(Path(path).name, path),
             path=path, running=True, source="running",
         )
 
@@ -254,7 +313,7 @@ def app_catalog(running_paths=None, registry_paths=None,
             if not entries[key].path:
                 entries[key] = replace(entries[key], path=path)
             continue
-        entries[key] = AppEntry(exe=name, name=pretty_app_name(name),
+        entries[key] = AppEntry(exe=name, name=pretty_app_name(name, path),
                                 path=path, source="registry")
 
     for label, path in shortcuts:

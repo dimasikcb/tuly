@@ -72,3 +72,15 @@ class AppSearchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunningProcessesTest(unittest.TestCase):
+    """Регрессия: EnumProcesses вызывался из kernel32 и молча падал."""
+
+    def test_running_paths_detected(self) -> None:
+        import sys
+        if sys.platform != "win32":
+            self.skipTest("только Windows")
+        paths = app._running_exe_paths()
+        self.assertTrue(paths, "список запущенных процессов пуст")
+        self.assertTrue(all(path.lower().endswith(".exe") for path in paths))

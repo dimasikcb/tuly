@@ -38,7 +38,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, simpledialog, ttk
 
-from apps_catalog import AppEntry, app_catalog, filter_apps, normalize_apps
+from apps_catalog import APP_COMPANIONS, AppEntry, app_catalog, expand_companions, filter_apps, normalize_apps
 from bypass_core import (
     HAPP_SOCKS_DEFAULT,
     _find_happ,
@@ -50,6 +50,8 @@ from bypass_core import (
     bypass_happ_show,
     bypass_status,
     bypass_stop,
+    proxifyre_rescan,
+    proxifyre_restart,
     proxifyre_start,
     proxifyre_stop,
 )
@@ -4263,6 +4265,7 @@ class BypassPanel(Panel):
         self.loading_apps = False
         self.query = ""
         self.only_running = False
+        self.only_bypass = False
         self._offline_noted = False
         self._apply_job = None
         self._build()
@@ -4313,6 +4316,9 @@ class BypassPanel(Panel):
         self.btn_download.pack(side="left", padx=(px(8), 0))
         self.btn_refresh = flat_button(tools, "Обновить", self.refresh_now, kind="ghost")
         self.btn_refresh.pack(side="right")
+        self.btn_catch = flat_button(tools, "Подхватить программы",
+                                     self.catch_programs, kind="ghost")
+        self.btn_catch.pack(side="right", padx=(0, px(8)))
 
         self.apps_card = self._apps_card(self)
         self.apps_card.grid(row=3, column=0, sticky="nsew", pady=(px(10), 0))
@@ -4387,9 +4393,12 @@ class BypassPanel(Panel):
         self.count_var = tk.StringVar(value="выбрано 0")
         tk.Label(head, textvariable=self.count_var, bg=CARD, fg=MUTED,
                  font=("Segoe UI", 9)).pack(side="left", padx=(px(10), 0))
+        self.only_bypass_btn = flat_button(
+            head, "Только обход", self._toggle_only_bypass, kind="ghost")
+        self.only_bypass_btn.pack(side="right")
         self.only_running_btn = flat_button(
             head, "Только запущенные", self._toggle_only_running, kind="ghost")
-        self.only_running_btn.pack(side="right")
+        self.only_running_btn.pack(side="right", padx=(0, px(8)))
         flat_button(head, "Снять все", self._clear_apps, kind="ghost").pack(
             side="right", padx=(0, px(8)))
 
@@ -4451,6 +4460,8 @@ class BypassPanel(Panel):
 
     def _apply_filter(self) -> None:
         matched = filter_apps(self.catalog, self.query, only_running=self.only_running)
+        if self.only_bypass:
+            matched = [e for e in matched if e.exe.lower() in self.selected_apps]
         visible = matched[: self.ROW_LIMIT]
         shown: set[str] = set()
         for entry in visible:
@@ -4473,6 +4484,11 @@ class BypassPanel(Panel):
         if not total:
             self.empty_label.configure(
                 text="Список пуст — нажмите «Обновить» или добавьте программу вручную."
+            )
+        elif not matched and self.only_bypass:
+            self.empty_label.configure(
+                text="Обход ни для одной программы не включён — отметьте программы "
+                     "в списке или сбросьте фильтр «Только обход»."
             )
         elif not matched:
             self.empty_label.configure(
@@ -4510,14 +4526,30 @@ class BypassPanel(Panel):
         )
         self._apply_filter()
 
+    def _toggle_only_bypass(self) -> None:
+        self.only_bypass = not self.only_bypass
+        self.only_bypass_btn.configure(
+            text="● Только обход" if self.only_bypass else "Только обход",
+            fg=ACCENT if self.only_bypass else FG,
+        )
+        self._apply_filter()
+
     def _on_app_toggle(self, entry: AppEntry, selected: bool) -> None:
         key = entry.exe.lower()
-        if selected:
-            self.selected_apps.add(key)
-        else:
-            self.selected_apps.discard(key)
+        targets = [key]
+        for comp in APP_COMPANIONS.get(key) or []:
+            targets.append(comp.lower())
+        for k in targets:
+            if selected:
+                self.selected_apps.add(k)
+            else:
+                self.selected_apps.discard(k)
+            if k in self.rows:
+                self.rows[k].set_selected(selected)
         self._save_cfg()
         self._update_controls()
+        if self.only_bypass and not selected:
+            self._apply_filter()
         self._schedule_apply()
 
     def _clear_apps(self) -> None:
@@ -4526,6 +4558,8 @@ class BypassPanel(Panel):
             row.set_selected(False)
         self._save_cfg()
         self._update_controls()
+        if self.only_bypass:
+            self._apply_filter()
         self._schedule_apply()
 
     def _schedule_apply(self) -> None:
@@ -4541,7 +4575,7 @@ class BypassPanel(Panel):
         self._apply_job = None
         if self.busy or not self.winfo_exists():
             return
-        if self.mode != "happ" or self.scope != "apps":
+        if self.scope != "apps":
             return
         if not (self.state.get("proxyfyre") or {}).get("running"):
             return  # служба выключена — конфиг применится при включении
@@ -4573,10 +4607,6 @@ class BypassPanel(Panel):
         if self.busy or self.mode == mode:
             return
         self.mode = mode
-        if mode == "gbd" and self.scope == "apps":
-            self.scope = "all"
-            self.hub.toast("GoodbyeDPI не различает процессы — включён режим «весь трафик»",
-                           kind="warn")
         self._save_cfg()
         self._update_controls()
 
@@ -4586,8 +4616,10 @@ class BypassPanel(Panel):
         self.scope = scope
         self._save_cfg()
         self._update_controls()
-        if self._engine_on(self.mode):
-            self._start_mode(self.mode)
+        if self._engine_on("happ") or scope == "apps":
+            self._start_mode("happ")
+        elif self._engine_on("gbd"):
+            self._start_mode("gbd")
 
     def _engine_on(self, mode: str) -> bool:
         if mode == "happ":
@@ -4606,9 +4638,6 @@ class BypassPanel(Panel):
             self._stop_mode(mode)
 
     def _start_mode(self, mode: str) -> None:
-        if mode == "gbd" and self.scope == "apps":
-            self.scope = "all"
-            self._save_cfg()
         if mode == "happ" and self.scope == "apps" and not self.selected_apps:
             self.hub.toast("Отметьте программы, для которых нужен обход", kind="warn")
             self._update_controls()
@@ -4619,13 +4648,16 @@ class BypassPanel(Panel):
             self._update_controls()
             return
         label = "Happ" if mode == "happ" else "GoodbyeDPI"
-        scope_text = "весь трафик" if self.scope == "all" else (
-            f"программы: {len(self.selected_apps)}")
+        if mode == "happ":
+            scope_text = "весь трафик" if self.scope == "all" else (
+                f"программы: {len(self.selected_apps)}")
+        else:
+            scope_text = "остальной трафик" if self.scope == "apps" else "весь трафик"
         self._run(lambda: bypass_apply(self.scope, mode),
                   f"{label}: включаю ({scope_text})…",
                   f"Включаю {label} · {scope_text}" + (
                       " · потребуется подтверждение администратора (UAC)"
-                      if not bypass_admin() and self.scope == "apps" else ""))
+                      if False else ""))
 
     def _stop_mode(self, mode: str) -> None:
         label = "Happ" if mode == "happ" else "GoodbyeDPI"
@@ -4647,6 +4679,13 @@ class BypassPanel(Panel):
             self.hub.run_bg(bypass_status, self._state_ok, self._state_off)
         self.after(3000, self._tick)
 
+    def catch_programs(self) -> None:
+        """Перезапуск ProxiFyre: служба видит только процессы со своего старта."""
+        if self.busy:
+            return
+        self._run(proxifyre_restart, "ProxiFyre: подхватываю запущенные программы…",
+                  "Перезапускаю службу ProxiFyre…")
+
     def refresh_now(self) -> None:
         if self.checking or self.busy:
             return
@@ -4658,6 +4697,15 @@ class BypassPanel(Panel):
         self.online = True
         self._offline_noted = False
         self.state = state if isinstance(state, dict) else {}
+        rescan = self.state.get("proxyfyre_rescan")
+        if isinstance(rescan, dict):
+            apps = ", ".join(map(str, rescan.get("apps") or []))
+            if rescan.get("ok"):
+                self.append_log(self.log_box,
+                                f"ProxiFyre: подхвачены новые процессы ({apps})", "ok")
+            else:
+                self.append_log(self.log_box,
+                                "ProxiFyre: не удалось подхватить новые процессы", "error")
         self._update_controls()
 
     def _state_off(self, exc: Exception) -> None:
@@ -4700,17 +4748,14 @@ class BypassPanel(Panel):
                 OK if on else (MUTED if installed else WARN)
             ))
 
-        # область обхода
-        self.scope_control.set_enabled(self.mode == "happ" and not self.busy)
+        # область обхода — это поведение Happ, движки друг другу не мешают
+        self.scope_control.set_enabled(not self.busy)
         self.scope_control.set_value(self.scope)
-        if self.mode != "happ":
+        if self.scope == "apps":
             self.scope_hint.configure(
-                text="GoodbyeDPI правит пакеты и не различает процессы — только весь трафик."
-            )
-        elif self.scope == "apps":
-            self.scope_hint.configure(
-                text="Выбранные программы идут через Happ, остальные — напрямую. "
-                     "Программу, открытую до включения обхода, перезапустите."
+                text="Выбранные программы идут через Happ, остальной трафик — "
+                     "напрямую или через GoodbyeDPI. Программу, открытую до "
+                     "включения обхода, перезапустите."
             )
         else:
             self.scope_hint.configure(
@@ -4718,7 +4763,7 @@ class BypassPanel(Panel):
             )
 
         # секция программ
-        show_apps = self.mode == "happ" and self.scope == "apps"
+        show_apps = self.scope == "apps"
         if show_apps:
             if not self.apps_card.winfo_manager():
                 self.apps_card.grid(row=3, column=0, sticky="nsew", pady=(px(10), 0))
@@ -4735,6 +4780,7 @@ class BypassPanel(Panel):
         self.btn_show_happ.configure(state="disabled" if self.busy else "normal")
         self.btn_refresh.configure(
             state="disabled" if self.busy or self.checking else "normal")
+        self.btn_catch.configure(state="disabled" if self.busy else "normal")
         gbd_installed = bool(gbd.get("installed"))
         self.btn_download.configure(state="disabled" if self.busy else "normal")
         if gbd_installed:
@@ -4766,7 +4812,8 @@ class BypassPanel(Panel):
         if not installed:
             return "не скачан"
         if engine.get("on"):
-            return f"● работает{pid_text}"
+            where = " для остального трафика" if self.scope == "apps" else ""
+            return f"● работает{where}{pid_text}"
         return "○ готов к запуску"
 
     def _status_text(self) -> tuple[str, str, str]:
@@ -4774,16 +4821,12 @@ class BypassPanel(Panel):
         gbd = self.state.get("gbd") or {}
         proxyfyre = self.state.get("proxyfyre") or {}
         port = happ.get("socks_port") or HAPP_SOCKS_DEFAULT
-
-        if self.mode == "gbd":
-            if gbd.get("on"):
-                return ("GoodbyeDPI работает", f"обход DPI для всего трафика · PID "
-                        f"{', '.join(map(str, gbd.get('pids') or []))}", OK)
-            return ("GoodbyeDPI выключен", "обход для всего интернета · нужен запуск",
-                    MUTED)
+        happ_on = bool(happ.get("connected"))
+        gbd_on = bool(gbd.get("on"))
+        gbd_pids = ", ".join(map(str, gbd.get("pids") or []))
 
         if self.scope == "apps":
-            if happ.get("connected") and proxyfyre.get("running"):
+            if happ_on and proxyfyre.get("running"):
                 if not happ.get("socks_ok"):
                     return (
                         "ProxiFyre работает, но SOCKS Happ не отвечает",
@@ -4804,15 +4847,21 @@ class BypassPanel(Panel):
                         "список программ изменён — применяю настройки…",
                         WARN,
                     )
+                count = len(proxyfyre.get("apps") or [])
+                if gbd_on:
+                    return (
+                        "Happ — выбранные программы, GoodbyeDPI — остальное",
+                        f"{count} программ через SOCKS 127.0.0.1:{port} · "
+                        f"остальной трафик правит DPI"
+                        + (f" · PID {gbd_pids}" if gbd_pids else ""),
+                        OK,
+                    )
                 return (
                     "Обход по программам включён",
-                    f"{len(proxyfyre.get('apps') or [])} программ через "
+                    f"{count} программ через "
                     f"SOCKS 127.0.0.1:{port} · остальные напрямую",
                     OK,
                 )
-            if happ.get("connected"):
-                return ("Happ подключён, обход по программам выключен",
-                        "включите переключатель Happ или отметьте программы", MUTED)
             if proxyfyre.get("running"):
                 return (
                     "Happ выключен, а перенаправление осталось включённым",
@@ -4820,21 +4869,32 @@ class BypassPanel(Panel):
                     "или выключите обход по программам",
                     WARN,
                 )
-            if gbd.get("on"):
-                return ("Работает GoodbyeDPI",
-                        "обход по программам выключен: два движка одновременно не работают",
-                        WARN)
+            if gbd_on:
+                return (
+                    "GoodbyeDPI работает, Happ выключен",
+                    "весь трафик правит DPI · обход по программам не включён — "
+                    "включите Happ для выбранных программ",
+                    MUTED,
+                )
             return ("Обход по программам выключен",
                     "Happ не подключён — включите переключатель Happ", MUTED)
 
-        if happ.get("connected"):
+        if happ_on and gbd_on:
+            return (
+                "Весь трафик через Happ, GoodbyeDPI тоже включён",
+                "туннель забирает весь трафик — GoodbyeDPI здесь ничего не "
+                "добавляет. Для разных программ выберите «Только программы».",
+                WARN,
+            )
+        if happ_on:
             return ("Весь трафик через Happ", f"TUN: "
                     f"{'включён' if happ.get('tun') else 'выключен'} · "
                     f"системный прокси: {'да' if (happ.get('mode') or {}).get('system_proxy') else 'нет'}",
                     OK)
-        if gbd.get("on"):
+        if gbd_on:
             return ("Работает GoodbyeDPI",
-                    "Happ выключен: два движка одновременно не работают", WARN)
+                    f"обход DPI для всего трафика" + (f" · PID {gbd_pids}" if gbd_pids else ""),
+                    OK)
         return ("Весь трафик через Happ выключен", "включите переключатель Happ", MUTED)
 
     # -- действия ------------------------------------------------------------ #
@@ -6080,11 +6140,7 @@ class Hub(tk.Tk):
             font=("Segoe UI", 8),
             anchor="w",
         ).pack(fill="x")
-        if not admin:
-            flat_button(
-                bottom, "Запустить от администратора",
-                lambda: self.request_admin(), kind="ghost", padx=px(8), pady=px(6),
-            ).pack(fill="x", pady=(px(8), 0))
+# admin button removed
         tk.Label(
             bottom,
             text=f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
@@ -6256,6 +6312,11 @@ def main() -> int:
     if HAS_DEPS:
         pyautogui.PAUSE = 0
         pyautogui.FAILSAFE = True
+
+    # Собранный Tools.exe запрашивает права манифестом. Исходник запускаем
+    # обычным процессом: иначе двойной клик сначала закрывает pythonw, а затем
+    # ждёт UAC-перезапуска, из-за чего кажется, что tools.pyw не открывается.
+    # Для конкретных действий права запрашиваются через ensure_admin().
 
     hub = Hub(initial_tab=args.tab)
     hub.mainloop()

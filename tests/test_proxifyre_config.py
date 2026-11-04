@@ -101,6 +101,17 @@ class ProxiFyreConfigTest(unittest.TestCase):
                 app.proxifyre_start(["chrome.exe"], 10808)
         self.assertIn("ndisrd", str(ctx.exception))
 
+    def test_advapi_ready_flag_defined(self) -> None:
+        # Раньше флаг не был объявлен: NameError глотался в _svc_state, и панель
+        # считала, что служба и драйвер не установлены.
+        self.assertIsNotNone(app._advapi())
+        self.assertTrue(app._ADVAPI_READY)
+
+    def test_svc_state_reads_real_service(self) -> None:
+        if app.sys.platform != "win32":
+            self.skipTest("только Windows")
+        self.assertIsNotNone(app._svc_state("RpcSs"))
+
     def test_stop_without_service(self) -> None:
         with mock.patch.object(app, "_svc_state", lambda name: None):
             self.assertEqual(app.proxifyre_stop()["detail"], "")
