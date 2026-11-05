@@ -141,10 +141,18 @@ def load_settings(path) -> dict:
 
 
 def save_settings(path, settings: dict) -> None:
+    p = Path(path)
     try:
-        Path(path).write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        text = json.dumps(settings, ensure_ascii=False, indent=1)
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(p)
     except OSError:
-        pass
+        try:
+            p.write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError:
+            pass
 
 
 class MailState:

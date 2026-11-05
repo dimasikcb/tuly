@@ -6274,7 +6274,7 @@ class Hub(tk.Tk):
         self.status_var = tk.StringVar(value="Готово")
         tk.Label(status_bar, textvariable=self.status_var, bg="#0f1115", fg=MUTED,
                  font=("Segoe UI", 8), anchor="w").pack(side="left", padx=px(14))
-        tk.Label(status_bar, text="Ctrl+1…6 — переключение разделов", bg="#0f1115",
+        tk.Label(status_bar, text="Ctrl+1…7 — переключение разделов", bg="#0f1115",
                  fg="#5f6773", font=("Segoe UI", 8), anchor="e").pack(side="right", padx=px(14))
 
         head = tk.Frame(main, bg=BG)

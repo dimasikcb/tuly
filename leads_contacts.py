@@ -25,7 +25,9 @@ def num(value, default: float = 0.0) -> float:
 
 
 def phone_to_e164(phone: str) -> str:
-    digits = re.sub(r"[^\d+]", "", str(phone).strip())
+    digits = re.sub(r"[^\d+]", "", str(phone or "").strip())
+    if not digits or digits == "+":
+        return ""
     if digits.startswith("+"):
         return digits
     if len(digits) == 11 and digits[0] in "78":

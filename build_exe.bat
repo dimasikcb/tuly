@@ -21,7 +21,7 @@ if errorlevel 1 (
 if exist "build\out\Tools.exe" del /q "build\out\Tools.exe" >nul 2>&1
 
 echo  Building. This can take a few minutes...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name Tools --distpath build\out --workpath build --specpath build --exclude-module matplotlib --exclude-module pandas --exclude-module scipy --exclude-module PyQt5 --exclude-module PySide6 --hidden-import telethon --hidden-import telethon.sync --hidden-import vk_api tools.pyw
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name Tools --distpath build\out --workpath build --specpath build --exclude-module matplotlib --exclude-module pandas --exclude-module scipy --exclude-module PyQt5 --exclude-module PySide6 --hidden-import telethon --hidden-import telethon.sync --hidden-import vk_api --hidden-import winbase --hidden-import bypass_core --hidden-import apps_catalog --hidden-import leads_contacts --hidden-import leads_pool --hidden-import leads_mail --hidden-import leads2gis tools.pyw
 if errorlevel 1 goto failed
 if not exist "build\out\Tools.exe" goto failed
 
