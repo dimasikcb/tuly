@@ -4775,11 +4775,15 @@ class BypassPanel(Panel):
                 what.append("системный прокси")
             if leak.get("cores"):
                 what.append("ядро Happ")
-            if what:
+            current_leak = tuple(what)
+            if current_leak and current_leak != getattr(self, "_last_leak_noted", None):
+                self._last_leak_noted = current_leak
                 self.append_log(self.log_box,
                                 "⚠ Внимание: обнаружена утечка трафика — "
                                 + ", ".join(what) + " активен даже при выключенном обходе. "
                                 + "Проверьте, что Happ выключен.", "warn")
+            elif not current_leak:
+                self._last_leak_noted = None
         self._update_controls()
 
     def _state_off(self, exc: Exception) -> None:

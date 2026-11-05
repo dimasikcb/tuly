@@ -355,6 +355,43 @@ def happ_connected(images: set[str] | None = None) -> bool:
     )
 
 
+def reset_tcp_connections(target_port: int) -> int:
+    """Сбрасывает установленные TCP-соединения с локальным портом (например, 10808).
+
+    Предотвращает сохранение открытых keepalive/QUIC сокетов браузера (YouTube)
+    после выключения обхода.
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        iphlpapi = ctypes.windll.iphlpapi
+        size = ctypes.c_ulong(0)
+        iphlpapi.GetTcpTable(None, ctypes.byref(size), False)
+        if size.value == 0:
+            return 0
+        buf = (ctypes.c_char * size.value)()
+        if iphlpapi.GetTcpTable(buf, ctypes.byref(size), False) != 0:
+            return 0
+        import struct
+        num_entries = struct.unpack_from("=I", buf, 0)[0]
+        row_size = 20
+        offset = 4
+        closed = 0
+        MIB_TCP_STATE_DELETE_TCB = 12
+        for _ in range(num_entries):
+            state, laddr, lport, raddr, rport = struct.unpack_from("=IIIII", buf, offset)
+            local_p = socket.ntohs(lport & 0xFFFF)
+            remote_p = socket.ntohs(rport & 0xFFFF)
+            if local_p == target_port or remote_p == target_port:
+                new_row = struct.pack("=IIIII", MIB_TCP_STATE_DELETE_TCB, laddr, lport, raddr, rport)
+                if iphlpapi.SetTcpEntry(new_row) == 0:
+                    closed += 1
+            offset += row_size
+        return closed
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def happ_send(command: str) -> bool:
     """Отправить команду Happ через зарегистрированную схему happ:// (connect/disconnect/open)."""
     url = command if "://" in command else "happ://" + command
@@ -413,6 +450,7 @@ def bypass_status(_timeout: float = 1.5) -> dict:
     # запустил выбранную программу позже, перезапускаем службу автоматически,
     # чтобы она тоже попала под перенаправление.
     result["proxyfyre"] = proxifyre_status()
+    result["proxifyre"] = result["proxyfyre"]
     result["proxyfyre_rescan"] = rescan
     result["scope"] = cfg["scope"]
     result["apps"] = cfg["apps"]
@@ -426,7 +464,8 @@ def bypass_status(_timeout: float = 1.5) -> dict:
 def _bypass_leak_diagnosis(scope: str) -> dict:
     """Проверяет, не остаётся ли после выключения обхода перехват трафика."""
     happ_on = happ_connected()
-    cores_leak = bool(not happ_on and (_image_pids("xray.exe") or _image_pids("sing-box.exe")))
+    happ_app_running = bool(_image_pids(Path(bypass_cfg()["happ_path"]).name))
+    cores_leak = bool(not happ_app_running and (_image_pids("xray.exe") or _image_pids("sing-box.exe")))
     tun_leak = bool(happ_tun_active() and (scope == "apps" or not happ_on))
     enable, server = happ_system_proxy()
     proxy_leak = bool(enable and ("127.0.0.1" in server or "localhost" in server or "::1" in server)
@@ -535,6 +574,10 @@ def bypass_stop(key: str) -> dict:
                 run_tool(["taskkill", "/F", "/IM", core_proc], timeout=5)
             except Exception:
                 pass
+        try:
+            reset_tcp_connections(happ_socks_port())
+        except Exception:
+            pass
         try:
             run_tool(["ipconfig", "/flushdns"], timeout=5)
         except Exception:
@@ -1487,9 +1530,10 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
 
         # Запуск/перезапуск туннеля Happ
         happ_pids = _image_pids(Path(cfg["happ_path"]).name)
+        need_restart = settings_changed or (not want_tun and happ_tun_active())
         if not happ_connected():
             add(bypass_happ_start())
-        elif settings_changed and happ_pids:
+        elif need_restart and happ_pids:
             add(happ_tunnel_restart())
 
         # Управление ProxiFyre

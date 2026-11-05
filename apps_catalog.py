@@ -75,6 +75,14 @@ APP_COMPANIONS: dict[str, list[str]] = {
         "workbuddy-editor-sdk-supervisor.exe",
         "node.exe",
     ],
+    "workbuddy.exe": [
+        "editor_sdk.exe",
+        "betterleaks.exe",
+        "sandbox-center.exe",
+        "sandbox-cli.exe",
+        "workbuddy-editor-sdk-supervisor.exe",
+        "node.exe",
+    ],
     "cursor.exe": ["cursor-server.exe", "node.exe"],
     "code.exe": ["node.exe"],
 }
@@ -371,7 +379,7 @@ def app_catalog(running_paths=None, registry_paths=None,
                 else:
                     entries[parent_key] = AppEntry(
                         exe=parent, name=pretty_app_name(parent, path),
-                        path=path, running=True, source="running",
+                        path="", running=True, source="running",
                     )
             continue
         entries[key_of(path)] = AppEntry(
