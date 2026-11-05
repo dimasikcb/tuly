@@ -767,13 +767,18 @@ class Store:
 
     def _load_ids(self) -> set[str]:
         ids: set[str] = set()
-        try:
-            with self.path.open(encoding="utf-8-sig", newline="") as fh:
-                for row in csv.DictReader(fh):
-                    if row.get("id"):
-                        ids.add(row["id"])
-        except (OSError, csv.Error):
-            pass
+        for attempt in range(5):
+            try:
+                with self.path.open(encoding="utf-8-sig", newline="") as fh:
+                    for row in csv.DictReader(fh):
+                        if row.get("id"):
+                            ids.add(row["id"])
+                break
+            except (PermissionError, OSError):
+                if attempt < 4:
+                    time.sleep(0.15)
+            except csv.Error:
+                break
         return ids
 
     def __enter__(self) -> "Store":

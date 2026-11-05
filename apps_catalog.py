@@ -254,12 +254,19 @@ def running_processes() -> list[tuple[int, str]]:
             ctypes.POINTER(ctypes.c_ulong),
         ]
         count = 2048
-        buffer = (ctypes.c_ulong * count)()
-        needed = ctypes.c_ulong()
-        if not psapi.EnumProcesses(buffer, ctypes.sizeof(buffer), ctypes.byref(needed)):
-            return []
+        while True:
+            buffer = (ctypes.c_ulong * count)()
+            needed = ctypes.c_ulong()
+            if not psapi.EnumProcesses(buffer, ctypes.sizeof(buffer), ctypes.byref(needed)):
+                return []
+            if needed.value < ctypes.sizeof(buffer):
+                break
+            count *= 2
+
         total = min(count, needed.value // ctypes.sizeof(ctypes.c_ulong))
         paths: list[tuple[int, str]] = []
+        name_buffer = ctypes.create_unicode_buffer(4096)
+        size = ctypes.c_ulong(len(name_buffer))
         for index in range(total):
             pid = int(buffer[index])
             if not pid:
@@ -268,13 +275,13 @@ def running_processes() -> list[tuple[int, str]]:
             if not handle:
                 continue
             try:
-                name_buffer = ctypes.create_unicode_buffer(32768)
-                size = ctypes.c_ulong(len(name_buffer))
+                size.value = len(name_buffer)
                 if kernel32.QueryFullProcessImageNameW(
                     handle, 0, name_buffer, ctypes.byref(size)
                 ):
-                    if name_buffer.value:
-                        paths.append((pid, name_buffer.value))
+                    val = name_buffer.value
+                    if val:
+                        paths.append((pid, val))
             finally:
                 kernel32.CloseHandle(handle)
         return paths

@@ -28,9 +28,11 @@ from __future__ import annotations
 import asyncio
 import imaplib
 import json
+import os
 import random
 import re
 import smtplib
+import socket
 import threading
 import time
 from datetime import datetime, timedelta
@@ -133,10 +135,22 @@ DEFAULT_SETTINGS = {
 
 def load_settings(path) -> dict:
     data = dict(DEFAULT_SETTINGS)
-    try:
-        data.update(json.loads(Path(path).read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        pass
+    p = Path(path)
+    if not p.exists():
+        return data
+    content = ""
+    for attempt in range(3):
+        try:
+            content = p.read_text(encoding="utf-8")
+            break
+        except OSError:
+            if attempt < 2:
+                time.sleep(0.1)
+    if content:
+        try:
+            data.update(json.loads(content))
+        except (ValueError, json.JSONDecodeError):
+            pass
     return data
 
 
@@ -144,15 +158,19 @@ def save_settings(path, settings: dict) -> None:
     p = Path(path)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
         text = json.dumps(settings, ensure_ascii=False, indent=1)
         tmp.write_text(text, encoding="utf-8")
-        tmp.replace(p)
+        for attempt in range(5):
+            try:
+                tmp.replace(p)
+                return
+            except OSError:
+                if attempt < 4:
+                    time.sleep(0.1)
+        p.write_text(text, encoding="utf-8")
     except OSError:
-        try:
-            p.write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
-        except OSError:
-            pass
+        pass
 
 
 class MailState:
@@ -160,10 +178,32 @@ class MailState:
 
     def __init__(self, path) -> None:
         self.path = Path(path)
-        try:
-            self.data: dict = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            self.data = {}
+        self.data: dict = {}
+        if not self.path.exists():
+            return
+        content = ""
+        for attempt in range(3):
+            try:
+                content = self.path.read_text(encoding="utf-8")
+                break
+            except OSError:
+                if attempt < 2:
+                    time.sleep(0.1)
+        if content:
+            try:
+                self.data = json.loads(content)
+                return
+            except (ValueError, json.JSONDecodeError):
+                pass
+        # Восстановление из .tmp при повреждении основного файла
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        if not tmp.exists():
+            tmp = self.path.with_suffix(".tmp")
+        if tmp.exists():
+            try:
+                self.data = json.loads(tmp.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                self.data = {}
 
     def get(self, lead_id) -> dict:
         return self.data.setdefault(str(lead_id), {})
@@ -171,9 +211,17 @@ class MailState:
     def save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
+            tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+            text = json.dumps(self.data, ensure_ascii=False, indent=1)
+            tmp.write_text(text, encoding="utf-8")
+            for attempt in range(5):
+                try:
+                    tmp.replace(self.path)
+                    return
+                except OSError:
+                    if attempt < 4:
+                        time.sleep(0.1)
+            self.path.write_text(text, encoding="utf-8")
         except OSError:
             pass
 
@@ -202,6 +250,7 @@ def fallback_text(row: dict, idea: str) -> str:
 
 def ai_generate(settings: dict, row: dict, idea: str) -> str:
     """Один запрос к OpenAI-совместимому API (OpenRouter / Groq / Ollama и т.п.)."""
+    import urllib.error
     import urllib.request
 
     base = (settings.get("ai_url") or "").rstrip("/")
@@ -242,33 +291,70 @@ def ai_generate(settings: dict, row: dict, idea: str) -> str:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode("utf-8", "ignore"))
-    return (data["choices"][0]["message"]["content"] or "").strip()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"ИИ API ошибка {exc.code}: {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"ИИ API недоступен: {exc.reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError("ИИ API: таймаут запроса") from exc
+
+    choices = data.get("choices")
+    if not choices or not isinstance(choices, list):
+        msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else "пустой ответ модели"
+        raise RuntimeError(f"ИИ API: {msg}")
+    return (choices[0].get("message", {}).get("content") or "").strip()
 
 
 def _send_email(settings: dict, to: str, text: str) -> None:
-    host = settings.get("smtp_host") or ""
-    user = settings.get("smtp_user") or ""
+    host = (settings.get("smtp_host") or "").strip()
+    user = (settings.get("smtp_user") or "").strip()
     pwd = settings.get("smtp_pass") or ""
-    if not (host and user and pwd and to):
-        raise RuntimeError("SMTP не настроен (host/user/pass)")
-    port = int(settings.get("smtp_port") or 465)
-    frm = settings.get("smtp_from") or user
+    to_clean = str(to or "").strip()
+    if to_clean.lower().startswith("mailto:"):
+        to_clean = to_clean[7:].strip()
+    if not (host and user and pwd and to_clean):
+        raise RuntimeError("SMTP не настроен (host/user/pass или пустой email)")
+    if "@" not in to_clean or "." not in to_clean.split("@")[-1]:
+        raise RuntimeError(f"SMTP: некорректный email получателя '{to_clean}'")
+
+    try:
+        port = int(str(settings.get("smtp_port") or "465").strip() or 465)
+    except (TypeError, ValueError):
+        port = 465
+
+    frm = (settings.get("smtp_from") or "").strip() or user
     msg = EmailMessage()
     msg["From"] = frm
-    msg["To"] = to
+    msg["To"] = to_clean
     msg["Subject"] = settings.get("mail_subject") or "Предложение"
     msg.set_content(text)
-    if port == 465:
-        with smtplib.SMTP_SSL(host, port, timeout=30) as srv:
-            srv.login(user, pwd)
-            srv.send_message(msg)
-    else:
-        with smtplib.SMTP(host, port, timeout=30) as srv:
-            srv.starttls()
-            srv.login(user, pwd)
-            srv.send_message(msg)
+
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=30) as srv:
+                srv.login(user, pwd)
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as srv:
+                try:
+                    srv.starttls()
+                except smtplib.SMTPNotSupportedError:
+                    pass
+                srv.login(user, pwd)
+                srv.send_message(msg)
+    except smtplib.SMTPAuthenticationError as exc:
+        raise RuntimeError(f"SMTP: ошибка авторизации ({exc.smtp_code}: {exc.smtp_error})") from exc
+    except smtplib.SMTPConnectError as exc:
+        raise RuntimeError(f"SMTP: не удалось подключиться к серверу {host}:{port}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(f"SMTP: таймаут подключения к {host}:{port}") from exc
+    except smtplib.SMTPException as exc:
+        raise RuntimeError(f"SMTP ошибка отправки: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"SMTP сетевая ошибка: {exc}") from exc
 
 
 def _ensure_loop() -> None:
@@ -287,9 +373,15 @@ def _tg_session_path(settings: dict) -> str:
 
 def _tg_call(settings: dict, fn):
     """Единая точка входа в Telegram: loop на поток, lock на сессию, connect/disconnect."""
-    from telethon.sync import TelegramClient
+    try:
+        from telethon.sync import TelegramClient
+    except ImportError:
+        raise RuntimeError("Telegram: библиотека telethon не установлена (pip install telethon)")
 
-    api_id = int(str(settings.get("api_id") or "0").strip() or 0)
+    try:
+        api_id = int(str(settings.get("api_id") or "0").strip() or 0)
+    except ValueError:
+        api_id = 0
     api_hash = (settings.get("api_hash") or "").strip()
     if not (api_id and api_hash):
         raise RuntimeError("Telegram: заполни api_id и api_hash")
@@ -297,8 +389,8 @@ def _tg_call(settings: dict, fn):
     with TG_LOCK:
         _ensure_loop()
         client = TelegramClient(_tg_session_path(settings), api_id, api_hash)
-        client.connect()
         try:
+            client.connect()
             if not client.is_user_authorized():
                 raise RuntimeError("Telegram: сначала нажми «Войти в TG» в настройках")
             return fn(client)
@@ -313,16 +405,20 @@ def _tg_send(client, contact: str, kind: str, text: str) -> dict:
     from telethon.tl.functions.contacts import ImportContactsRequest
     from telethon.tl.types import InputPhoneContact
 
+    contact_clean = str(contact or "").strip()
+    if not contact_clean:
+        raise RuntimeError("TG: пустой контакт")
+
     if kind == "phone":
         res = client(ImportContactsRequest([
-            InputPhoneContact(client_id=0, phone=contact, first_name="lead", last_name=""),
+            InputPhoneContact(client_id=0, phone=contact_clean, first_name="lead", last_name=""),
         ]))
         users = [u for u in (getattr(res, "users", None) or []) if getattr(u, "id", None)]
         if not users:
-            raise RuntimeError(f"TG: телефон {contact} не зарегистрирован в Telegram")
+            raise RuntimeError(f"TG: телефон {contact_clean} не зарегистрирован в Telegram")
         entity = users[0]
     else:
-        entity = client.get_entity(contact)
+        entity = client.get_entity(contact_clean.lstrip("@"))
 
     sent = client.send_message(entity, text)
     if isinstance(sent, (list, tuple)):
@@ -338,16 +434,17 @@ def tg_send(settings: dict, contact: str, kind: str, text: str) -> dict:
 
 
 def tg_login(settings: dict, phone: str, ask=None, on_log=None) -> None:
-    """Вход в TG. `ask(заголовок, вопрос, secret=False)` спрашивает код и 2FA.
+    """Вход в TG. `ask(заголовок, вопрос, secret=False)` спрашивает код и 2FA."""
+    try:
+        from telethon.errors import SessionPasswordNeededError
+        from telethon.sync import TelegramClient
+    except ImportError:
+        raise RuntimeError("Telegram: библиотека telethon не установлена (pip install telethon)")
 
-    Раньше функция звала tkinter.simpledialog напрямую, и модуль рассылки тянул
-    GUI. Теперь диалог передаёт вызывающая сторона (в приложении — MailWindow),
-    поэтому здесь нет ни одного импорта графической библиотеки.
-    """
-    from telethon.errors import SessionPasswordNeededError
-    from telethon.sync import TelegramClient
-
-    api_id = int(str(settings.get("api_id") or "0").strip() or 0)
+    try:
+        api_id = int(str(settings.get("api_id") or "0").strip() or 0)
+    except ValueError:
+        api_id = 0
     api_hash = (settings.get("api_hash") or "").strip()
     phone = (phone or "").strip()
     if not (api_id and api_hash and phone):
@@ -358,8 +455,8 @@ def tg_login(settings: dict, phone: str, ask=None, on_log=None) -> None:
     with TG_LOCK:
         _ensure_loop()
         client = TelegramClient(_tg_session_path(settings), api_id, api_hash)
-        client.connect()
         try:
+            client.connect()
             if client.is_user_authorized():
                 if on_log:
                     on_log("TG: аккаунт уже привязан", "ok")
@@ -386,9 +483,15 @@ def tg_login(settings: dict, phone: str, ask=None, on_log=None) -> None:
 
 def tg_logout(settings: dict) -> str:
     """Удаляет файл сессии. Возвращает строку для лога."""
-    from telethon.sync import TelegramClient
+    try:
+        from telethon.sync import TelegramClient
+    except ImportError:
+        return "TG: telethon не установлен"
 
-    api_id = int(str(settings.get("api_id") or "0").strip() or 0)
+    try:
+        api_id = int(str(settings.get("api_id") or "0").strip() or 0)
+    except ValueError:
+        api_id = 0
     api_hash = (settings.get("api_hash") or "").strip()
     if not (api_id and api_hash):
         return "TG: нет api_id/api_hash"
@@ -420,15 +523,24 @@ class VKClient:
             import vk_api
         except ImportError:
             raise RuntimeError("нет vk-api: pip install vk-api>=11.9.9")
-        if not token:
+        token_clean = (token or "").strip()
+        if not token_clean:
             raise RuntimeError("нет VK token")
-        self.vk = vk_api.VkApi(token=token).get_api()
+        self.vk = vk_api.VkApi(token=token_clean).get_api()
 
     def peer_id(self, screen: str) -> int:
         """'company' -> -123456 для группы, 'id123' -> 123 для профиля."""
-        screen = str(screen).strip()
+        screen = str(screen).strip().lstrip("@")
+        if not screen:
+            raise RuntimeError("VK: пустой контакт")
         if re.fullmatch(r"-?\d+", screen):
             return int(screen)
+        if screen.startswith("id") and screen[2:].isdigit():
+            return int(screen[2:])
+        if screen.startswith("club") and screen[4:].isdigit():
+            return -int(screen[4:])
+        if screen.startswith("public") and screen[6:].isdigit():
+            return -int(screen[6:])
         res = self.vk.utils.resolveScreenName(screen_name=screen)
         if not res:
             raise RuntimeError(f"VK: не найден {screen}")
@@ -436,9 +548,17 @@ class VKClient:
         return -oid if res.get("type") == "group" else oid
 
     def send(self, screen: str, text: str) -> dict:
+        import vk_api.exceptions
         pid = self.peer_id(screen)
-        resp = self.vk.messages.send(
-            peer_id=pid, message=text, random_id=random.randint(1, 2**31))
+        try:
+            resp = self.vk.messages.send(
+                peer_id=pid, message=text, random_id=random.randint(1, 2**31))
+        except vk_api.exceptions.ApiError as exc:
+            if exc.code in (901, 902):
+                raise RuntimeError(f"VK: закрыты личные сообщения у {screen} (ошибка {exc.code})") from exc
+            if exc.code == 5:
+                raise RuntimeError("VK: неверный или истекший токен (ошибка 5)") from exc
+            raise RuntimeError(f"VK API ошибка {exc.code}: {getattr(exc, 'error', {}).get('error_msg', exc)}") from exc
         msg_id = resp if isinstance(resp, int) else (resp or {}).get("last_message_id")
         if msg_id is None:
             raise RuntimeError("VK: не получил id отправленного сообщения")
@@ -479,24 +599,35 @@ class VKClient:
 
 
 def _send_max(settings: dict, target: str, text: str) -> None:
+    import urllib.error
     import urllib.request
 
-    url = settings.get("max_url") or ""
-    token = settings.get("max_token") or ""
+    url = (settings.get("max_url") or "").strip()
+    token = (settings.get("max_token") or "").strip()
+    target_clean = str(target or "").strip()
     if not (url and token):
         raise RuntimeError("MAX API не настроен (url/token)")
-    payload = json.dumps({"to": target, "text": text}).encode()
+    if not target_clean:
+        raise RuntimeError("MAX: пустой получатель")
+    payload = json.dumps({"to": target_clean, "text": text}).encode()
     req = urllib.request.Request(
         url, data=payload,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"MAX API ошибка {exc.code}: {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"MAX API недоступен: {exc.reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError("MAX API: таймаут запроса") from exc
 
 
 def _vk_client(settings: dict) -> VKClient:
-    token = settings.get("vk_token") or ""
+    token = (settings.get("vk_token") or "").strip()
     with _CLIENTS_LOCK:
         client = _CLIENTS.get(("vk", token))
         if client is None:
@@ -820,18 +951,24 @@ class Poller:
 
     # -- Почта ------------------------------------------------------------- #
     def _poll_email(self) -> None:
-        host = self.settings.get("smtp_host") or ""
-        user = self.settings.get("smtp_user") or ""
+        host = (self.settings.get("smtp_host") or "").strip()
+        user = (self.settings.get("smtp_user") or "").strip()
         pwd = self.settings.get("smtp_pass") or ""
         if not (host and user and pwd):
             return
+
+        imap_host = (self.settings.get("imap_host") or "").strip()
+        if not imap_host:
+            imap_host = host.replace("smtp.", "imap.", 1) if "smtp." in host else host
+
         conn = None
         try:
-            conn = imaplib.IMAP4_SSL(host)
+            conn = imaplib.IMAP4_SSL(imap_host, timeout=20)
             conn.login(user, pwd)
             conn.select("INBOX")
             _, ids = conn.search(None, "UNSEEN")
-            for num in (ids[0].split() if ids and ids[0] else []):
+            id_list = ids[0].split() if ids and ids[0] else []
+            for num in id_list[-30:]:
                 _, parts = conn.fetch(num, "(RFC822)")
                 if not parts or not parts[0]:
                     continue
@@ -840,8 +977,11 @@ class Poller:
                 match = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", sender)
                 if not match:
                     continue
-                row = next((r for r in self.leads
-                            if str(r.get("email") or "").lower() == match.group(0).lower()), None)
+                sender_email = match.group(0).lower()
+                row = next((
+                    r for r in self.leads
+                    if str(r.get("email") or "").lower().replace("mailto:", "").strip() == sender_email
+                ), None)
                 if not row:
                     continue
                 body = ""

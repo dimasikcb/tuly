@@ -25,15 +25,16 @@ def num(value, default: float = 0.0) -> float:
 
 
 def phone_to_e164(phone: str) -> str:
-    digits = re.sub(r"[^\d+]", "", str(phone or "").strip())
-    if not digits or digits == "+":
+    raw = str(phone or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
         return ""
-    if digits.startswith("+"):
-        return digits
     if len(digits) == 11 and digits[0] in "78":
         return "+7" + digits[1:]
     if len(digits) == 10:
         return "+7" + digits
+    if raw.startswith("+"):
+        return "+" + digits
     return "+" + digits
 
 
@@ -46,7 +47,7 @@ def is_phone_like(value: str) -> bool:
 
 def pick_contact(row: dict, channel: str) -> str:
     """Контакт канала: прямое поле, иначе запись вида «telegram:ник» в messengers."""
-    direct = str(row.get(channel) or "").strip()
+    direct = str(row.get(channel) or row.get(f"{channel}_url") or "").strip()
     if direct:
         return direct
     raw = row.get("messengers") or ""
@@ -65,14 +66,29 @@ def to_link(channel: str, value) -> str:
         return ""
     if value.lower().startswith(("http://", "https://", "mailto:")):
         return value
+    if value.startswith("//"):
+        return "https:" + value
+
+    low = value.lower()
     if channel == "telegram":
         if is_phone_like(value):
             return "https://t.me/+" + re.sub(r"\D", "", value)  # диплинк по номеру
-        return "https://t.me/" + value.lstrip("@").strip("/")
+        clean = value
+        for prefix in ("telegram.me/", "t.me/"):
+            if low.startswith(prefix):
+                clean = value[len(prefix):]
+                break
+        return "https://t.me/" + clean.lstrip("@").strip("/")
     if channel == "max":
-        return "https://max.ru/" + value.lstrip("@").strip("/")
+        clean = value[7:] if low.startswith("max.ru/") else value
+        return "https://max.ru/" + clean.lstrip("@").strip("/")
     if channel == "vk":
-        return "https://vk.com/" + value.strip("/")
+        clean = value
+        for prefix in ("vk.com/", "vk.ru/"):
+            if low.startswith(prefix):
+                clean = value[len(prefix):]
+                break
+        return "https://vk.com/" + clean.lstrip("@").strip("/")
     if channel == "email":
         return "mailto:" + value
     return ""
@@ -83,16 +99,29 @@ def from_link(channel: str, value) -> str:
     value = str(value or "").strip()
     if not value:
         return ""
-    low = value.lower()
-    if channel == "telegram" and "t.me/" in low:
-        return value[low.index("t.me/") + 5:].strip("/")
-    if channel == "max" and "max.ru/" in low:
-        return value[low.index("max.ru/") + 7:].strip("/")
-    if channel == "vk" and "vk.com/" in low:
-        return value[low.index("vk.com/") + 6:].strip("/")
+    # Отрезаем query-параметры (?ref=...) и якори (#anchor)
+    value_clean = value.split("?")[0].split("#")[0].strip()
+    low = value_clean.lower()
+    if channel == "telegram":
+        for prefix in ("telegram.me/", "t.me/"):
+            if prefix in low:
+                idx = low.index(prefix) + len(prefix)
+                return value_clean[idx:].lstrip("@").strip("/")
+        return value_clean.lstrip("@").strip("/")
+    if channel == "max":
+        if "max.ru/" in low:
+            idx = low.index("max.ru/") + 7
+            return value_clean[idx:].lstrip("@").strip("/")
+        return value_clean.lstrip("@").strip("/")
+    if channel == "vk":
+        for prefix in ("vk.com/", "vk.ru/"):
+            if prefix in low:
+                idx = low.index(prefix) + len(prefix)
+                return value_clean[idx:].lstrip("@").strip("/")
+        return value_clean.lstrip("@").strip("/")
     if channel == "email" and low.startswith("mailto:"):
-        return value[7:].strip()
-    return value
+        return value_clean[7:].strip()
+    return value_clean
 
 
 def channels_of(row: dict) -> dict:
@@ -172,6 +201,8 @@ def format_phone(phone) -> str:
     digits = re.sub(r"\D", "", str(phone or ""))
     if len(digits) == 11 and digits[0] in "78":
         return f"+7 {digits[1:4]} {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
+    if len(digits) == 10:
+        return f"+7 {digits[0:3]} {digits[3:6]}-{digits[6:8]}-{digits[8:10]}"
     return str(phone or "—") if digits else "—"
 
 
@@ -185,7 +216,7 @@ def short(url: str) -> str:
 
 def same_number(a, b) -> bool:
     da, db = re.sub(r"\D", "", str(a or "")), re.sub(r"\D", "", str(b or ""))
-    return bool(da) and bool(db) and da[-10:] == db[-10:]
+    return len(da) >= 7 and len(db) >= 7 and da[-10:] == db[-10:]
 
 
 def targets_of(row: dict) -> list[tuple[str, str, str]]:
@@ -196,12 +227,14 @@ def targets_of(row: dict) -> list[tuple[str, str, str]]:
     """
     out: list[tuple[str, str, str]] = []
     phone = format_phone(row.get("phone"))
-    tg = to_link("telegram", row.get("telegram"))
+    tg_contact = pick_contact(row, "telegram")
+    tg = to_link("telegram", tg_contact)
     tg_is_phone = bool(tg) and phone != "—" and same_number(tg, row.get("phone"))
     if tg and not tg_is_phone:
         out.append(("telegram", short(tg), tg))
     for channel in ("vk", "max", "email"):
-        link = to_link(channel, row.get(channel))
+        contact_val = pick_contact(row, channel)
+        link = to_link(channel, contact_val)
         if link:
             out.append((channel, short(link), link))
     if phone != "—":

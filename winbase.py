@@ -39,7 +39,10 @@ def log_exception() -> None:
 def is_admin() -> bool:
     """Запущено ли приложение с правами администратора."""
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        shell32 = ctypes.windll.shell32
+        shell32.IsUserAnAdmin.restype = ctypes.c_int
+        shell32.IsUserAnAdmin.argtypes = []
+        return bool(shell32.IsUserAnAdmin())
     except Exception:  # noqa: BLE001
         return False
 

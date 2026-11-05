@@ -57,6 +57,7 @@ PROXIFYRE_SERVICE = "ProxiFyreService"
 PROXIFYRE_SERVICE_ALIASES = ("ProxiFyreService", "ProxiFyre")
 _PROXIFYRE_SERVICE_NAME: str | None = None
 PACKET_FILTER_DRIVER = "ndisrd"
+PACKET_FILTER_DRIVER_ALIASES = ("ndisrd", "WinpkFilter", "ndisrd_lwf", "ndisrd64")
 SVC_STOPPED = 1
 SVC_RUNNING = 4
 _ADVAPI_READY = False
@@ -113,7 +114,10 @@ def bypass_cfg_save(**updates) -> None:
 
 def bypass_admin() -> bool:
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        shell32 = ctypes.windll.shell32
+        shell32.IsUserAnAdmin.restype = ctypes.c_int
+        shell32.IsUserAnAdmin.argtypes = []
+        return bool(shell32.IsUserAnAdmin())
     except Exception:  # noqa: BLE001
         return False
 
@@ -167,9 +171,39 @@ def _pid_alive(pid: int) -> bool:
     return rc == 0 and bool(out) and "INFO:" not in out.upper()
 
 
+def _user32():
+    u32 = ctypes.windll.user32
+    try:
+        u32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        u32.IsWindowVisible.restype = ctypes.c_int
+        u32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        u32.IsIconic.restype = ctypes.c_int
+        u32.IsIconic.argtypes = [ctypes.c_void_p]
+        u32.ShowWindow.restype = ctypes.c_int
+        u32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    except Exception:
+        pass
+    return u32
+
+
+def _shell_execute(op: str, file: str, params: str = "", directory: str = "", show: int = 0) -> int:
+    shell32 = ctypes.windll.shell32
+    try:
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        shell32.ShellExecuteW.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int,
+        ]
+    except Exception:
+        pass
+    code = shell32.ShellExecuteW(None, op, file, params or None, directory or None, show)
+    return int(code or 0)
+
+
 def _pid_windows(pids) -> list[int]:
     """Видимые top-level окна, принадлежащие перечисленным PID."""
-    user32 = ctypes.windll.user32
+    u32 = _user32()
     windows: list[int] = []
     wanted = {int(pid) for pid in pids if pid}
     if not wanted:
@@ -179,15 +213,15 @@ def _pid_windows(pids) -> list[int]:
     def on_window(hwnd, _lparam):
         try:
             owner = ctypes.c_ulong()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-            if owner.value in wanted and user32.IsWindowVisible(hwnd):
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value in wanted and u32.IsWindowVisible(hwnd):
                 windows.append(hwnd)
         except Exception:  # noqa: BLE001
             pass
         return True
 
     try:
-        user32.EnumWindows(proto(on_window), None)
+        u32.EnumWindows(proto(on_window), None)
     except Exception:  # noqa: BLE001
         pass
     return windows
@@ -195,12 +229,12 @@ def _pid_windows(pids) -> list[int]:
 
 def _minimize_happ_windows(pids, attempts: int = 8, delay: float = 0.4) -> int:
     """Свёртывает окна запущенного Happ, чтобы окно не вылезало при включении VPN."""
-    user32 = ctypes.windll.user32
+    u32 = _user32()
     for _ in range(attempts):
         minimized = 0
         for hwnd in _pid_windows(pids):
-            if not user32.IsIconic(hwnd):
-                user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+            if not u32.IsIconic(hwnd):
+                u32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
                 minimized += 1
         if minimized:
             return minimized
@@ -210,11 +244,11 @@ def _minimize_happ_windows(pids, attempts: int = 8, delay: float = 0.4) -> int:
 
 def _restore_happ_windows(pids) -> int:
     """Развёртывает свёрнутые окна Happ — доступ нужен для смены сервера."""
-    user32 = ctypes.windll.user32
+    u32 = _user32()
     restored = 0
     for hwnd in _pid_windows(pids):
-        if user32.IsIconic(hwnd):
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, 9)  # SW_RESTORE
             restored += 1
     return restored
 
@@ -251,8 +285,15 @@ def set_windows_system_proxy(enable: bool, server: str = "") -> bool:
                 winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, str(server))
         wininet = getattr(ctypes.windll, "wininet", None)
         if wininet:
-            wininet.InternetSetOptionW(0, 39, 0, 0)  # INTERNET_OPTION_SETTINGS_CHANGED
-            wininet.InternetSetOptionW(0, 37, 0, 0)  # INTERNET_OPTION_REFRESH
+            try:
+                wininet.InternetSetOptionW.restype = ctypes.c_int
+                wininet.InternetSetOptionW.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
+                ]
+            except Exception:
+                pass
+            wininet.InternetSetOptionW(None, 39, None, 0)  # INTERNET_OPTION_SETTINGS_CHANGED
+            wininet.InternetSetOptionW(None, 37, None, 0)  # INTERNET_OPTION_REFRESH
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -355,37 +396,71 @@ def happ_connected(images: set[str] | None = None) -> bool:
     )
 
 
+class MIB_TCPROW(ctypes.Structure):
+    _fields_ = [
+        ("dwState", ctypes.c_ulong),
+        ("dwLocalAddr", ctypes.c_ulong),
+        ("dwLocalPort", ctypes.c_ulong),
+        ("dwRemoteAddr", ctypes.c_ulong),
+        ("dwRemotePort", ctypes.c_ulong),
+    ]
+
+
 def reset_tcp_connections(target_port: int) -> int:
     """Сбрасывает установленные TCP-соединения с локальным портом (например, 10808).
 
     Предотвращает сохранение открытых keepalive/QUIC сокетов браузера (YouTube)
     после выключения обхода.
+    Корректно работает на 64-битной платформе и устойчив при отсутствии прав администратора.
     """
     if sys.platform != "win32":
         return 0
     try:
         iphlpapi = ctypes.windll.iphlpapi
+        try:
+            iphlpapi.GetTcpTable.restype = ctypes.c_ulong
+            iphlpapi.GetTcpTable.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_int]
+            iphlpapi.SetTcpEntry.restype = ctypes.c_ulong
+            iphlpapi.SetTcpEntry.argtypes = [ctypes.POINTER(MIB_TCPROW)]
+        except Exception:
+            pass
+
         size = ctypes.c_ulong(0)
         iphlpapi.GetTcpTable(None, ctypes.byref(size), False)
         if size.value == 0:
             return 0
-        buf = (ctypes.c_char * size.value)()
-        if iphlpapi.GetTcpTable(buf, ctypes.byref(size), False) != 0:
+
+        # Буфер может вырасти между вызовами из-за новых сокетов: повторяем с запасом
+        buf = None
+        for _ in range(3):
+            alloc_size = size.value + 800
+            buf = (ctypes.c_char * alloc_size)()
+            actual_size = ctypes.c_ulong(alloc_size)
+            if iphlpapi.GetTcpTable(buf, ctypes.byref(actual_size), False) == 0:
+                break
+            size = actual_size
+        else:
             return 0
+
         import struct
         num_entries = struct.unpack_from("=I", buf, 0)[0]
-        row_size = 20
+        row_size = ctypes.sizeof(MIB_TCPROW)
         offset = 4
         closed = 0
         MIB_TCP_STATE_DELETE_TCB = 12
+        is_adm = is_admin()
+
         for _ in range(num_entries):
-            state, laddr, lport, raddr, rport = struct.unpack_from("=IIIII", buf, offset)
-            local_p = socket.ntohs(lport & 0xFFFF)
-            remote_p = socket.ntohs(rport & 0xFFFF)
+            if offset + row_size > len(buf):
+                break
+            row = MIB_TCPROW.from_buffer_copy(buf[offset : offset + row_size])
+            local_p = socket.ntohs(row.dwLocalPort & 0xFFFF)
+            remote_p = socket.ntohs(row.dwRemotePort & 0xFFFF)
             if local_p == target_port or remote_p == target_port:
-                new_row = struct.pack("=IIIII", MIB_TCP_STATE_DELETE_TCB, laddr, lport, raddr, rport)
-                if iphlpapi.SetTcpEntry(new_row) == 0:
-                    closed += 1
+                if is_adm:
+                    row.dwState = MIB_TCP_STATE_DELETE_TCB
+                    if iphlpapi.SetTcpEntry(ctypes.byref(row)) == 0:
+                        closed += 1
             offset += row_size
         return closed
     except Exception:  # noqa: BLE001
@@ -396,7 +471,7 @@ def happ_send(command: str) -> bool:
     """Отправить команду Happ через зарегистрированную схему happ:// (connect/disconnect/open)."""
     url = command if "://" in command else "happ://" + command
     try:
-        code = ctypes.windll.shell32.ShellExecuteW(None, "open", url, None, None, 0)
+        code = _shell_execute("open", url)
     except Exception:  # noqa: BLE001
         return False
     return code > 32
@@ -513,9 +588,7 @@ def bypass_gbd_start() -> dict:
         # Важно: cmd /s /c ""exe" args > "log" 2>&1" — без внешних кавычек cmd
         # не выполняет перенаправление и лог не создаётся.
         inner = f'""{exe}" {args} > "{log_path}" 2>&1"'
-        code = int(ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", "cmd.exe", f"/s /c {inner}", str(BYPASS_GBD_DIR), 0,
-        ))
+        code = _shell_execute("runas", "cmd.exe", f"/s /c {inner}", str(BYPASS_GBD_DIR), 0)
         if code <= 32:
             raise RuntimeError(
                 "GoodbyeDPI не запущен: окно UAC закрыто или отклонено.\n"
@@ -613,9 +686,7 @@ def bypass_stop(key: str) -> dict:
     if any(_image_pids(name) for name in targets):
         # скорее всего процесс от администратора — taskkill ещё раз через UAC
         arguments = " ".join(f"/IM {name}" for name in targets)
-        code = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", "taskkill.exe", f"/F {arguments}", None, 0,
-        )
+        code = _shell_execute("runas", "taskkill.exe", f"/F {arguments}", "", 0)
         if code <= 32:
             raise RuntimeError(
                 f"{label} запущен от администратора — появится окно UAC, "
@@ -1093,6 +1164,7 @@ def _advapi():
         api.OpenSCManagerW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
         api.OpenServiceW.restype = ctypes.c_void_p
         api.OpenServiceW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        api.QueryServiceStatus.restype = ctypes.c_int
         api.QueryServiceStatus.argtypes = [ctypes.c_void_p, ctypes.POINTER(SERVICE_STATUS)]
         api.StartServiceW.restype = ctypes.c_int
         api.StartServiceW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
@@ -1100,6 +1172,7 @@ def _advapi():
         api.ControlService.restype = ctypes.c_int
         api.ControlService.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
                                        ctypes.POINTER(SERVICE_STATUS)]
+        api.CloseServiceHandle.restype = ctypes.c_int
         api.CloseServiceHandle.argtypes = [ctypes.c_void_p]
         _ADVAPI_READY = True
     return api
@@ -1109,53 +1182,76 @@ def _svc_state(name: str) -> int | None:
     """Состояние службы/драйвера: 4 — работает, 1 — остановлена, None — нет такой."""
     if sys.platform != "win32":
         return None
+    api = None
+    scm = None
+    handle = None
     try:
         api = _advapi()
         scm = api.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
         if not scm:
             return None
-        try:
-            handle = api.OpenServiceW(scm, name, 0x0004)  # SERVICE_QUERY_STATUS
-            if not handle:
-                return None
-            try:
-                status = SERVICE_STATUS()
-                if not api.QueryServiceStatus(handle, ctypes.byref(status)):
-                    return None
-                return int(status.dwCurrentState)
-            finally:
-                api.CloseServiceHandle(handle)
-        finally:
-            api.CloseServiceHandle(scm)
+        handle = api.OpenServiceW(scm, name, 0x0004)  # SERVICE_QUERY_STATUS
+        if not handle:
+            return None
+        status = SERVICE_STATUS()
+        if not api.QueryServiceStatus(handle, ctypes.byref(status)):
+            return None
+        return int(status.dwCurrentState)
     except Exception:  # noqa: BLE001
         return None
+    finally:
+        if api:
+            if handle:
+                try:
+                    api.CloseServiceHandle(handle)
+                except Exception:
+                    pass
+            if scm:
+                try:
+                    api.CloseServiceHandle(scm)
+                except Exception:
+                    pass
 
 
 def _svc_start(name: str, wait: float = 12.0) -> bool:
     if sys.platform != "win32":
         return False
+    if _svc_state(name) == SVC_RUNNING:
+        return True
+    api = None
+    scm = None
+    handle = None
     try:
         api = _advapi()
         scm = api.OpenSCManagerW(None, None, 0x0001)
-        if not scm:
-            return False
-        try:
+        if scm:
             handle = api.OpenServiceW(scm, name, 0x0010 | 0x0004)
-            if not handle:
-                return False
-            try:
+            if handle:
                 api.StartServiceW(handle, 0, None)
-            finally:
-                api.CloseServiceHandle(handle)
-        finally:
-            api.CloseServiceHandle(scm)
     except Exception:  # noqa: BLE001
         pass
+    finally:
+        if api:
+            if handle:
+                try:
+                    api.CloseServiceHandle(handle)
+                except Exception:
+                    pass
+            if scm:
+                try:
+                    api.CloseServiceHandle(scm)
+                except Exception:
+                    pass
+
+    if _svc_state(name) == SVC_RUNNING:
+        return True
+
     # Если запуск через Win32 API не прошёл, пробуем sc start / net start
     try:
         run_tool(["sc.exe", "start", name], timeout=10)
     except Exception:  # noqa: BLE001
         pass
+
     deadline = time.time() + wait
     while time.time() < deadline:
         if _svc_state(name) == SVC_RUNNING:
@@ -1167,28 +1263,42 @@ def _svc_start(name: str, wait: float = 12.0) -> bool:
 def _svc_stop(name: str, wait: float = 12.0) -> bool:
     if sys.platform != "win32":
         return False
+    if _svc_state(name) == SVC_STOPPED:
+        return True
+    api = None
+    scm = None
+    handle = None
     try:
         api = _advapi()
         scm = api.OpenSCManagerW(None, None, 0x0001)
-        if not scm:
-            return False
-        try:
+        if scm:
             handle = api.OpenServiceW(scm, name, 0x0020 | 0x0004)
-            if not handle:
-                return False
-            try:
+            if handle:
                 status = SERVICE_STATUS()
                 api.ControlService(handle, 1, ctypes.byref(status))  # SERVICE_CONTROL_STOP
-            finally:
-                api.CloseServiceHandle(handle)
-        finally:
-            api.CloseServiceHandle(scm)
     except Exception:  # noqa: BLE001
         pass
+    finally:
+        if api:
+            if handle:
+                try:
+                    api.CloseServiceHandle(handle)
+                except Exception:
+                    pass
+            if scm:
+                try:
+                    api.CloseServiceHandle(scm)
+                except Exception:
+                    pass
+
+    if _svc_state(name) == SVC_STOPPED:
+        return True
+
     try:
         run_tool(["sc.exe", "stop", name], timeout=10)
     except Exception:  # noqa: BLE001
         pass
+
     deadline = time.time() + wait
     while time.time() < deadline:
         if _svc_state(name) == SVC_STOPPED:
@@ -1242,8 +1352,18 @@ def proxifyre_write_config(apps, port: int) -> bool:
     return True
 
 
+def proxifyre_driver_name() -> str:
+    """Определяет зарегистрированное имя службы драйвера WinpkFilter/ndisrd."""
+    for name in PACKET_FILTER_DRIVER_ALIASES:
+        if _svc_state(name) is not None:
+            return name
+    return PACKET_FILTER_DRIVER
+
+
 def proxifyre_driver_ok() -> bool:
-    return _svc_state(PACKET_FILTER_DRIVER) == SVC_RUNNING
+    """Проверяет состояние драйвера пакетов (ndisrd/WinpkFilter)."""
+    driver = proxifyre_driver_name()
+    return _svc_state(driver) == SVC_RUNNING
 
 
 # ProxiFyre 1.0.22 запоминает PID процессов в момент старта службы: программа,
@@ -1348,9 +1468,7 @@ def _proxifyre_install() -> bool:
         run_tool([str(PROXIFYRE_EXE), "install"], cwd=str(PROXIFYRE_DIR), timeout=120)
     else:
         try:
-            code = int(ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", str(PROXIFYRE_EXE), "install", str(PROXIFYRE_DIR), 0,
-            ))
+            code = _shell_execute("runas", str(PROXIFYRE_EXE), "install", str(PROXIFYRE_DIR), 0)
         except Exception:  # noqa: BLE001
             return False
         if code <= 32:
@@ -1371,6 +1489,11 @@ def proxifyre_start(apps=None, port: int | None = None) -> dict:
     port = int(port or cfg.get("socks_port") or happ_socks_port())
     if not PROXIFYRE_EXE.exists():
         raise RuntimeError(f"ProxiFyre не найден: {PROXIFYRE_EXE}")
+    if not proxifyre_driver_ok():
+        # Если драйвер установлен, но остановлен — пробуем запустить
+        driver = proxifyre_driver_name()
+        if _svc_state(driver) == SVC_STOPPED:
+            _svc_start(driver, wait=4.0)
     if not proxifyre_driver_ok():
         raise RuntimeError(
             "Драйвер Windows Packet Filter (ndisrd) не запущен — "

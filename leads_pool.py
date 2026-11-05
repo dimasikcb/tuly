@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import re
 import time
 from datetime import datetime, timedelta
@@ -120,18 +121,59 @@ def _tier_of(lead: dict) -> str:
 def pool_load(pool_file) -> list[dict]:
     """Все записи пула (в порядке добавления). Старый формат приводится к новому."""
     path = Path(pool_file)
+    spare = path.with_name(f"{path.stem}_new{path.suffix}")
+
+    target = path
+    if not path.exists():
+        if spare.exists():
+            target = spare
+        else:
+            return []
+
     rows: list[dict] = []
-    try:
-        with path.open(encoding="utf-8-sig", newline="") as fh:
-            for row in csv.DictReader(fh):
-                item = {key: str(row.get(key) or "").strip() for key in POOL_COLUMNS}
-                if not item["name"] and not item["phone"]:
-                    continue
-                for channel in ("telegram", "max", "vk", "email"):
-                    item[channel] = _pool_value(channel, item[channel])
-                rows.append(item)
-    except (OSError, csv.Error):
-        return []
+    last_exc = None
+    for attempt in range(5):
+        try:
+            with target.open(encoding="utf-8-sig", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    item = {key: str(row.get(key) or "").strip() for key in POOL_COLUMNS}
+                    if not item["name"] and not item["phone"]:
+                        continue
+                    for channel in ("telegram", "max", "vk", "email"):
+                        item[channel] = _pool_value(channel, item[channel])
+                    rows.append(item)
+            last_exc = None
+            break
+        except (PermissionError, OSError) as exc:
+            last_exc = exc
+            rows.clear()
+            if attempt < 4:
+                time.sleep(0.15)
+        except csv.Error:
+            return []
+
+    if last_exc is not None:
+        raise PoolBusy(f"{target.name} открыт в другой программе — не удалось прочитать: {last_exc}")
+
+    # Если рядом есть файл _new (сохранённый при блокировке основного),
+    # догружаем из него свежие записи без дублей
+    if spare.exists() and spare != target:
+        try:
+            with spare.open(encoding="utf-8-sig", newline="") as fh:
+                known = {pool_key(r) for r in rows}
+                for row in csv.DictReader(fh):
+                    item = {key: str(row.get(key) or "").strip() for key in POOL_COLUMNS}
+                    if not item["name"] and not item["phone"]:
+                        continue
+                    key = pool_key(item)
+                    if key and key not in known:
+                        for channel in ("telegram", "max", "vk", "email"):
+                            item[channel] = _pool_value(channel, item[channel])
+                        rows.append(item)
+                        known.add(key)
+        except (OSError, csv.Error):
+            pass
+
     return rows
 
 
@@ -142,7 +184,7 @@ def _pool_save(pool_file, rows: list[dict]) -> None:
     сообщаем об этом, иначе новые горячие лиды молча теряются.
     """
     path = Path(pool_file)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
@@ -153,15 +195,21 @@ def _pool_save(pool_file, rows: list[dict]) -> None:
     except OSError as exc:
         raise PoolBusy(f"не записался {path.name}: {exc}") from exc
 
+    spare = path.with_name(f"{path.stem}_new{path.suffix}")
     for attempt in range(10):
         try:
             tmp.replace(path)
+            if spare.exists():
+                try:
+                    spare.unlink()
+                except OSError:
+                    pass
             return
         except OSError:
             if attempt < 9:
                 time.sleep(0.2)
+
     # файл занят: не теряем пачку, кладём рядом и говорим, куда смотреть
-    spare = path.with_name(f"{path.stem}_new{path.suffix}")
     try:
         tmp.replace(spare)
         where = f", свежие записи — в {spare.name}"
@@ -326,11 +374,16 @@ def pool_mark_status(pool_file, key, status: str) -> bool:
 
 
 def _read_csv(path) -> list[dict]:
-    try:
-        with open(path, encoding="utf-8-sig", newline="") as fh:
-            return list(csv.DictReader(fh))
-    except (OSError, csv.Error):
-        return []
+    for attempt in range(3):
+        try:
+            with open(path, encoding="utf-8-sig", newline="") as fh:
+                return list(csv.DictReader(fh))
+        except (PermissionError, OSError):
+            if attempt < 2:
+                time.sleep(0.15)
+        except csv.Error:
+            return []
+    return []
 
 
 def migrate_legacy(dir_path) -> dict:
