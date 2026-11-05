@@ -4160,7 +4160,7 @@ class AppRow(tk.Frame):
         self.box.pack(side="right", padx=(0, px(6)))
         self._parts.append(self.box)
 
-        for widget in self._parts:
+        for widget in (self, self.stripe, *self._parts):
             widget.bind("<Button-1>", self._click)
             widget.bind("<Enter>", self._enter)
             widget.bind("<Leave>", self._leave)
@@ -4237,6 +4237,14 @@ class ScrollList(tk.Frame):
         if active:
             self.canvas.bind_all("<MouseWheel>", self._scroll)
         else:
+            try:
+                x, y = self.canvas.winfo_pointerxy()
+                rx, ry = self.canvas.winfo_rootx(), self.canvas.winfo_rooty()
+                rw, rh = self.canvas.winfo_width(), self.canvas.winfo_height()
+                if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                    return
+            except Exception:
+                pass
             self.canvas.unbind_all("<MouseWheel>")
 
     def _scroll(self, event) -> None:
@@ -5324,6 +5332,7 @@ class LeadsPanel(Panel):
         rscroll.grid(row=0, column=1, sticky="ns")
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
+        self.result_tree.bind("<ButtonRelease-1>", self._on_single_click)
         self.result_tree.bind("<Double-1>", self._open_row_link)
         self.result_tree.bind("<Button-3>", self._row_menu)
         self._row_links: dict[str, list[tuple[str, str]]] = {}
@@ -5521,12 +5530,37 @@ class LeadsPanel(Panel):
         self.stop_btn.configure(state="normal" if running else "disabled")
 
     # -- контекст ---------------------------------------------------------- #
-    def _open_row_link(self, event=None) -> None:
-        sel = self.result_tree.selection()
-        if not sel:
+    def _on_single_click(self, event) -> None:
+        """Одиночный клик по колонке «2ГИС» открывает карточку (с защитой от двойного клика)."""
+        col_id = self.result_tree.identify_column(event.x)
+        try:
+            if self.result_tree.column(col_id, option="id") != "gis":
+                return
+        except Exception:
             return
-        iid = sel[0]
-        # Если кликнули по колонке 2ГИС — сразу открываем карточку 2ГИС
+        iid = self.result_tree.identify_row(event.y)
+        if not iid:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_gis_click", 0) < 0.4:
+            return
+        self._last_gis_click = now
+        url = self._row_urls.get(iid, "")
+        if url:
+            webbrowser.open(url)
+
+    def _open_row_link(self, event=None) -> None:
+        iid = (self.result_tree.identify_row(event.y) if event is not None else None)
+        if not iid:
+            sel = self.result_tree.selection()
+            if not sel:
+                return
+            iid = sel[0]
+        # Если ссылка 2ГИС уже открыта одиночным кликом — не дублируем вкладку
+        now = time.monotonic()
+        if now - getattr(self, "_last_gis_click", 0) < 0.4:
+            return
+        # Двойной клик по колонке «2ГИС» — открываем карточку 2ГИС
         if event is not None:
             try:
                 col_id = self.result_tree.identify_column(event.x)

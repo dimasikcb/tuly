@@ -85,6 +85,18 @@ class HappModeTest(unittest.TestCase):
 
 
 class HappSocksPortTest(unittest.TestCase):
+    def test_port_from_socks_inbound(self) -> None:
+        data = {"inbounds": [
+            {"type": "socks", "listen": "127.0.0.1", "listen_port": 10809}
+        ]}
+        self.assertEqual(app.happ_socks_port_from(data), 10809)
+
+    def test_port_from_mixed_inbound(self) -> None:
+        data = {"inbounds": [
+            {"type": "mixed", "listen": "127.0.0.1", "port": 2080}
+        ]}
+        self.assertEqual(app.happ_socks_port_from(data), 2080)
+
     def test_port_from_socks_outbound(self) -> None:
         data = {"outbounds": [
             {"type": "direct", "tag": "direct"},

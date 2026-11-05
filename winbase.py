@@ -53,7 +53,12 @@ def config_read() -> dict:
 
 
 def config_write(data: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    temp_path = CONFIG_PATH.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+    try:
+        temp_path.replace(CONFIG_PATH)
+    except OSError:
+        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 
 
 def config_update(**sections) -> None:

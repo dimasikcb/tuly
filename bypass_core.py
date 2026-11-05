@@ -423,18 +423,17 @@ def bypass_status(_timeout: float = 1.5) -> dict:
 
 def _bypass_leak_diagnosis(scope: str) -> dict:
     """Проверяет, не остаётся ли после выключения обхода перехват трафика."""
-    leak = {
-        "tun": happ_tun_active(),
-        "proxy": None,
-        "cores": bool(_image_pids("xray.exe") or _image_pids("sing-box.exe")),
+    happ_on = happ_connected()
+    cores_leak = bool(not happ_on and (_image_pids("xray.exe") or _image_pids("sing-box.exe")))
+    tun_leak = bool(happ_tun_active() and (scope == "apps" or not happ_on))
+    enable, server = happ_system_proxy()
+    proxy_leak = bool(enable and ("127.0.0.1" in server or "localhost" in server or "::1" in server)
+                      and (scope == "apps" or not happ_on))
+    return {
+        "tun": tun_leak,
+        "proxy": proxy_leak,
+        "cores": cores_leak,
     }
-    if scope == "apps":
-        # В режиме программ всё, кроме выбранных приложений, должно ходить напрямую.
-        # Если системный прокси Windows смотрит на localhost — это утечка.
-        enable, server = happ_system_proxy()
-        leak["proxy"] = enable and ("127.0.0.1" in server or "localhost" in server
-                                    or "::1" in server)
-    return leak
 
 
 def bypass_gbd_start() -> dict:
@@ -653,11 +652,13 @@ def bypass_happ_stop() -> dict:
         # Ждём, пока Happ сам выключит VPN, TUN и системный прокси
         if not happ_connected() and not happ_tun_active():
             enable, server = happ_system_proxy()
-            if not enable or server not in ("127.0.0.1", "localhost", "::1"):
+            is_local_proxy = enable and any(h in server for h in ("127.0.0.1", "localhost", "::1"))
+            if not is_local_proxy:
                 # Ключевое: в реестре Happ tun=true / systemProxy=true — он
                 # переподключится через некоторое время. Гасим эти настройки,
                 # чтобы трафик точно не утекал.
                 happ_mode_write(tun=False, system_proxy=False)
+                set_windows_system_proxy(False)
                 return {"ok": True, "detail": "VPN, TUN и системный прокси выключены"}
         time.sleep(0.4)
     # Штатное отключение не сработало — гасим всё принудительно.
@@ -815,10 +816,58 @@ def happ_direct_ru_ensure() -> bool:
     return True
 
 
+def happ_config_tun_ensure(enable_auto_route: bool) -> bool:
+    """Управляет параметром auto_route в inbounds sing-box config.json.
+
+    При enable_auto_route=False sing-box не перехватывает маршруты 0.0.0.0/0
+    всей Windows, позволяя невыбранным программам выходить напрямую в интернет.
+    """
+    try:
+        if not HAPP_CONFIG_FILE.exists():
+            return False
+        data = json.loads(HAPP_CONFIG_FILE.read_text("utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    inbounds = data.get("inbounds")
+    if not isinstance(inbounds, list):
+        return False
+    changed = False
+    for item in inbounds:
+        if isinstance(item, dict) and item.get("type") == "tun":
+            if item.get("auto_route") != bool(enable_auto_route):
+                item["auto_route"] = bool(enable_auto_route)
+                changed = True
+    if changed:
+        try:
+            HAPP_CONFIG_FILE.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), "utf-8"
+            )
+            return True
+        except OSError:
+            return False
+    return False
+
+
 def happ_socks_port_from(data) -> int:
     """Порт локального SOCKS Happ из его конфига (sing-box)."""
     if not isinstance(data, dict):
         return HAPP_SOCKS_DEFAULT
+    for inbound in data.get("inbounds") or []:
+        if not isinstance(inbound, dict):
+            continue
+        if str(inbound.get("type") or "").lower() not in ("socks", "socks5", "mixed"):
+            continue
+        server = str(inbound.get("listen") or inbound.get("server") or "").strip()
+        if server and server not in ("127.0.0.1", "localhost", "::1", "0.0.0.0", "::"):
+            continue
+        try:
+            port = int(inbound.get("listen_port") or inbound.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if 0 < port < 65536:
+            return port
     for outbound in data.get("outbounds") or []:
         if not isinstance(outbound, dict):
             continue
@@ -1368,6 +1417,8 @@ def happ_ensure_apps_mode(restart: bool = False) -> bool:
     changed = False
     if current["tun"] or current["system_proxy"]:
         happ_mode_write(tun=False, system_proxy=False)
+        changed = True
+    if happ_config_tun_ensure(False):
         changed = True
     enable, server = happ_system_proxy()
     if enable:

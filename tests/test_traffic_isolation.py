@@ -52,5 +52,35 @@ class TrafficIsolationTest(unittest.TestCase):
             self.assertIn("tun_disable", calls)
 
 
+    def test_leak_diagnosis_no_false_positive_when_happ_connected(self) -> None:
+        with mock.patch.object(app, "happ_connected", lambda: True), \
+             mock.patch.object(app, "_image_pids", lambda name: [1234]), \
+             mock.patch.object(app, "happ_tun_active", lambda: False), \
+             mock.patch.object(app, "happ_system_proxy", lambda: (False, "")):
+            leak = app._bypass_leak_diagnosis("apps")
+            self.assertFalse(leak["cores"])
+            self.assertFalse(leak["tun"])
+            self.assertFalse(leak["proxy"])
+
+    def test_leak_diagnosis_detects_orphan_cores_when_happ_disconnected(self) -> None:
+        with mock.patch.object(app, "happ_connected", lambda: False), \
+             mock.patch.object(app, "_image_pids", lambda name: [1234] if name == "xray.exe" else []), \
+             mock.patch.object(app, "happ_tun_active", lambda: False), \
+             mock.patch.object(app, "happ_system_proxy", lambda: (False, "")):
+            leak = app._bypass_leak_diagnosis("apps")
+            self.assertTrue(leak["cores"])
+
+    def test_happ_config_tun_ensure_toggles_auto_route(self) -> None:
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_file = Path(tmp) / "config.json"
+            cfg_file.write_text(json.dumps({
+                "inbounds": [{"type": "tun", "auto_route": True}]
+            }), encoding="utf-8")
+            with mock.patch.object(app, "HAPP_CONFIG_FILE", cfg_file):
+                self.assertTrue(app.happ_config_tun_ensure(False))
+                data = json.loads(cfg_file.read_text("utf-8"))
+                self.assertFalse(data["inbounds"][0]["auto_route"])
+
 if __name__ == "__main__":
     unittest.main()
