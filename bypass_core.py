@@ -260,14 +260,16 @@ def set_windows_system_proxy(enable: bool, server: str = "") -> bool:
 
 def happ_tun_active() -> bool:
     """Проверяет, перехватывает ли TUN-адаптер Happ (happ-xray / happ-tun) системный трафик."""
-    for iface in ("happ-xray", "happ-tun"):
-        try:
-            rc, out, _ = run_tool(["netsh", "interface", "show", "interface", iface], timeout=5)
-            if rc == 0 and ("connected" in out.lower() or "подключен" in out.lower()):
-                return True
-        except Exception:  # noqa: BLE001
-            pass
-    return False
+    if not happ_connected():
+        return False
+    try:
+        rc, out, _ = run_tool(["route", "print", "0.0.0.0"], timeout=3)
+        if rc == 0 and ("172.19." in out or "172.18." in out or "happ-xray" in out or "happ-tun" in out):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    mode = happ_mode_read()
+    return bool(mode.get("tun"))
 
 
 def happ_tun_disable(wait: float = 4.0) -> bool:
@@ -1372,6 +1374,8 @@ def proxifyre_restart() -> dict:
             "Драйвер Windows Packet Filter (ndisrd) не запущен — "
             "обход по программам без него невозможен"
         )
+    cfg = bypass_cfg()
+    proxifyre_write_config(cfg["apps"], happ_socks_port())
     if state == SVC_RUNNING:
         _svc_stop(service)
     if not _svc_start(service):
@@ -1379,7 +1383,9 @@ def proxifyre_restart() -> dict:
             "Не удалось запустить службу ProxiFyre"
         )
     proxifyre_snapshot()
-    apps = normalize_apps(bypass_cfg()["apps"])
+    global _PROXIFYRE_LAST_RESTART
+    _PROXIFYRE_LAST_RESTART = time.time()
+    apps = normalize_apps(cfg["apps"])
     return {"ok": True, "detail": f"ProxiFyre перезапущен — подхвачено {len(apps)} программ"}
 
 
@@ -1438,8 +1444,7 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
     """Единая точка применения: весь трафик или только выбранные программы.
 
     Движки независимы: Happ (через ProxiFyre) можно держать для выбранных
-    программ, а GoodbyeDPI — включённым для остального трафика. Поэтому
-    применение одного движка больше не гасит второй.
+    программ, а GoodbyeDPI — включённым для остального трафика.
     """
     cfg = bypass_cfg()
     scope = str(scope or cfg["scope"]).lower()
@@ -1457,41 +1462,38 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
         if isinstance(result, dict) and result.get("detail"):
             notes.append(str(result["detail"]))
 
-    # 1. Настройки Happ: TUN нужен только для «всего трафика»
     if mode == "happ":
         want_tun = scope == "all"
-        if want_tun:
-            happ_tun_enable()
         current = happ_mode_read()
-        if current["tun"] != want_tun or current["system_proxy"] != want_tun:
+        settings_changed = (current["tun"] != want_tun or current["system_proxy"] != want_tun)
+
+        if settings_changed:
             happ_mode_write(tun=want_tun, system_proxy=want_tun)
             notes.append(
                 "Happ: весь трафик (TUN)" if want_tun
                 else "Happ: без TUN — только локальный SOCKS для выбранных программ"
             )
-            if _image_pids(Path(cfg["happ_path"]).name):
-                add(happ_tunnel_restart())
 
-    # 2. Включаем движок (второй при этом не гасим)
-    if mode == "happ":
-        if scope == "apps":
-            # ДО подключения: Happ не должен включать системный прокси при
-            # connect, иначе весь трафик ПК уйдёт в VPN ещё до старта ProxiFyre.
-            happ_ensure_apps_mode()
-        # В режиме «весь трафик» пускаем Яндекс и российские сайты напрямую —
-        # иначе они уходят на зарубежный сервер и не открываются.
-        if scope == "all" and happ_direct_ru_ensure():
-            notes.append("Happ: Яндекс и российские сайты — напрямую, минуя прокси")
-            if happ_connected():
-                add(happ_tunnel_restart())
-            else:
-                add(bypass_happ_start())
+        happ_config_tun_ensure(want_tun)
+
+        if want_tun:
+            happ_tun_enable()
+            if happ_direct_ru_ensure():
+                notes.append("Happ: Яндекс и российские сайты — напрямую, минуя прокси")
+                settings_changed = True
         else:
-            add(bypass_happ_start())
-        if scope == "apps":
-            # ПОСЛЕ подключения Happ мог вернуть TUN/прокси — гасим повторно.
-            happ_ensure_apps_mode(restart=True)
+            set_windows_system_proxy(False)
             happ_tun_disable()
+
+        # Запуск/перезапуск туннеля Happ
+        happ_pids = _image_pids(Path(cfg["happ_path"]).name)
+        if not happ_connected():
+            add(bypass_happ_start())
+        elif settings_changed and happ_pids:
+            add(happ_tunnel_restart())
+
+        # Управление ProxiFyre
+        if scope == "apps":
             port = happ_socks_port()
             if not _wait_port(port):
                 raise RuntimeError(
@@ -1499,16 +1501,8 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
                     "обход по программам не заработает. Проверьте, что Happ подключён."
                 )
             add(proxifyre_start(cfg["apps"], port))
-            # Happ иногда восстанавливает системный прокси уже после старта
-            # службы — финальный контроль, иначе браузер снова пойдёт через VPN.
-            happ_ensure_apps_mode()
-            after = happ_mode_read()
-            if after["tun"] or after["system_proxy"]:
-                notes.append(
-                    "Внимание: Happ снова включил TUN/системный прокси — "
-                    "весь трафик идёт в туннель, а не только выбранные программы. "
-                    "Выключите TUN в самом Happ."
-                )
+            set_windows_system_proxy(False)
+            happ_tun_disable()
         else:
             add(proxifyre_stop())
     else:

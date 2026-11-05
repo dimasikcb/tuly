@@ -4466,7 +4466,7 @@ class BypassPanel(Panel):
         self.loading_apps = False
         self.catalog = list(catalog or [])
         self._rebuild_rows()
-        self._apply_filter()
+        self._apply_filter(reset_scroll=True)
         self.append_log(self.log_box, f"Найдено программ: {len(self.catalog)}")
 
     def _catalog_fail(self, exc: Exception) -> None:
@@ -4478,7 +4478,7 @@ class BypassPanel(Panel):
         self.app_list.clear()
         self.rows.clear()
 
-    def _apply_filter(self) -> None:
+    def _apply_filter(self, reset_scroll: bool = False) -> None:
         matched = filter_apps(self.catalog, self.query, only_running=self.only_running)
         if self.only_bypass:
             matched = [e for e in matched if e.exe.lower() in self.selected_apps]
@@ -4496,7 +4496,8 @@ class BypassPanel(Panel):
         for key, row in self.rows.items():
             if key not in shown:
                 row.pack_forget()
-        self.app_list.canvas.yview_moveto(0)
+        if reset_scroll:
+            self.app_list.canvas.yview_moveto(0)
         self._update_empty_hint(matched)
 
     def _update_empty_hint(self, matched) -> None:
@@ -4529,7 +4530,7 @@ class BypassPanel(Panel):
             self.placeholder.place_forget()
         else:
             self.placeholder.place(in_=self.search_entry, x=px(2), rely=0.5, anchor="w")
-        self._apply_filter()
+        self._apply_filter(reset_scroll=True)
 
     def _clear_search(self) -> None:
         self.search_var.set("")
@@ -4545,7 +4546,7 @@ class BypassPanel(Panel):
             text="● Только запущенные" if self.only_running else "Только запущенные",
             fg=ACCENT if self.only_running else FG,
         )
-        self._apply_filter()
+        self._apply_filter(reset_scroll=True)
 
     def _toggle_only_bypass(self) -> None:
         self.only_bypass = not self.only_bypass
@@ -4553,7 +4554,7 @@ class BypassPanel(Panel):
             text="● Только обход" if self.only_bypass else "Только обход",
             fg=ACCENT if self.only_bypass else FG,
         )
-        self._apply_filter()
+        self._apply_filter(reset_scroll=True)
 
     def _on_app_toggle(self, entry: AppEntry, selected: bool) -> None:
         key = entry.exe.lower()
@@ -4576,7 +4577,7 @@ class BypassPanel(Panel):
         self._save_cfg()
         self._update_controls()
         if self.only_bypass:
-            self._apply_filter()
+            self._apply_filter(reset_scroll=True)
         self._schedule_apply()
 
     def _schedule_apply(self) -> None:
@@ -4738,6 +4739,9 @@ class BypassPanel(Panel):
         """Перезапуск ProxiFyre: служба видит только процессы со своего старта."""
         if self.busy:
             return
+        if self.scope != "apps":
+            self.hub.toast("«Подхватить программы» нужно только в режиме «Только программы»", kind="info")
+            return
         self._run(proxifyre_restart, "ProxiFyre: подхватываю запущенные программы…",
                   "Перезапускаю службу ProxiFyre…")
 
@@ -4850,7 +4854,10 @@ class BypassPanel(Panel):
         self.btn_show_happ.configure(state="disabled" if self.busy else "normal")
         self.btn_refresh.configure(
             state="disabled" if self.busy or self.checking else "normal")
-        self.btn_catch.configure(state="disabled" if self.busy else "normal")
+        if hasattr(self, "btn_catch"):
+            self.btn_catch.configure(
+                state="normal" if (self.scope == "apps" and not self.busy) else "disabled"
+            )
         if hasattr(self, "btn_check_ip"):
             self.btn_check_ip.configure(state="disabled" if self.busy else "normal")
         if hasattr(self, "btn_fix_tun"):
