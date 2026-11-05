@@ -14,11 +14,67 @@ from pathlib import Path
 
 from winbase import ps_run
 
-APP_SKIP_PREFIXES = ("unins", "setup", "install", "update", "vcredist", "dxsetup")
+APP_SKIP_PREFIXES = ("unins", "setup", "install", "update", "vcredist", "dxsetup", "repair")
+
+
+INTERNAL_CHILD_PROCESSES = {
+    "language_server.exe",
+    "editor_sdk.exe",
+    "betterleaks.exe",
+    "sandbox-center.exe",
+    "sandbox-cli.exe",
+    "workbuddy-editor-sdk-supervisor.exe",
+    "webm_encoder.exe",
+    "cursor-server.exe",
+}
+
+
+def is_internal_child_process(exe: str, path: str = "") -> bool:
+    """Определяет, является ли процесс скрытым бэкендом (например, editor_sdk у WorkBuddy)."""
+    exe_low = str(exe or "").lower()
+    path_low = str(path or "").lower()
+    if exe_low in ("workbuddyai.exe", "antigravity.exe"):
+        return False
+    if "shorts-autopilot" in path_low or "shorts-gui" in path_low:
+        return False
+    if "workbuddy" in path_low or ".workbuddy-ai" in path_low:
+        return True
+    if "antigravity" in path_low:
+        return True
+    if exe_low in INTERNAL_CHILD_PROCESSES:
+        return True
+    return False
+
+
+def parent_app_for(exe: str, path: str = "") -> str | None:
+    """Возвращает имя главного приложения для служебного процесса."""
+    exe_low = str(exe or "").lower()
+    path_low = str(path or "").lower()
+    if (
+        exe_low in (
+            "editor_sdk.exe", "betterleaks.exe", "sandbox-center.exe",
+            "sandbox-cli.exe", "workbuddy-editor-sdk-supervisor.exe",
+        )
+        or ("workbuddy" in path_low or ".workbuddy-ai" in path_low)
+    ):
+        return "WorkBuddyAI.exe"
+    if (
+        exe_low in ("language_server.exe", "webm_encoder.exe")
+        or ("antigravity" in path_low and exe_low != "antigravity.exe")
+    ):
+        return "Antigravity.exe"
+    return None
 
 APP_COMPANIONS: dict[str, list[str]] = {
     "antigravity.exe": ["language_server.exe"],
-    "workbuddyai.exe": ["editor_sdk.exe", "betterleaks.exe", "node.exe"],
+    "workbuddyai.exe": [
+        "editor_sdk.exe",
+        "betterleaks.exe",
+        "sandbox-center.exe",
+        "sandbox-cli.exe",
+        "workbuddy-editor-sdk-supervisor.exe",
+        "node.exe",
+    ],
     "cursor.exe": ["cursor-server.exe", "node.exe"],
     "code.exe": ["node.exe"],
 }
@@ -59,12 +115,17 @@ def pretty_app_name(exe: str, path: str = "") -> str:
     if exe_low == "language_server.exe" and "antigravity" in path_low:
         return "Antigravity (Language Server)"
     if exe_low == "editor_sdk.exe" and "workbuddy" in path_low:
-        return "WorkBuddy (Editor SDK)"
+        return "WorkBuddy AI"
     if exe_low == "betterleaks.exe" and "workbuddy" in path_low:
         return "WorkBuddy (Sandbox)"
     if exe_low == "node.exe" and "workbuddy" in path_low:
         return "WorkBuddy (Node Backend)"
 
+    exe_low = str(exe or "").lower()
+    if "shorts-autopilot" in path_low or "shorts-gui" in path_low:
+        return "Shorts Autopilot"
+    if exe_low == "workbuddyai.exe":
+        return "WorkBuddy AI"
     stem = Path(str(exe or "")).stem
     stem = re.sub(r"(?i)([-_](x64|x86|amd64|setup|portable|bin))$", "", stem)
     words = [word for word in re.split(r"[-_\s]+", stem) if word]
@@ -299,8 +360,22 @@ def app_catalog(running_paths=None, registry_paths=None,
     for path in running_paths:
         if not _usable_exe(path):
             continue
+        name = Path(path).name
+        if is_internal_child_process(name, path):
+            parent = parent_app_for(name, path)
+            if parent:
+                parent_key = key_of(parent)
+                prev = entries.get(parent_key)
+                if prev:
+                    entries[parent_key] = replace(prev, running=True)
+                else:
+                    entries[parent_key] = AppEntry(
+                        exe=parent, name=pretty_app_name(parent, path),
+                        path=path, running=True, source="running",
+                    )
+            continue
         entries[key_of(path)] = AppEntry(
-            exe=Path(path).name, name=pretty_app_name(Path(path).name, path),
+            exe=name, name=pretty_app_name(name, path),
             path=path, running=True, source="running",
         )
 
@@ -308,6 +383,8 @@ def app_catalog(running_paths=None, registry_paths=None,
         if not _usable_exe(path):
             continue
         name = Path(path).name
+        if is_internal_child_process(name, path):
+            continue
         key = key_of(path)
         if key in entries:
             if not entries[key].path:

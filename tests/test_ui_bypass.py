@@ -5,6 +5,16 @@ import tkinter as tk
 import unittest
 from unittest import mock
 
+import sys
+from pathlib import Path
+
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+ROOT_DIR = TESTS_DIR.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from helpers import TempConfig, load_app
 
 app = load_app()

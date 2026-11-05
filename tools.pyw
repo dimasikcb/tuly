@@ -46,14 +46,20 @@ from bypass_core import (
     bypass_apply,
     bypass_cfg,
     bypass_cfg_save,
+    bypass_check_ip,
     bypass_download,
     bypass_happ_show,
     bypass_status,
     bypass_stop,
+    happ_connected,
+    happ_mode_write,
+    happ_tun_disable,
+    happ_tunnel_restart,
     proxifyre_rescan,
     proxifyre_restart,
     proxifyre_start,
     proxifyre_stop,
+    set_windows_system_proxy,
 )
 from winbase import (
     APP_DIR,
@@ -4311,6 +4317,9 @@ class BypassPanel(Panel):
         self.btn_show_happ = flat_button(tools, "Показать Happ", self.show_happ,
                                          kind="ghost")
         self.btn_show_happ.pack(side="left", padx=(px(8), 0))
+        self.btn_fix_tun = flat_button(tools, "⚡ Выключить TUN", self.fix_tun_now,
+                                       kind="ghost")
+        self.btn_fix_tun.pack(side="left", padx=(px(8), 0))
         self.btn_download = flat_button(tools, "Скачать GoodbyeDPI",
                                         lambda: self.download("gbd"), kind="ghost")
         self.btn_download.pack(side="left", padx=(px(8), 0))
@@ -4319,6 +4328,9 @@ class BypassPanel(Panel):
         self.btn_catch = flat_button(tools, "Подхватить программы",
                                      self.catch_programs, kind="ghost")
         self.btn_catch.pack(side="right", padx=(0, px(8)))
+        self.btn_check_ip = flat_button(tools, "🌐 Проверить IP",
+                                        self.check_ip_now, kind="ghost")
+        self.btn_check_ip.pack(side="right", padx=(0, px(8)))
 
         self.apps_card = self._apps_card(self)
         self.apps_card.grid(row=3, column=0, sticky="nsew", pady=(px(10), 0))
@@ -4500,7 +4512,8 @@ class BypassPanel(Panel):
             )
         else:
             self.empty_label.configure(text="")
-        self.count_var.set(f"выбрано {len(self.selected_apps)} из {total}")
+        selected_count = sum(1 for e in self.catalog if e.exe.lower() in self.selected_apps)
+        self.count_var.set(f"выбрано {selected_count} из {total}")
 
     def _on_search(self) -> None:
         self.query = self.search_var.get()
@@ -4536,16 +4549,12 @@ class BypassPanel(Panel):
 
     def _on_app_toggle(self, entry: AppEntry, selected: bool) -> None:
         key = entry.exe.lower()
-        targets = [key]
-        for comp in APP_COMPANIONS.get(key) or []:
-            targets.append(comp.lower())
-        for k in targets:
-            if selected:
-                self.selected_apps.add(k)
-            else:
-                self.selected_apps.discard(k)
-            if k in self.rows:
-                self.rows[k].set_selected(selected)
+        if selected:
+            self.selected_apps.add(key)
+        else:
+            self.selected_apps.discard(key)
+        if key in self.rows:
+            self.rows[key].set_selected(selected)
         self._save_cfg()
         self._update_controls()
         if self.only_bypass and not selected:
@@ -4616,7 +4625,14 @@ class BypassPanel(Panel):
         self.scope = scope
         self._save_cfg()
         self._update_controls()
-        if self._engine_on("happ") or scope == "apps":
+        if scope == "apps":
+            try:
+                happ_mode_write(tun=False, system_proxy=False)
+                set_windows_system_proxy(False)
+                happ_tun_disable()
+            except Exception:
+                pass
+        if self._engine_on("happ") and (scope != "apps" or self.selected_apps):
             self._start_mode("happ")
         elif self._engine_on("gbd"):
             self._start_mode("gbd")
@@ -4679,6 +4695,37 @@ class BypassPanel(Panel):
             self.hub.run_bg(bypass_status, self._state_ok, self._state_off)
         self.after(3000, self._tick)
 
+    def fix_tun_now(self) -> None:
+        self._run(self._do_fix_tun, "Отключаю TUN в Happ…",
+                  "Happ: TUN отключён, локальный SOCKS активен")
+
+    def _do_fix_tun(self) -> dict:
+        happ_mode_write(tun=False, system_proxy=False)
+        set_windows_system_proxy(False)
+        happ_tun_disable()
+        if happ_connected():
+            return happ_tunnel_restart()
+        return {"ok": True, "detail": "TUN отключён в Happ"}
+
+    def check_ip_now(self) -> None:
+        """Быстрая проверка текущего внешнего IP, чтобы убедиться в работе обхода."""
+        self.btn_check_ip.configure(state="disabled")
+        self.hub.run_bg(
+            bypass_check_ip,
+            lambda res: self._on_ip_done(res),
+            lambda err: self._on_ip_fail(err),
+        )
+
+    def _on_ip_done(self, res: dict) -> None:
+        self.btn_check_ip.configure(state="normal")
+        ip = res.get("ip") or "не определён"
+        self.append_log(self.log_box, f"🌐 Текущий внешний IP: {ip}", "ok")
+        self.hub.toast(f"Внешний IP: {ip}", kind="ok")
+
+    def _on_ip_fail(self, err: Exception) -> None:
+        self.btn_check_ip.configure(state="normal")
+        self.append_log(self.log_box, f"Ошибка проверки IP: {err}", "warn")
+
     def catch_programs(self) -> None:
         """Перезапуск ProxiFyre: служба видит только процессы со своего старта."""
         if self.busy:
@@ -4706,6 +4753,21 @@ class BypassPanel(Panel):
             else:
                 self.append_log(self.log_box,
                                 "ProxiFyre: не удалось подхватить новые процессы", "error")
+        # Диагностика утечек: если обход выключен, но трафик всё ещё перехватывается
+        leak = self.state.get("leak")
+        if isinstance(leak, dict):
+            what = []
+            if leak.get("tun"):
+                what.append("TUN-адаптер")
+            if leak.get("proxy"):
+                what.append("системный прокси")
+            if leak.get("cores"):
+                what.append("ядро Happ")
+            if what:
+                self.append_log(self.log_box,
+                                "⚠ Внимание: обнаружена утечка трафика — "
+                                + ", ".join(what) + " активен даже при выключенном обходе. "
+                                + "Проверьте, что Happ выключен.", "warn")
         self._update_controls()
 
     def _state_off(self, exc: Exception) -> None:
@@ -4781,6 +4843,14 @@ class BypassPanel(Panel):
         self.btn_refresh.configure(
             state="disabled" if self.busy or self.checking else "normal")
         self.btn_catch.configure(state="disabled" if self.busy else "normal")
+        if hasattr(self, "btn_check_ip"):
+            self.btn_check_ip.configure(state="disabled" if self.busy else "normal")
+        if hasattr(self, "btn_fix_tun"):
+            tun_on = bool(((happ.get("mode") or {}).get("tun")) or happ.get("tun"))
+            self.btn_fix_tun.configure(
+                state="disabled" if self.busy else "normal",
+                fg=ACCENT if (self.scope == "apps" and tun_on) else FG,
+            )
         gbd_installed = bool(gbd.get("installed"))
         self.btn_download.configure(state="disabled" if self.busy else "normal")
         if gbd_installed:

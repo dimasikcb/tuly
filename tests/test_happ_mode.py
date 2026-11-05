@@ -7,6 +7,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import sys
+from pathlib import Path
+
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+ROOT_DIR = TESTS_DIR.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from helpers import load_module
 
 app = load_module("bypass_core")
@@ -14,14 +24,24 @@ app = load_module("bypass_core")
 
 class HappModeTest(unittest.TestCase):
     def test_read_defaults_when_no_key(self) -> None:
-        with mock.patch.object(app, "_reg_get_int", lambda *a, **k: 1):
+        with mock.patch.object(app, "_reg_bool", lambda *a, **k: None):
             self.assertEqual(app.happ_mode_read(),
                              {"tun": True, "system_proxy": True})
 
     def test_read_respects_zero(self) -> None:
-        with mock.patch.object(app, "_reg_get_int", lambda *a, **k: 0):
+        with mock.patch.object(app, "_reg_bool", lambda *a, **k: False):
             self.assertEqual(app.happ_mode_read(),
                              {"tun": False, "system_proxy": False})
+
+    def test_read_prefers_real_systemproxy_key(self) -> None:
+        # Happ хранит настройку в «systemProxy» (REG_SZ); legacy «system_proxy»
+        # не должен перебивать реальное значение.
+        def fake(_key, name, default=True):
+            return {"tun": True, "systemProxy": False, "system_proxy": True}.get(name)
+
+        with mock.patch.object(app, "_reg_bool", fake):
+            self.assertEqual(app.happ_mode_read(),
+                             {"tun": True, "system_proxy": False})
 
     def test_write_sets_both_values(self) -> None:
         written = {}
@@ -30,32 +50,38 @@ class HappModeTest(unittest.TestCase):
             written[name] = value
             return True
 
-        with mock.patch.object(app, "_reg_set_int", fake_set), \
-                mock.patch.object(app, "_reg_get_int",
-                                  lambda _k, name, default: written.get(name, default)):
+        def fake_read(_key, name, default=True):
+            return written.get(name, default)
+
+        with mock.patch.object(app, "_reg_set_bool", fake_set), \
+                mock.patch.object(app, "_reg_set_int", lambda *a, **k: True), \
+                mock.patch.object(app, "_reg_bool", fake_read):
             result = app.happ_mode_write(tun=False, system_proxy=False)
-        self.assertEqual(written, {"tun": 0, "system_proxy": 0})
+        self.assertEqual(written, {"tun": False, "systemProxy": False})
         self.assertFalse(result["tun"])
         self.assertFalse(result["system_proxy"])
 
     def test_write_failure_raises(self) -> None:
-        with mock.patch.object(app, "_reg_set_int", lambda *a, **k: False):
+        with mock.patch.object(app, "_reg_set_bool", lambda *a, **k: False):
             with self.assertRaises(RuntimeError):
                 app.happ_mode_write(tun=False)
 
     def test_write_partial_keeps_other_value(self) -> None:
-        written = {"system_proxy": 1}
+        written = {"systemProxy": True}
 
         def fake_set(_key, name, value):
             written[name] = value
             return True
 
-        with mock.patch.object(app, "_reg_set_int", fake_set), \
-                mock.patch.object(app, "_reg_get_int",
-                                  lambda _k, name, default: written.get(name, default)):
+        def fake_read(_key, name, default=True):
+            return written.get(name, default)
+
+        with mock.patch.object(app, "_reg_set_bool", fake_set), \
+                mock.patch.object(app, "_reg_set_int", lambda *a, **k: True), \
+                mock.patch.object(app, "_reg_bool", fake_read):
             app.happ_mode_write(tun=False)
-        self.assertEqual(written["tun"], 0)
-        self.assertEqual(written["system_proxy"], 1)
+        self.assertEqual(written["tun"], False)
+        self.assertEqual(written["systemProxy"], True)
 
 
 class HappSocksPortTest(unittest.TestCase):

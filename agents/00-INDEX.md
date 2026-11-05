@@ -10,84 +10,53 @@
 
 ## Задачи
 
-| № | Файл задания | Кто правит | Статус на 2026-11-02 |
-|---|--------------|-----------|----------------------|
+| № | Файл задания | Кто правит | Статус |
+|---|--------------|-----------|--------|
 | 1 | `task-1-topic-card.md` | `leads_mail.py` | ✅ выполнено (35/35 записей с темой и ссылкой) |
 | 2 | `task-2-smart-search.md` | `leads_mail.py` + `tools.pyw` | ✅ выполнено |
 | 3 | `task-3-fill-topic-button.md` | `tools.pyw` | ✅ выполнено |
-| 4 | `task-4-open-2gis-click.md` | `tools.pyw` | ⚠️ работает по двойному клику; одиночный не привязан |
+| 4 | `task-4-open-2gis-click.md` | `tools.pyw` | ⚠️ работает по двойному клику |
 | 5 | `task-5-old-links.md` | данные + `leads_mail.py` | ✅ выполнено |
 | 6 | `task-6-tests.md` | `tests/test_leads_pool.py` | ✅ 40/40 ok |
-| 7 | `task-7-bypass-routing.md` | `bypass_core.py` + `tools.pyw` | ✅ автоматическое перенаправление новых процессов |
-
-Статус — это **факт проверки**, а не обещание. Если запускаешь агента на
-задаче со статусом ✅, его цель — не переписать код заново, а **проверить,
-что не сломалось**, и починить только найденное.
+| 7 | `task-7-bypass-routing.md` | `bypass_core.py` + `tools.pyw` | ✅ подхват процессов ProxiFyre |
+| 8 | `task-8-traffic-isolation.md` | `bypass_core.py` | ✅ выполнено (отключение ProxyEnable и TUN) |
+| 9 | `task-9-app-connection-reset.md` | `bypass_core.py` + `tools.pyw` | ✅ выполнено (чистый сброс и перезапуск правил) |
+| 10 | `task-10-auto-heal-and-diagnostics.md` | `bypass_core.py` + `tools.pyw` | ✅ выполнено (самодиагностика утечек и кнопка «⚡ Выключить TUN») |
+| 11 | `task-11-leads-interaction.md` | `tools.pyw` | ✅ выполнено (одиночный клик 2ГИС в LeadsPanel) |
+| 12 | `task-12-bundle-apps-catalog.md` | `apps_catalog.py` | ✅ выполнено (WorkBuddy AI как 1 программа вместо 4) |
+| 13 | `task-13-live-ip-and-verification.md` | `bypass_core.py` + `tools.pyw` | ✅ выполнено (кнопка «🌐 Проверить IP» в панели) |
+| 14 | `task-14-clean-disconnect-flush.md` | `bypass_core.py` | ✅ выполнено (гарантированный kill ядра и flushdns) |
+| 15 | `task-15-youtube-leak-on-disable.md` | `bypass_core.py` + `tools.pyw` + `tests/` | ✅ выполнено (устранение утечек, изоляция трафика, сброс ProxyEnable) |
 
 ---
 
-## Как раздавать работу параллельно
+## Волны параллельного запуска агентов
 
 ```
-Волна 1 (обязательно первой):
-  Агент A → task-1 (leads_mail.py) + task-2, часть «RU_CITIES»
-  Ждём: py_compile OK
+Волна A (Каталог и объединение процессов):
+  Агент A → task-12 (apps_catalog.py) [ВЫПОЛНЕНО] — WorkBuddy объединён в 1 программу
 
-Волна 2 (параллельно, разные файлы):
-  Агент B → task-2, части «_city_list / leads_collect / Combobox / start»
-            + task-3 + task-4          (tools.pyw)
-  Агент C → task-6                   (tests/test_leads_pool.py)
+Волна B (Сброс соединений и остановка ядра):
+  Агент B → task-14 (bypass_core.py) [ВЫПОЛНЕНО] — сброс DNS и жесткий kill при отключении
 
-Волна 3 (после всех):
-  Агент D → task-5 (данные) + финальная проверка
+Волна C (Проверка внешнего IP и отображение):
+  Агент C → task-13 (bypass_core.py + tools.pyw) [ВЫПОЛНЕНО] — кнопка «🌐 Проверить IP» в тулбаре
 ```
-
-Почему так: `tools.pyw` использует `leads_mail.RU_CITIES`, поэтому константа
-должна появиться раньше. Тесты пишутся параллельно коду — они проверяют
-контракт, а не реализацию.
 
 ---
 
 ## Общий контекст (нужен всем)
 
-**Проект:** Python 3.10+ / Tkinter. Одно окно `tools.pyw`, вкладка
-«Лиды 2ГИС»: парсит 2ГИС → горячие лиды в `hot_pool.csv` → таблица
-**Название · Тема · Контакты · 2ГИС** → ИИ-рассылка.
+**Проект:** Python 3.10+ / Tkinter. Одно окно `tools.pyw`.
+Разделы:
+- «Лиды 2ГИС»: сбор лидов, дедупликация, карточки, рассылка.
+- «Bypass»: обход DPI через GoodbyeDPI и выборочный обход по программам через Happ (SOCKS) + ProxiFyre.
 
 **Файлы, которые можно менять:**
 
 | Файл | Роль |
 |------|------|
-| `leads_mail.py` | пул: CSV, дедуп, статистика, рассылка. Без GUI |
-| `leads2gis.py` | парсер 2ГИС. Без GUI |
-| `tools.pyw` | GUI + оркестрация сбора |
-| `tests/test_leads_pool.py` | офлайн-тесты |
-
-**Не трогать:** `Tools.exe`, `build/`, `buildout/`, `.git`, разделы
-DNS / кликер / очистка / GitHub / Bypass внутри `tools.pyw`.
-
-**Формат `hot_pool.csv`** (`POOL_COLUMNS`, порядок важен):
-```
-name, telegram, max, vk, email, phone, city, topic, card, found_at, sent_at, channel, status
-```
-- контакты — **полные ссылки** (`https://t.me/...`), не ники;
-- `email` — `mailto:адрес`;
-- `topic` — поисковый запрос («барбершоп»);
-- `card` — `https://2gis.ru/<city>/firm/<id>`;
-- кодировка всегда `utf-8-sig`, `newline=""`;
-- запись только через `_pool_save()` (атомарно, retry, `PoolBusy`).
-
-**Проверка после любой правки:**
-```bat
-cd C:\Users\admin\Documents\тулы
-python -m py_compile leads_mail.py leads2gis.py tools.pyw
-python -X utf8 tests/test_leads_pool.py
-```
-Ожидание: компиляция без вывода, тесты заканчиваются строкой `все тесты прошли`.
-
-**Формат отчёта агента:**
-```
-Шаг N из M: <что сделал> → <результат>
-Готово. Тесты: 40/40 ok. Файлы: <список>.
-Что дальше: <одна строка или «—»>
-```
+| `apps_catalog.py` | каталог программ, объединение связанных процессов, поиск |
+| `bypass_core.py` | маршрутизация, остановка служб, проверка IP, flush DNS |
+| `tools.pyw` | GUI + плашка внешнего IP |
+| `tests/` | модульные тесты |

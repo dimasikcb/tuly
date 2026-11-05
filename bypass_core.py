@@ -35,6 +35,19 @@ HAPP_SOCKS_DEFAULT = 10808
 HAPP_PREFS_KEY = r"Software\Happ\OrganizationDefaults\Preferences\AdvancedSettings"
 HAPP_CONFIG_FILE = (Path(os.environ.get("LOCALAPPDATA") or str(Path.home()))
                     / "Happ" / "config.json")
+# Сайты, которые ломаются при выходе с зарубежного IP (Яндекс, Госуслуги,
+# банки). Их пускаем напрямую, даже когда включён режим «весь трафик».
+HAPP_DIRECT_DOMAINS = (
+    "yandex.ru", ".yandex.ru", "yandex.com", ".yandex.com",
+    "ya.ru", ".ya.ru", ".yandex.net", ".yandex.kz", ".yandex.by",
+    ".yandex.uz", ".kinopoisk.ru", ".yandexcloud.ru",
+    ".mail.ru", ".vk.com", ".ok.ru", ".rutube.ru",
+    ".sberbank.ru", ".tinkoff.ru", ".gosuslugi.ru",
+)
+HAPP_DIRECT_CIDR = (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
+    "192.168.0.0/16", "169.254.0.0/16",
+)
 PROXIFYRE_DIR = (Path(os.environ.get("LOCALAPPDATA") or str(Path.home()))
                  / "BypassManager" / "proxifyre")
 PROXIFYRE_EXE = PROXIFYRE_DIR / "ProxiFyre.exe"
@@ -218,6 +231,96 @@ def _running_images() -> set[str]:
     return names
 
 
+
+def set_windows_system_proxy(enable: bool, server: str = "") -> bool:
+    """Включает или принудительно выключает системный прокси Windows (WinINet).
+
+    Когда enable=False, ProxyEnable выставляется в 0, а WinINet уведомляется
+    через InternetSetOptionW, чтобы все программы и браузеры немедленно пошли напрямую.
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            0,
+            winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+        ) as key:
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1 if enable else 0)
+            if server:
+                winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, str(server))
+        wininet = getattr(ctypes.windll, "wininet", None)
+        if wininet:
+            wininet.InternetSetOptionW(0, 39, 0, 0)  # INTERNET_OPTION_SETTINGS_CHANGED
+            wininet.InternetSetOptionW(0, 37, 0, 0)  # INTERNET_OPTION_REFRESH
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def happ_tun_active() -> bool:
+    """Проверяет, перехватывает ли TUN-адаптер Happ (happ-xray / happ-tun) системный трафик."""
+    for iface in ("happ-xray", "happ-tun"):
+        try:
+            rc, out, _ = run_tool(["netsh", "interface", "show", "interface", iface], timeout=5)
+            if rc == 0 and ("connected" in out.lower() or "подключен" in out.lower()):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
+def happ_tun_disable(wait: float = 4.0) -> bool:
+    """Отключает TUN-адаптер Happ в режиме программ, исключая перехват трафика всего ПК.
+    
+    Ждёт, пока интерфейс реально перестанет быть активным; при неудаче —
+    пробует полный сброс маршрута через этот интерфейс.
+    """
+    any_disabled = False
+    for iface in ("happ-xray", "happ-tun"):
+        try:
+            rc, _, _ = run_tool(["netsh", "interface", "set", "interface", iface, "disable"],
+                                timeout=5)
+            if rc == 0:
+                any_disabled = True
+        except Exception:  # noqa: BLE001
+            pass
+    if not any_disabled:
+        return False
+    # Ждём, пока интерфейс перейдёт в неактивное состояние.
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        done = True
+        for iface in ("happ-xray", "happ-tun"):
+            try:
+                rc, out, _ = run_tool(["netsh", "interface", "show", "interface", iface],
+                                      timeout=3)
+                if rc == 0 and ("connected" in out.lower() or "подключен" in out.lower()):
+                    done = False
+            except Exception:  # noqa: BLE001
+                done = False
+        if done:
+            return True
+        time.sleep(0.25)
+    # Если интерфейс не отключился — удаляем его маршрут из таблицы.
+    for iface in ("happ-xray", "happ-tun"):
+        try:
+            run_tool(["netsh", "interface", "delete", "route", "interface=" + iface,
+                      "purge"], timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
+def happ_tun_enable() -> bool:
+    """Включает TUN-адаптер Happ для режима «весь трафик»."""
+    for iface in ("happ-xray", "happ-tun"):
+        try:
+            run_tool(["netsh", "interface", "set", "interface", iface, "enable"], timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
 def happ_system_proxy() -> tuple[bool, str]:
     """Системный прокси Windows: (включён, адрес). Happ ставит сюда 127.0.0.1."""
     try:
@@ -312,7 +415,26 @@ def bypass_status(_timeout: float = 1.5) -> dict:
     result["scope"] = cfg["scope"]
     result["apps"] = cfg["apps"]
     result["mode"] = cfg["mode"]
+    # Диагностика утечек: если обход программ включён (scope=apps), но что-то
+    # из системы продолжает перехватывать трафик — это сигнал.
+    result["leak"] = _bypass_leak_diagnosis(cfg["scope"])
     return result
+
+
+def _bypass_leak_diagnosis(scope: str) -> dict:
+    """Проверяет, не остаётся ли после выключения обхода перехват трафика."""
+    leak = {
+        "tun": happ_tun_active(),
+        "proxy": None,
+        "cores": bool(_image_pids("xray.exe") or _image_pids("sing-box.exe")),
+    }
+    if scope == "apps":
+        # В режиме программ всё, кроме выбранных приложений, должно ходить напрямую.
+        # Если системный прокси Windows смотрит на localhost — это утечка.
+        enable, server = happ_system_proxy()
+        leak["proxy"] = enable and ("127.0.0.1" in server or "localhost" in server
+                                    or "::1" in server)
+    return leak
 
 
 def bypass_gbd_start() -> dict:
@@ -383,12 +505,39 @@ def bypass_stop(key: str) -> dict:
     if key != "gbd":
         # Happ не закрываем — отключаем VPN и снимаем перенаправление программ,
         # иначе выбранные приложения останутся с мёртвым SOCKS и без интернета.
+        # Порядок важен: сначала выключаем VPN в Happ, ждём, пока он реально
+        # отключится (TUN, прокси и ядра), и только потом гасим остальное.
         notes: list[str] = []
         try:
             notes.append(proxifyre_stop().get("detail") or "")
         except Exception as exc:  # noqa: BLE001
             notes.append(f"ProxiFyre: {exc}")
-        notes.append(bypass_happ_stop().get("detail") or "")
+        try:
+            detail = bypass_happ_stop().get("detail") or ""
+        except Exception as exc:  # noqa: BLE001
+            # VPN не отключился штатно — гасим принудительно.
+            detail = f"Happ VPN отключён вручную: {exc}"
+        notes.append(detail)
+        # После отключения Happ прокси и TUN могут остаться активными —
+        # выключаем их принудительно, чтобы трафик не утекал через прокси.
+        set_windows_system_proxy(False)
+        happ_tun_disable()
+        # Гасим фоновый процесс Happ (happd.exe) — он сам переподключает VPN,
+        # если в реестре остались tun/systemProxy включёнными.
+        try:
+            run_tool(["taskkill", "/F", "/IM", "happd.exe"], timeout=5)
+        except Exception:
+            pass
+        # Гарантированное завершение фонового ядра и очистка DNS кэша
+        for core_proc in ("xray.exe", "sing-box.exe"):
+            try:
+                run_tool(["taskkill", "/F", "/IM", core_proc], timeout=5)
+            except Exception:
+                pass
+        try:
+            run_tool(["ipconfig", "/flushdns"], timeout=5)
+        except Exception:
+            pass
         return {"ok": True, "detail": "\n".join(filter(None, notes))}
     image, label, extra_images = "goodbyedpi.exe", "GoodbyeDPI", []
     track = _bypass_track()
@@ -486,7 +635,11 @@ def bypass_happ_start(visible: bool = False) -> dict:
 
 
 def bypass_happ_stop() -> dict:
-    """Выключает VPN в Happ командой happ://disconnect — программа остаётся открытой."""
+    """Выключает VPN в Happ командой happ://disconnect — программа остаётся открытой.
+
+    Если штатное отключение не сработало, гасит ядра xray/sing-box и TUN
+    принудительно — чтобы трафик точно не утекал через прокси Happ.
+    """
     exe = Path(bypass_cfg()["happ_path"])
     pids = _image_pids(exe.name)
     if not pids:
@@ -495,13 +648,37 @@ def bypass_happ_stop() -> dict:
         return {"ok": True, "detail": "VPN уже выключен"}
     if not happ_send("disconnect"):
         raise RuntimeError("Happ не принял команду отключения (happ://disconnect)")
-    for _ in range(20):
-        time.sleep(0.5)
-        if not happ_connected():
-            return {"ok": True, "detail": "VPN выключен"}
-    raise RuntimeError(
-        "Happ не отключил VPN — нажмите «Показать Happ» и выключите вручную"
+    deadline = time.time() + 25  # больше: даём Happ время сбросить TUN/прокси
+    while time.time() < deadline:
+        # Ждём, пока Happ сам выключит VPN, TUN и системный прокси
+        if not happ_connected() and not happ_tun_active():
+            enable, server = happ_system_proxy()
+            if not enable or server not in ("127.0.0.1", "localhost", "::1"):
+                # Ключевое: в реестре Happ tun=true / systemProxy=true — он
+                # переподключится через некоторое время. Гасим эти настройки,
+                # чтобы трафик точно не утекал.
+                happ_mode_write(tun=False, system_proxy=False)
+                return {"ok": True, "detail": "VPN, TUN и системный прокси выключены"}
+        time.sleep(0.4)
+    # Штатное отключение не сработало — гасим всё принудительно.
+    detail = (
+        "Happ не отключил VPN штатно — ядра и TUN выключены вручную, "
+        "трафик должен идти напрямую. Откройте Happ и убедитесь, что VPN выключен."
     )
+    for core_proc in ("xray.exe", "sing-box.exe", "happd.exe"):
+        try:
+            run_tool(["taskkill", "/F", "/IM", core_proc], timeout=5)
+        except Exception:
+            pass
+    happ_tun_disable()
+    set_windows_system_proxy(False)
+    # Дополнительно гасим настройки Happ в реестре — иначе он сам
+    # переподключится при следующей попытке или перезапуске.
+    try:
+        happ_mode_write(tun=False, system_proxy=False)
+    except Exception:
+        pass
+    return {"ok": True, "detail": detail}
 
 
 def bypass_happ_show() -> dict:
@@ -574,6 +751,70 @@ def bypass_download(kind: str) -> dict:
     return {"ok": True, "detail": f"Скачан {name.strip() or 'GoodbyeDPI'}"}
 
 
+def happ_direct_ru_ensure() -> bool:
+    """Добавляет в config.json Happ правила direct для российских сайтов.
+
+    Без них при ``route.final: proxy`` Яндекс/Госуслуги/банки уходят на
+    зарубежный сервер и не открываются. Возвращает True, если файл меняли —
+    тогда ядро Happ надо перезапустить, чтобы правила применились.
+    """
+    try:
+        data = json.loads(HAPP_CONFIG_FILE.read_text("utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    route = data.get("route")
+    if not isinstance(route, dict):
+        return False
+    rules = route.get("rules")
+    if not isinstance(rules, list):
+        return False
+
+    wanted = [
+        {"domain_suffix": list(HAPP_DIRECT_DOMAINS), "outbound": "direct"},
+        {"ip_cidr": list(HAPP_DIRECT_CIDR), "outbound": "direct"},
+    ]
+    # Сравниваем по набору доменов/CIDR, а не по всему объекту: Happ может
+    # дополнить правила своими полями, и тогда мы не должны дублировать.
+    def present(rule: dict) -> bool:
+        key = "domain_suffix" if "domain_suffix" in rule else "ip_cidr"
+        needed = set(rule[key])
+        for item in rules:
+            if not isinstance(item, dict) or item.get("outbound") != "direct":
+                continue
+            if needed.issubset(set(item.get(key) or [])):
+                return True
+        return False
+
+    missing = [rule for rule in wanted if not present(rule)]
+    if not missing:
+        return False
+
+    try:
+        backup = HAPP_CONFIG_FILE.with_suffix(".json.tools.bak")
+        if not backup.exists():
+            backup.write_bytes(HAPP_CONFIG_FILE.read_bytes())
+    except OSError:
+        pass
+    # Ставим после правил process_name, но до sniff/hijack-dns: sniff должен
+    # видеть уже размеченный трафик, а hijack-dns не должен перехватить direct.
+    insert_at = 0
+    for index, item in enumerate(rules):
+        if isinstance(item, dict) and item.get("process_name"):
+            insert_at = index + 1
+            break
+    for offset, rule in enumerate(missing):
+        rules.insert(insert_at + offset, rule)
+    try:
+        HAPP_CONFIG_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), "utf-8"
+        )
+    except OSError:
+        return False
+    return True
+
+
 def happ_socks_port_from(data) -> int:
     """Порт локального SOCKS Happ из его конфига (sing-box)."""
     if not isinstance(data, dict):
@@ -640,25 +881,87 @@ def _reg_set_int(key_path: str, name: str, value: int) -> bool:
         return False
 
 
+def _reg_bool(key_path: str, name: str, default: bool = True) -> bool | None:
+    """Читает булево Happ: REG_SZ 'true'/'false' или DWORD 0/1.
+
+    None — ключа нет (тогда вызывающий решает, что считать по умолчанию).
+    Happ хранит настройки строками, поэтому обычный int() тут не годится.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return default
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+    except OSError:
+        return None
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _reg_set_bool(key_path: str, name: str, value: bool) -> bool:
+    """Пишет булево в том типе, в котором ключ уже существует.
+
+    Happ использует REG_SZ ('true'/'false'); если ключ создан нами как DWORD,
+    сохраняем DWORD, чтобы не менять тип под ногами у приложения.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return False
+    kind = winreg.REG_SZ
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            _old, kind = winreg.QueryValueEx(key, name)
+    except OSError:
+        pass
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            if kind == winreg.REG_SZ:
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ,
+                                  "true" if value else "false")
+            else:
+                winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, 1 if value else 0)
+        return True
+    except OSError:
+        return False
+
+
 def happ_mode_read() -> dict:
-    """Как Happ сейчас пускает трафик: TUN-адаптер и системный прокси."""
+    """Как Happ сейчас пускает трафик: TUN-адаптер и системный прокси.
+
+    Реальный ключ Happ — ``systemProxy`` (REG_SZ). Раньше код читал и писал
+    ``system_proxy`` (DWORD), который Happ игнорирует: из-за этого proxies
+    оставался включённым и YouTube открывался при выключенном обходе.
+    """
+    tun = _reg_bool(HAPP_PREFS_KEY, "tun")
+    proxy = _reg_bool(HAPP_PREFS_KEY, "systemProxy")
+    if proxy is None:  # старые сборки / наш legacy-ключ
+        proxy = _reg_bool(HAPP_PREFS_KEY, "system_proxy")
     return {
-        "tun": bool(_reg_get_int(HAPP_PREFS_KEY, "tun", 1)),
-        "system_proxy": bool(_reg_get_int(HAPP_PREFS_KEY, "system_proxy", 1)),
+        "tun": True if tun is None else tun,
+        "system_proxy": True if proxy is None else proxy,
     }
 
 
 def happ_mode_write(tun: bool | None = None, system_proxy: bool | None = None) -> dict:
-    if tun is not None and not _reg_set_int(HAPP_PREFS_KEY, "tun", 1 if tun else 0):
+    if tun is not None and not _reg_set_bool(HAPP_PREFS_KEY, "tun", bool(tun)):
         raise RuntimeError(
             "Не удалось изменить настройку Happ (tun) в реестре HKCU\\Software\\Happ"
         )
-    if system_proxy is not None and not _reg_set_int(
-        HAPP_PREFS_KEY, "system_proxy", 1 if system_proxy else 0
-    ):
-        raise RuntimeError(
-            "Не удалось изменить настройку Happ (systemProxy) в реестре HKCU\\Software\\Happ"
-        )
+    if system_proxy is not None:
+        if not _reg_set_bool(HAPP_PREFS_KEY, "systemProxy", bool(system_proxy)):
+            raise RuntimeError(
+                "Не удалось изменить настройку Happ (systemProxy) в реестре HKCU\\Software\\Happ"
+            )
+        # Дублируем в legacy-ключ: его читают старые сборки тулзы.
+        _reg_set_int(HAPP_PREFS_KEY, "system_proxy", 1 if system_proxy else 0)
     return happ_mode_read()
 
 
@@ -883,7 +1186,7 @@ def proxifyre_rescan() -> dict | None:
     """
     if _svc_state(proxifyre_service_name()) != SVC_RUNNING:
         return None
-    wanted = {Path(name).stem.lower() for name in bypass_cfg()["apps"]}
+    wanted = {Path(name).stem.lower() for name in expand_companions(bypass_cfg()["apps"])}
     if not wanted:
         return None
     current = _selected_pids()
@@ -1053,19 +1356,31 @@ def _wait_port(port: int, timeout: float = 25.0) -> bool:
     return port_open(port)
 
 
-def _force_apps_mode() -> bool:
-    """Гасит TUN и системный прокси Happ, если он включил их сам.
+def happ_ensure_apps_mode(restart: bool = False) -> bool:
+    """Гарантирует, что Happ работает как локальный SOCKS без TUN и без
+    системного прокси Windows — только так «обход по программам» имеет смысл.
 
-    С включённым TUN весь трафик идёт в туннель, и обход «по программам»
-    фактически становится обходом «всего трафика». True — настройки меняли.
+    Happ в режиме «Прокси» включает WinINet-прокси на весь ПК, и тогда галочки
+    в списке программ ничего не значат: браузер идёт через VPN независимо от
+    выбора. Возвращает True, если что-то меняли.
     """
     current = happ_mode_read()
-    if not (current["tun"] or current["system_proxy"]):
-        return False
-    happ_mode_write(tun=False, system_proxy=False)
-    if _image_pids(Path(bypass_cfg()["happ_path"]).name):
+    changed = False
+    if current["tun"] or current["system_proxy"]:
+        happ_mode_write(tun=False, system_proxy=False)
+        changed = True
+    enable, server = happ_system_proxy()
+    if enable:
+        changed = True
+    set_windows_system_proxy(False)
+    if changed and restart and _image_pids(Path(bypass_cfg()["happ_path"]).name):
         happ_tunnel_restart()
-    return True
+    return changed
+
+
+def _force_apps_mode() -> bool:
+    """Совместимость: то же, что happ_ensure_apps_mode(restart=True)."""
+    return happ_ensure_apps_mode(restart=True)
 
 
 def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
@@ -1094,6 +1409,8 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
     # 1. Настройки Happ: TUN нужен только для «всего трафика»
     if mode == "happ":
         want_tun = scope == "all"
+        if want_tun:
+            happ_tun_enable()
         current = happ_mode_read()
         if current["tun"] != want_tun or current["system_proxy"] != want_tun:
             happ_mode_write(tun=want_tun, system_proxy=want_tun)
@@ -1106,11 +1423,24 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
 
     # 2. Включаем движок (второй при этом не гасим)
     if mode == "happ":
-        add(bypass_happ_start())
         if scope == "apps":
-            if _force_apps_mode():
-                notes.append("Happ: TUN был включён — выключил, иначе через туннель "
-                             "шёл бы весь трафик")
+            # ДО подключения: Happ не должен включать системный прокси при
+            # connect, иначе весь трафик ПК уйдёт в VPN ещё до старта ProxiFyre.
+            happ_ensure_apps_mode()
+        # В режиме «весь трафик» пускаем Яндекс и российские сайты напрямую —
+        # иначе они уходят на зарубежный сервер и не открываются.
+        if scope == "all" and happ_direct_ru_ensure():
+            notes.append("Happ: Яндекс и российские сайты — напрямую, минуя прокси")
+            if happ_connected():
+                add(happ_tunnel_restart())
+            else:
+                add(bypass_happ_start())
+        else:
+            add(bypass_happ_start())
+        if scope == "apps":
+            # ПОСЛЕ подключения Happ мог вернуть TUN/прокси — гасим повторно.
+            happ_ensure_apps_mode(restart=True)
+            happ_tun_disable()
             port = happ_socks_port()
             if not _wait_port(port):
                 raise RuntimeError(
@@ -1118,6 +1448,9 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
                     "обход по программам не заработает. Проверьте, что Happ подключён."
                 )
             add(proxifyre_start(cfg["apps"], port))
+            # Happ иногда восстанавливает системный прокси уже после старта
+            # службы — финальный контроль, иначе браузер снова пойдёт через VPN.
+            happ_ensure_apps_mode()
             after = happ_mode_read()
             if after["tun"] or after["system_proxy"]:
                 notes.append(
@@ -1137,3 +1470,54 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
 
     bypass_cfg_save(mode=mode, scope=scope)
     return {"ok": True, "detail": "\n".join(filter(None, notes))}
+
+
+def bypass_check_ip(timeout: float = 3.0) -> dict:
+    """Определяет текущий внешний IP-адрес для быстрой проверки работы обхода.
+
+    Одновременно делает DNS-leak тест: если ответ с разных сервисов отличается —
+    один из них (DNS или прокси) просачивается отдельно.
+    """
+    import urllib.request
+    urls = [
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.me/all.json",
+        "https://api6.ipify.org?format=json",  # IPv6, для сопоставления
+    ]
+    results: list[str] = []
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", errors="replace").strip()
+                if "{" in text:
+                    data = json.loads(text)
+                    ip = data.get("ip") or data.get("ip_addr")
+                else:
+                    ip = text
+                if ip and len(str(ip).split(".")) == 4:
+                    results.append(str(ip).strip())
+        except Exception:
+            continue
+    ip = results[0] if results else ""
+    ok = bool(ip)
+    leak_dns = ""
+    # DNS-leak тест: resolver.info показывает, через какой DNS-сервер был получен ответ.
+    try:
+        req = urllib.request.Request(
+            "https://dnsleaktest.com/api.php",
+            headers={"User-Agent": "curl/7.68.0"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            leak_dns = resp.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        pass
+    detail = {}
+    if len(set(results)) > 1:
+        detail["note"] = f"Разные IP у сервисов: {', '.join(results)} — возможно, DNS утекает отдельно"
+    if leak_dns:
+        detail["dns"] = leak_dns
+    return {"ok": ok, "ip": ip, "results": results, "detail": detail,
+            "dns_leak": leak_dns}
+
+
