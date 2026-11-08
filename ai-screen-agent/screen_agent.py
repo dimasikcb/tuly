@@ -7,10 +7,10 @@ import sys
 import os
 import json
 import time
-import io
 import threading
 import queue
 import base64
+from collections import deque
 import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageTk, ImageGrab, ImageDraw
@@ -40,19 +40,79 @@ except ImportError:
 
 import requests
 
+# Служебные модули рядом со скриптом (их импорт без GUI и без сети):
+# agent_window   — скрытие окна из скриншотов (WDA_EXCLUDEFROMCAPTURE) + детект самоклика
+# agent_progress — diff_ratio + StagnationTracker (детект зависания автоцикла)
+# agent_speed    — downscale_for_api + encode_jpeg + get_session (ускорение шага)
+import agent_window
+import agent_progress
+import agent_speed
+
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+# Детект «экран изменился после клика» — по АБСОЛЮТНОМУ числу различающихся
+# пикселей уменьшенного снапшота (agent_progress.diff_stats +
+# MIN_CHANGED_PIXELS). Прежняя доля 0.5% (SCREEN_CHANGE_MIN_RATIO) пропускала
+# реальный прогресс: успешный клик по радиокнопке/чекбоксу без широкой
+# подсветки строки меняет ~0.016% кадра (замер симуляцией на ROI 2879x1629 —
+# это ~6 пикселей снапшота 256x145) и проходил как «экран НЕ изменился», из-за
+# чего промпт врал модели «опция уже выбрана — жми Далее», и ответ уходил
+# невыбранным. Пайплайн сравнения детерминирован: два захвата статичного
+# экрана дают ровно 0 различающихся пикселей, поэтому порог «>= 4 пикселей»
+# отделяет шум от отметки чекбокса/радио (обоснование — в agent_progress).
+
+
+_desktop_tls = threading.local()
 
 
 def ensure_interactive_desktop():
-    """Переключает поток на интерактивный рабочий стол Windows, если запущен в изолированной среде."""
+    """Переключает поток на интерактивный рабочий стол Windows, если запущен в изолированной среде.
+
+    Вызывается перед каждым захватом, но реально работает один раз на поток —
+    рабочий стол у потока между захватами не меняется. Хэндл OpenDesktopW
+    закрывается сразу после SetThreadDesktop: раньше OpenDesktopW звался на
+    каждый захват и хэндл никогда не закрывался (+1 USER-хэндл на захват,
+    ~3 хэндла/шаг с after-снимком — длинная сессия утекала в тысячи хэндлов).
+    """
+    if getattr(_desktop_tls, "done", False):
+        return
     if sys.platform == "win32":
         try:
             user32 = ctypes.windll.user32
             h_def = user32.OpenDesktopW("Default", 0, False, 0x01FF)
             if h_def:
-                user32.SetThreadDesktop(h_def)
+                try:
+                    user32.SetThreadDesktop(h_def)
+                finally:
+                    user32.CloseDesktop(h_def)
         except Exception:
             pass
+    _desktop_tls.done = True
+
+
+def resolve_click_scale(x, y):
+    """Переводит координаты из ответа модели в доли (0.0..1.0) относительно ROI.
+
+    Промпт требует целые 0..1000, но прежняя эвристика «обе координаты <= 100
+    значит шкала 0..100» ломала валидные ответы 0..1000 из левого верхнего
+    угла (~10%x10% ROI): (80, 40) читалось как 80%x40% — клик улетал в центр
+    вместо первой опции; (1, 1) читалось как 100%x100% — в правый нижний угол.
+    Правила теперь такие (контракт промпта приоритетнее совместимости):
+      * обе координаты целые (в т.ч. 80.0) => шкала 0..1000;
+      * обе <= 1.0 и хотя бы одна дробная (0.4) => нормализованные 0..1;
+      * обе <= 100 и хотя бы одна дробная (37.5) => проценты 0..100;
+      * иначе => 0..1000.
+    Выход за диапазон 0..1000 клампится.
+    """
+    x = min(max(float(x), 0.0), 1000.0)
+    y = min(max(float(y), 0.0), 1000.0)
+    if float(x).is_integer() and float(y).is_integer():
+        return x / 1000.0, y / 1000.0
+    if x <= 1.0 and y <= 1.0:
+        return x, y
+    if x <= 100.0 and y <= 100.0:
+        return x / 100.0, y / 100.0
+    return x / 1000.0, y / 1000.0
 
 
 class ScreenSelector(tk.Toplevel):
@@ -134,12 +194,47 @@ class AIScreenAgentApp:
         self.worker_thread = None
         self.log_queue = queue.Queue()
         self.last_preview_img = None
+        # Детект зависания автоцикла и короткая история кликов для промпта
+        self._stagnation = agent_progress.StagnationTracker()
+        self._action_history = deque(maxlen=3)  # последние 3 клика: (norm_x, norm_y, screen_changed)
+        # Поколения воркеров: СТОП во время висящего API-вызова + быстрый СТАРТ
+        # раньше сбрасывали stop_requested, старый воркер продолжал цикл, и два
+        # воркера кликали одновременно. Теперь СТАРТ поднимает номер поколения,
+        # а воркер предыдущего выходит по несовпадению (и не кликает: см.
+        # should_abort в execute_one_cycle).
+        self._worker_generation = 0
+        self._single_step_running = False  # СТАРТ блокируется, пока идёт одиночный шаг
+        # Fallback-скрытие окна на время захвата (когда WDA_EXCLUDEFROMCAPTURE
+        # не сработал): пояснение в журнал пишем один раз, а не на каждый захват
+        self._hide_fallback_logged = False
+        self._capture_hide_lock = threading.Lock()
+        self._capture_hide_depth = 0  # >0 — окно уже спрятано параллельным захватом
 
         # Загрузка конфига
         self.config = self.load_config()
 
         # Создание интерфейса
         self.setup_ui()
+
+        # Зеркало Tk-переменных для worker-потока. Прямые .get() из потока
+        # формально небезопасны (падают «main thread is not in main loop»,
+        # если mainloop ещё не запущен), поэтому значения копируются в обычный
+        # dict трассировкой на главном потоке; worker читает только dict.
+        self._ui_snapshot = {
+            "api_key": self.config.get("api_key", ""),
+            "model": self.config.get("model", "gemini-2.5-flash"),
+            "custom_hint": self.config.get("custom_instruction", ""),
+            "smooth_mouse": bool(self.config.get("smooth_mouse", True)),
+            "delay": float(self.config.get("delay", 2.5)),
+        }
+        self._install_ui_snapshot_traces()
+
+        # Исключаем собственное окно из захвата экрана (WDA_EXCLUDEFROMCAPTURE):
+        # пользователь продолжает его видеть, но окно исчезает из скриншотов,
+        # OBS и шаринга экрана, а модель больше не принимает его за часть теста.
+        # Статус операции (✅/⚠️) модуль сам пишет в журнал через self.log;
+        # HWND при этом привязывается даже при неудаче — детект самоклика работает.
+        agent_window.exclude_from_capture(self.root, self.log)
 
         # Восстановление сохраненного ROI
         roi_saved = self.config.get("roi")
@@ -509,6 +604,23 @@ class AIScreenAgentApp:
         if custom_hint:
             prompt += f"\nUser extra hint: {custom_hint}\n"
 
+        # История последних кликов: без неё каждый запрос stateless и модель
+        # повторяет уже сделанный клик в выбранную опцию. Теперь она видит,
+        # какой клик не изменил экран, и получает явное правило нажимать «Далее».
+        if self._action_history:
+            hist_lines = [
+                f"- clicked ({hx:.0f}, {hy:.0f}) in 0-1000 image coords — "
+                + ("screen CHANGED" if changed else "screen did NOT change")
+                for hx, hy, changed in self._action_history
+            ]
+            prompt += (
+                "\nHistory of your recent clicks (oldest first):\n"
+                + "\n".join(hist_lines) + "\n"
+                "RULE: if your previous click on an answer option did NOT change the screen, "
+                "that option is already selected — do NOT click the same point again; "
+                "click the 'Далее' / 'Next' / 'Submit' / 'Ответить' button instead.\n"
+            )
+
         b64_img = base64.b64encode(img_bytes).decode("utf-8")
 
         # 1. Запрос к APInex / OpenRouter / OpenAI-совместимому API
@@ -532,7 +644,8 @@ class AIScreenAgentApp:
                 ],
                 "response_format": {"type": "json_object"}
             }
-            res = requests.post(url, headers=headers, json=payload, timeout=35)
+            # Общий Session с keep-alive: без DNS+TCP+TLS-handshake на каждый шаг
+            res = agent_speed.get_session().post(url, headers=headers, json=payload, timeout=35)
             if res.status_code != 200:
                 raise RuntimeError(f"HTTP {res.status_code}: {res.text}")
             res_data = res.json()
@@ -570,7 +683,8 @@ class AIScreenAgentApp:
             ],
             "generationConfig": {"response_mime_type": "application/json", "temperature": 0.1}
         }
-        res = requests.post(url, json=payload, timeout=35)
+        # Общий Session с keep-alive и здесь (REST-fallback Google)
+        res = agent_speed.get_session().post(url, json=payload, timeout=35)
         if res.status_code != 200:
             raise RuntimeError(f"HTTP {res.status_code}: {res.text}")
         res_data = res.json()
@@ -618,15 +732,19 @@ class AIScreenAgentApp:
         rx, ry, rw, rh = self.roi
         self.log(f"📸 Захват области {rw}x{rh}...")
 
+        prep_t0 = time.time()
         img = self.capture_roi_image()
         if not img:
             self.log("❌ Не удалось захватить снимок экрана.")
             return False
 
-        # Конвертация в JPEG bytes
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        img_bytes = buf.getvalue()
+        # Подготовка кадра: даунскейл до 1536 px по большей стороне + JPEG q80 —
+        # payload меньше в ~2.4 раза, vision-токенов в ~3.5 раза меньше;
+        # модель отвечает в координатах 0-1000 относительно картинки,
+        # поэтому пересчёт клика в пиксели ROI не меняется.
+        api_img = agent_speed.downscale_for_api(img)
+        img_bytes = agent_speed.encode_jpeg(api_img)
+        prep_s = time.time() - prep_t0
 
         self.log(f"🧠 Отправка в {self.model_var.get()}...")
         start_t = time.time()
@@ -642,7 +760,7 @@ class AIScreenAgentApp:
         norm_x = result["x"]
         norm_y = result["y"]
 
-        self.log(f"💡 ИИ ({elapsed:.1f}с): {thought}")
+        self.log(f"💡 ИИ ({elapsed:.1f}с API, {prep_s:.2f}с подготовка): {thought}")
 
         if action == "done":
             self.log("🏁 ИИ сообщает: Тест завершен!")
@@ -666,6 +784,15 @@ class AIScreenAgentApp:
         screen_x = max(rx + 2, min(rx + rw - 2, screen_x))
         screen_y = max(ry + 2, min(ry + rh - 2, screen_y))
 
+        # Детект самоклика: модель показала в наше собственное окно —
+        # не кликаем (можно было бы нажать собственную кнопку СТОП), шаг пропускаем
+        if agent_window.point_in_tool_window(screen_x, screen_y):
+            self.log(
+                f"⚠️ Точка ({screen_x}, {screen_y}) попадает в окно программы "
+                f"{agent_window.tool_window_rect()} — шаг пропущен, чтобы не кликнуть в себя."
+            )
+            return False
+
         # Обновляем превью с точкой клика
         self.root.after(0, lambda: self.capture_and_update_preview((local_click_x, local_click_y)))
 
@@ -680,6 +807,45 @@ class AIScreenAgentApp:
 
         time.sleep(0.08)
         pyautogui.click()
+
+        # Прогресс после клика: сравниваем кадр ДО клика с текущим экраном.
+        # ImageGrab курсор не захватывает, так что смещение мыши не мешает.
+        time.sleep(0.5)  # даём странице перерисоваться после клика
+        screen_changed = False
+        try:
+            after_img = self.capture_roi_image()
+            if after_img is not None:
+                ratio = agent_progress.diff_ratio(img, after_img)
+                screen_changed = ratio >= SCREEN_CHANGE_MIN_RATIO
+                self.log(
+                    f"📊 Экран после клика {'изменился' if screen_changed else 'НЕ изменился'} "
+                    f"(diff {ratio * 100:.1f}%)."
+                )
+        except Exception as e:
+            self.log(f"⚠️ Не удалось сравнить кадры до/после клика: {e}")
+
+        # Короткая история для промпта: модель увидит её на следующем шаге
+        self._action_history.append((norm_x, norm_y, screen_changed))
+
+        # Детект зависания: та же точка + неменяющийся экран N шагов подряд.
+        # 'repeat' — только предупреждение (кнопка «Далее» на одном месте —
+        # легитимный случай); авто-режим останавливаем исключительно на 'stalled'.
+        status = self._stagnation.register((screen_x, screen_y), screen_changed)
+        if status == agent_progress.STATUS_STALLED:
+            self.log(
+                f"🛑 Зависание: {self._stagnation.same_target_count} шага подряд в точку "
+                f"({screen_x}, {screen_y}), экран не меняется — останавливаю авто-режим. "
+                f"Возможно, ответ уже выбран (нажмите «Далее» вручную) или окно программы "
+                f"перекрывает область теста."
+            )
+            if self.is_running:
+                self.root.after(0, self.stop)
+        elif status == agent_progress.STATUS_REPEAT:
+            self.log(
+                f"⚠️ Та же точка {self._stagnation.same_target_count} шаг(ов) подряд: "
+                f"({screen_x}, {screen_y}). Модель получит подсказку нажать «Далее»."
+            )
+
         return True
 
     def do_single_step(self):
@@ -711,6 +877,8 @@ class AIScreenAgentApp:
 
         self.is_running = True
         self.stop_requested = False
+        self._stagnation.reset()       # детект зависания начинает с чистого листа
+        self._action_history.clear()   # история кликов для промпта — тоже
         self.start_btn.config(text="⏹ СТОП", bg="#dc3545")
         self.select_btn.config(state="disabled")
         self.step_btn.config(state="disabled")
