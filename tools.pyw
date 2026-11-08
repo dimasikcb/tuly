@@ -6,7 +6,7 @@
   * AutoClicker          — клики по точкам, областям и картинкам;
   * Пустые файлы и папки — поиск и удаление пустых файлов и папок;
   * DNS                  — Quad9 / Xbox / DHCP + DNS-over-HTTPS;
-  * Очистка Windows      — Temp, кэши, корзина, Windows.old.
+  * Дневник МО           — оценки, «5» до 4.50 и запас прочности (diary-grades/).
 
 Запуск: двойной клик по tools.pyw (или pythonw tools.pyw).
 """
@@ -44,9 +44,13 @@ from bypass_core import (
     _find_happ,
     bypass_admin,
     bypass_apply,
+    bypass_auto_heal_if_leak,
     bypass_cfg,
     bypass_cfg_save,
+    bypass_check_direct_ip,
     bypass_check_ip,
+    bypass_check_proxy_ip,
+    bypass_compare_connections,
     bypass_download,
     bypass_happ_show,
     bypass_status,
@@ -61,6 +65,7 @@ from bypass_core import (
     proxifyre_stop,
     set_windows_system_proxy,
 )
+import shutdown_watcher as wsh
 from winbase import (
     APP_DIR,
     APP_FILE,
@@ -130,26 +135,41 @@ def _dpi_aware() -> None:
 _dpi_aware()
 
 # --------------------------------------------------------------------------- #
-#  Зависимости (нужны только автокликеру)
+#  Зависимости автокликера (cv2 / numpy / pyautogui / PIL / keyboard).
+#  Раньше импортировались при старте ВСЕГДА и добавляли до 1 с к открытию окна,
+#  даже если нужна вкладка «Лиды» или «Bypass». Теперь грузятся лениво:
+#  load_autoclicker_deps() вызывается в AutoClickerPanel.__init__.
 # --------------------------------------------------------------------------- #
-try:
-    import cv2
-    import numpy as np
-    import pyautogui
-    from PIL import Image, ImageGrab
+HAS_DEPS = False
+DEPS_ERROR = ""
+HAS_KEYBOARD = False
 
-    HAS_DEPS = True
-    DEPS_ERROR = ""
-except Exception as _dep_error:  # noqa: BLE001
-    HAS_DEPS = False
-    DEPS_ERROR = str(_dep_error)
 
-try:
-    import keyboard
+def load_autoclicker_deps() -> None:
+    """Подгружает CV-стек при первом открытии вкладки AutoClicker."""
+    global HAS_DEPS, DEPS_ERROR, HAS_KEYBOARD
+    global cv2, np, pyautogui, Image, ImageGrab, keyboard
+    if HAS_DEPS or DEPS_ERROR:
+        return
+    try:
+        import cv2
+        import numpy as np
+        import pyautogui
+        from PIL import Image, ImageGrab
 
-    HAS_KEYBOARD = True
-except Exception:  # noqa: BLE001
-    HAS_KEYBOARD = False
+        HAS_DEPS = True
+        DEPS_ERROR = ""
+        pyautogui.PAUSE = 0
+        pyautogui.FAILSAFE = True
+    except Exception as _dep_error:  # noqa: BLE001
+        HAS_DEPS = False
+        DEPS_ERROR = str(_dep_error)
+    try:
+        import keyboard
+
+        HAS_KEYBOARD = True
+    except Exception:  # noqa: BLE001
+        HAS_KEYBOARD = False
 
 
 # --------------------------------------------------------------------------- #
@@ -795,137 +815,6 @@ def risk_warning(path: str) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-#  Очистка Windows: движок
-# --------------------------------------------------------------------------- #
-@dataclass
-class CleanupTarget:
-    key: str
-    label: str
-    paths: list[Path] = field(default_factory=list)
-    special: str = ""  # "" | "recycle" | "old"
-
-
-def build_cleanup_targets() -> list[CleanupTarget]:
-    windows = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-    local = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
-    program_data = Path(os.environ.get("ProgramData", r"C:\ProgramData"))
-    home = Path.home()
-    user_temp = os.environ.get("TEMP", "")
-    return [
-        CleanupTarget("win_temp", "Временные файлы Windows", [windows / "Temp"]),
-        CleanupTarget("user_temp", "Временные файлы пользователя", [Path(user_temp)] if user_temp else []),
-        CleanupTarget("prefetch", "Prefetch", [windows / "Prefetch"]),
-        CleanupTarget("update", "Кэш обновлений Windows", [windows / "SoftwareDistribution" / "Download"]),
-        CleanupTarget("wer", "Отчёты об ошибках", [program_data / "Microsoft" / "Windows" / "WER"]),
-        CleanupTarget("dumps", "Дампы падений", [local / "CrashDumps"]),
-        CleanupTarget("d3d", "Кэш шейдеров DirectX", [local / "D3DCache"]),
-        CleanupTarget("chrome", "Кэш Chrome", [
-            local / "Google" / "Chrome" / "User Data" / "Default" / "Cache",
-            local / "Google" / "Chrome" / "User Data" / "Default" / "Code Cache",
-        ]),
-        CleanupTarget("edge", "Кэш Edge", [
-            local / "Microsoft" / "Edge" / "User Data" / "Default" / "Cache",
-            local / "Microsoft" / "Edge" / "User Data" / "Default" / "Code Cache",
-        ]),
-        CleanupTarget("npm", "Кэш npm", [home / ".npm" / "_cacache", local / "npm" / "_cacache"]),
-        CleanupTarget("pip", "Кэш pip", [local / "pip" / "cache", home / ".cache" / "pip"]),
-        CleanupTarget("recycle", "Корзина", special="recycle"),
-        CleanupTarget("old", "Windows.old", [windows.parent / "Windows.old"], special="old"),
-    ]
-
-
-def dir_size(path: Path) -> int:
-    """Размер папки без перехода по ссылкам и junction-папкам."""
-    total = 0
-    try:
-        entries = list(os.scandir(path))
-    except OSError:
-        return 0
-    for entry in entries:
-        try:
-            st = entry.stat(follow_symlinks=False)
-        except OSError:
-            continue
-        if entry.is_symlink() or _is_reparse(st):
-            continue
-        if entry.is_dir(follow_symlinks=False):
-            total += dir_size(Path(entry.path))
-        else:
-            total += int(st.st_size)
-    return total
-
-
-def _purge_dir(path: Path) -> tuple[int, int]:
-    """Удаляет содержимое папки, саму папку оставляет. Возвращает (байты, ошибки)."""
-    freed = 0
-    errors = 0
-    try:
-        entries = list(os.scandir(path))
-    except OSError:
-        return 0, 1
-    for entry in entries:
-        try:
-            st = entry.stat(follow_symlinks=False)
-        except OSError:
-            errors += 1
-            continue
-        if entry.is_symlink() or _is_reparse(st):
-            continue
-        if entry.is_dir(follow_symlinks=False):
-            sub_freed, sub_errors = _purge_dir(Path(entry.path))
-            freed += sub_freed
-            errors += sub_errors
-            try:
-                os.rmdir(entry.path)
-            except OSError:
-                errors += 1
-        else:
-            size = int(st.st_size)
-            try:
-                os.remove(entry.path)
-                freed += size
-            except OSError:
-                errors += 1
-    return freed, errors
-
-
-def purge_paths(paths: list[Path]) -> tuple[int, int]:
-    freed = 0
-    errors = 0
-    for path in paths:
-        if not path.is_dir():
-            continue
-        part_freed, part_errors = _purge_dir(path)
-        freed += part_freed
-        errors += part_errors
-    return freed, errors
-
-
-def empty_recycle_bin() -> bool:
-    try:
-        result = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 0x1 | 0x2 | 0x4)
-    except Exception:  # noqa: BLE001
-        return False
-    return int(result) in (0, 1)
-
-
-def disk_space() -> tuple[int, int] | None:
-    """(свободно, всего) на системном диске."""
-    try:
-        usage = shutil.disk_usage(Path(os.environ.get("SystemDrive", "C:") + os.sep))
-    except OSError:
-        return None
-    return usage.free, usage.total
-
-
-def delete_windows_old() -> bool:
-    old = Path(os.environ.get("SystemRoot", r"C:\Windows")).parent / "Windows.old"
-    if not old.exists():
-        return True
-    shutil.rmtree(old, ignore_errors=True)
-    return not old.exists()
-
-# --------------------------------------------------------------------------- #
 #  AutoClicker: шаги, оверлей, поиск по картинке
 # --------------------------------------------------------------------------- #
 KIND_NAMES = {"point": "Точка", "area": "Область", "image": "Картинка"}
@@ -1260,6 +1149,7 @@ class Panel(ttk.Frame):
 # --------------------------------------------------------------------------- #
 class AutoClickerPanel(Panel):
     def __init__(self, master: tk.Misc, hub) -> None:
+        load_autoclicker_deps()  # тяжёлый CV-стек — только при открытии этой вкладки
         super().__init__(master, hub)
         self.steps: list[Step] = []
         self.running = False
@@ -1291,6 +1181,7 @@ class AutoClickerPanel(Panel):
         ttk.Button(bar, text="↑", command=lambda: self.move_selected(-1), width=3).pack(side="left", padx=(px(6), 0))
         ttk.Button(bar, text="↓", command=lambda: self.move_selected(1), width=3).pack(side="left", padx=(4, 0))
         ttk.Button(bar, text="Очистить", command=self.clear_steps, width=10).pack(side="left", padx=(px(6), 0))
+        flat_button(bar, "🤖 AI Агент", lambda: self.hub.show("ai_agent"), kind="ghost").pack(side="left", padx=(12, 0))
 
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill="both", expand=True, pady=(px(10), 0))
@@ -2232,234 +2123,6 @@ class DnsPanel(Panel):
         state = "normal" if enabled else "disabled"
         for button in self.action_buttons:
             button.configure(state=state)
-
-# --------------------------------------------------------------------------- #
-#  Панель: очистка Windows
-# --------------------------------------------------------------------------- #
-class CleanupPanel(Panel):
-    def __init__(self, master: tk.Misc, hub) -> None:
-        super().__init__(master, hub)
-        self.targets = build_cleanup_targets()
-        self.vars: dict[str, tk.BooleanVar] = {}
-        self.size_vars: dict[str, tk.StringVar] = {}
-        self.checkbuttons: dict[str, tk.Checkbutton] = {}
-        self.sizes: dict[str, int | None] = {}
-        self.busy = False
-        self._build()
-        self.refresh_sizes()
-
-    def _build(self) -> None:
-        card = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        card.pack(fill="x")
-        grid = tk.Frame(card, bg=CARD)
-        grid.pack(fill="x", padx=px(16), pady=px(12))
-        for column in range(2):
-            grid.columnconfigure(column, weight=1)
-
-        for index, target in enumerate(self.targets):
-            row, column = index % 7, index // 7
-            cell = tk.Frame(grid, bg=CARD)
-            cell.grid(row=row, column=column, sticky="ew", padx=(0, px(26)), pady=px(2))
-            variable = tk.BooleanVar(value=target.special not in ("recycle", "old"))
-            self.vars[target.key] = variable
-            check = dark_check(cell, target.label, variable, bg=CARD, command=self._update_total)
-            check.pack(side="left")
-            self.checkbuttons[target.key] = check
-            size_var = tk.StringVar(value="…")
-            self.size_vars[target.key] = size_var
-            tk.Label(cell, textvariable=size_var, bg=CARD, fg=MUTED,
-                     font=("Segoe UI", 8)).pack(side="right")
-
-        actions = ttk.Frame(self)
-        actions.pack(fill="x", pady=(px(14), 0))
-        self.refresh_btn = flat_button(actions, "Пересчитать размеры", self.refresh_sizes,
-                                       kind="ghost")
-        self.refresh_btn.pack(side="left")
-        self.clean_btn = flat_button(actions, "Очистить выбранное", self.start_clean,
-                                     kind="danger")
-        self.clean_btn.pack(side="left", padx=(px(8), 0))
-        self.total_var = tk.StringVar(value="Выбрано: —")
-        ttk.Label(actions, textvariable=self.total_var, style="Muted.TLabel").pack(side="right")
-
-        ttk.Label(
-            self,
-            text="Личные файлы не затрагиваются. Корзина и Windows.old удаляются безвозвратно.",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=(px(12), 0))
-
-        log_frame, self.log_box = self.make_log(self, height=9)
-        log_frame.pack(fill="both", expand=True, pady=(px(10), 0))
-        self.append_log(self.log_box, "Здесь появится журнал очистки.")
-
-    # -- размеры ----------------------------------------------------------- #
-    def _available(self, target: CleanupTarget) -> bool:
-        if target.special == "recycle":
-            return True
-        return any(path.exists() for path in target.paths)
-
-    def refresh_sizes(self) -> None:
-        if self.busy:
-            return
-        self.busy = True
-        self._set_buttons(False)
-        for variable in self.size_vars.values():
-            variable.set("…")
-
-        def work() -> dict[str, int | None]:
-            sizes: dict[str, int | None] = {}
-            for target in self.targets:
-                if target.special == "recycle":
-                    sizes[target.key] = None
-                elif not self._available(target):
-                    sizes[target.key] = -1
-                else:
-                    sizes[target.key] = sum(dir_size(path) for path in target.paths if path.exists())
-            return sizes
-
-        self.hub.run_bg(work, self._sizes_done, self._fail)
-
-    def _sizes_done(self, sizes: dict[str, int | None]) -> None:
-        self.busy = False
-        self.sizes = sizes
-        for target in self.targets:
-            size = sizes.get(target.key)
-            if size == -1:
-                self.size_vars[target.key].set("нет")
-            else:
-                self.size_vars[target.key].set(fmt_size(size))
-        self._set_buttons(True)
-        self._update_total()
-        self.hub.set_status("Размеры обновлены")
-
-    def _set_buttons(self, enabled: bool) -> None:
-        state = "normal" if enabled else "disabled"
-        self.refresh_btn.configure(state=state)
-        self.clean_btn.configure(state=state)
-        for target in self.targets:
-            check = self.checkbuttons[target.key]
-            if self._available(target):
-                check.configure(state=state, fg=FG if enabled else MUTED)
-            else:
-                check.configure(state="disabled", fg=MUTED)
-
-    def _selected(self) -> list[CleanupTarget]:
-        return [
-            target for target in self.targets
-            if self.vars[target.key].get() and self._available(target)
-        ]
-
-    def _update_total(self) -> None:
-        if self.busy:
-            return
-        total = 0
-        recycle = False
-        for target in self._selected():
-            if target.special == "recycle":
-                recycle = True
-                continue
-            size = self.sizes.get(target.key)
-            if size and size > 0:
-                total += size
-        text = f"Выбрано: {fmt_size(total)}"
-        if recycle:
-            text += " + корзина"
-        self.total_var.set(text)
-
-    # -- очистка ----------------------------------------------------------- #
-    def start_clean(self) -> None:
-        if self.busy:
-            return
-        if not self.hub.ensure_admin("cleanup"):
-            return
-        selected = self._selected()
-        if not selected:
-            messagebox.showinfo("Очистка Windows", "Отметьте, что очищать.")
-            return
-        total = 0
-        recycle = False
-        lines = []
-        for target in selected:
-            lines.append(f"• {target.label}")
-            if target.special == "recycle":
-                recycle = True
-            else:
-                size = self.sizes.get(target.key)
-                if size and size > 0:
-                    total += size
-        message = (
-            "Будет очищено:\n\n" + "\n".join(lines)
-            + f"\n\nПримерно {fmt_size(total)}" + (" + корзина" if recycle else "")
-            + "\n\nУдаление безвозвратно. Продолжить?"
-        )
-        if not messagebox.askyesno("Очистка Windows", message):
-            return
-
-        self.busy = True
-        self._set_buttons(False)
-        self.append_log(self.log_box, "Начинаю очистку…")
-        self.hub.set_status("Очистка Windows…")
-        self.hub.run_bg(lambda: self._clean_worker(selected), self._clean_done, self._fail)
-
-    def _clean_worker(self, selected: list[CleanupTarget]) -> tuple[int, int]:
-        freed_total = 0
-        failures = 0
-        for target in selected:
-            self.hub.post(lambda label=target.label: self.append_log(self.log_box, f"• {label}"))
-
-            if target.special == "recycle":
-                ok = empty_recycle_bin()
-                if not ok:
-                    failures += 1
-                self.hub.post(lambda ok=ok: self.append_log(
-                    self.log_box,
-                    "Корзина очищена" if ok else "Не удалось очистить корзину",
-                    None if ok else "error",
-                ))
-                continue
-
-            if target.special == "old":
-                size = dir_size(target.paths[0])
-                ok = delete_windows_old()
-                if ok:
-                    freed_total += size
-                else:
-                    failures += 1
-                self.hub.post(lambda ok=ok, size=size: self.append_log(
-                    self.log_box,
-                    f"Windows.old: {fmt_size(size)}" if ok else "Windows.old: удалить не удалось",
-                    None if ok else "error",
-                ))
-                continue
-
-            freed, errors = purge_paths(target.paths)
-            freed_total += freed
-            failures += 1 if errors else 0
-            suffix = f", ошибок: {errors}" if errors else ""
-            self.hub.post(lambda freed=freed, suffix=suffix: self.append_log(
-                self.log_box, f"Освобождено: {fmt_size(freed)}{suffix}"
-            ))
-
-        return freed_total, failures
-
-    def _clean_done(self, result: tuple[int, int]) -> None:
-        freed, failures = result
-        self.busy = False
-        self.append_log(self.log_box, f"Готово. Освобождено: {fmt_size(freed)}")
-        if failures:
-            self.append_log(self.log_box, f"Замечаний: {failures} (файлы заняты или нет прав)", "error")
-        space = disk_space()
-        if space is not None:
-            free, total = space
-            self.append_log(self.log_box, f"Системный диск: свободно {fmt_size(free)} из {fmt_size(total)}")
-        self.hub.set_status(f"Очистка Windows: освобождено {fmt_size(freed)}")
-        self.refresh_sizes()
-
-    def _fail(self, exc: Exception) -> None:
-        self.busy = False
-        self._set_buttons(True)
-        self.append_log(self.log_box, f"Ошибка: {exc}", "error")
-        self.hub.set_status("Очистка Windows: ошибка")
-        messagebox.showerror("Очистка Windows", str(exc))
 
 # --------------------------------------------------------------------------- #
 #  GitHub: движок (gh + git) и Bypass: HTTP-клиент
@@ -4276,16 +3939,33 @@ class BypassPanel(Panel):
         self.online = False
         self.busy = False
         self.checking = False
+        self.ip_checking = False
         self.loading_apps = False
         self.query = ""
         self.only_running = False
         self.only_bypass = False
         self._offline_noted = False
         self._apply_job = None
+        self._apply_retry = 0
+        self._tick_job = None
+        self._state_gen = 0
+        self._last_heal_action = None
         self._build()
         self.load_catalog()
         self.refresh_now()
-        self.after(3000, self._tick)
+        self._tick_job = self.after(3000, self._tick)
+
+    def destroy(self) -> None:
+        """Кэшированная панель не должна опрашивать движок после закрытия."""
+        for attr in ("_tick_job", "_apply_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:  # noqa: BLE001
+                    pass
+            setattr(self, attr, None)
+        super().destroy()
 
     # -- разметка ----------------------------------------------------------- #
     def _build(self) -> None:
@@ -4591,8 +4271,16 @@ class BypassPanel(Panel):
 
     def _apply_apps_now(self) -> None:
         self._apply_job = None
-        if self.busy or not self.winfo_exists():
+        if not self.winfo_exists():
             return
+        if self.busy:
+            self._pending_apps_apply = True
+            self._apply_retry += 1
+            if self._apply_retry <= 10:
+                self._apply_job = self.after(700, self._apply_apps_now)
+            return
+        self._pending_apps_apply = False
+        self._apply_retry = 0
         if self.scope != "apps":
             return
         if not (self.state.get("proxyfyre") or {}).get("running"):
@@ -4632,13 +4320,13 @@ class BypassPanel(Panel):
         if self.busy or scope == self.scope:
             return
         self.scope = scope
+        self._state_gen += 1
         self._save_cfg()
         self._update_controls()
         if scope == "apps":
             try:
                 happ_mode_write(tun=False, system_proxy=False)
                 set_windows_system_proxy(False)
-                happ_tun_disable()
             except Exception:
                 pass
         if self._engine_on("happ") and (scope != "apps" or self.selected_apps):
@@ -4696,13 +4384,39 @@ class BypassPanel(Panel):
             self._start_mode(mode)
 
     # -- статус -------------------------------------------------------------- #
+    def _poll_state(self, scope: str) -> dict:
+        """Опрос состояния + автоисцеление в ОДНОМ фоновом потоке.
+
+        Раньше `bypass_auto_heal_if_leak` вызывался прямо из `_tick`, то есть в
+        главном потоке tkinter: tasklist / netsh / taskkill замораживали окно
+        каждые 3 секунды. Теперь всё уходит в `run_bg`.
+        """
+        state = bypass_status()
+        try:
+            state["_heal"] = bypass_auto_heal_if_leak(scope)
+        except Exception as exc:  # noqa: BLE001
+            state["_heal"] = {"action": "error", "error": str(exc)}
+        return state
+
+    def _start_poll(self, work) -> None:
+        """Один опрос = одно поколение. Устаревшие callback-и игнорируются."""
+        self.checking = True
+        self._state_gen += 1
+        gen = self._state_gen
+        self.hub.run_bg(work,
+                        lambda state: self._state_ok(state, gen),
+                        lambda exc: self._state_off(exc, gen))
+
     def _tick(self) -> None:
+        self._tick_job = None
         if not self.winfo_exists():
             return
         if not self.busy and not self.checking:
-            self.checking = True
-            self.hub.run_bg(bypass_status, self._state_ok, self._state_off)
-        self.after(3000, self._tick)
+            # Читаем self.scope ЗДЕСЬ, в главном потоке: lambda исполняется в
+            # фоновом, а пользователь может переключить область в этот момент.
+            scope = self.scope
+            self._start_poll(lambda: self._poll_state(scope))
+        self._tick_job = self.after(3000, self._tick)
 
     def fix_tun_now(self) -> None:
         self._run(self._do_fix_tun, "Отключаю TUN в Happ…",
@@ -4717,23 +4431,47 @@ class BypassPanel(Panel):
         return {"ok": True, "detail": "TUN отключён в Happ"}
 
     def check_ip_now(self) -> None:
-        """Быстрая проверка текущего внешнего IP, чтобы убедиться в работе обхода."""
+        """Полная проверка обхода: прямой IP vs IP через SOCKS Happ → вердикт."""
+        if self.ip_checking or self.busy or not self.winfo_exists():
+            return
+        self.ip_checking = True
         self.btn_check_ip.configure(state="disabled")
         self.hub.run_bg(
-            bypass_check_ip,
-            lambda res: self._on_ip_done(res),
-            lambda err: self._on_ip_fail(err),
+            lambda: bypass_compare_connections(timeout=4.0),
+            self._on_ip_done,
+            self._on_ip_fail,
         )
 
     def _on_ip_done(self, res: dict) -> None:
-        self.btn_check_ip.configure(state="normal")
-        ip = res.get("ip") or "не определён"
-        self.append_log(self.log_box, f"🌐 Текущий внешний IP: {ip}", "ok")
-        self.hub.toast(f"Внешний IP: {ip}", kind="ok")
+        # Не просто включаем кнопку: _update_controls() учитывает и busy,
+        # и ip_checking, поэтому тик статуса не включит её посреди проверки.
+        self.ip_checking = False
+        direct = res.get("direct", {})
+        proxy = res.get("proxy", {})
+        lines = [
+            f"Прямое подключение -> {direct.get('ip', '—')} ({direct.get('country', '')})",
+            f"Обход SOCKS {proxy.get('proxy_port', HAPP_SOCKS_DEFAULT)} -> "
+            f"{proxy.get('ip', '—')} ({proxy.get('country', '')})",
+        ]
+        verdict = res.get("verdict", "")
+        ok = bool(res.get("ok"))
+        kind = "ok" if ok else ("warn" if verdict == "SOCKS НЕ ДОСТУПЕН" else "error")
+        if ok:
+            lines.append("🛡 ОБХОД РАБОТАЕТ")
+            self.hub.toast("Обход работает: IP через прокси отличается от прямого", kind="ok")
+        else:
+            lines.append(f"⚠ {verdict}")
+            self.hub.toast(f"Проверка: {verdict}", kind=kind)
+        for line in lines:
+            self.append_log(self.log_box, line, kind if ok else kind)
+        if res.get("message"):
+            self.append_log(self.log_box, res["message"])
+        self._update_controls()
 
     def _on_ip_fail(self, err: Exception) -> None:
-        self.btn_check_ip.configure(state="normal")
-        self.append_log(self.log_box, f"Ошибка проверки IP: {err}", "warn")
+        self.ip_checking = False
+        self.append_log(self.log_box, f"Ошибка проверки IP: {err}", "error")
+        self._update_controls()
 
     def catch_programs(self) -> None:
         """Перезапуск ProxiFyre: служба видит только процессы со своего старта."""
@@ -4745,23 +4483,47 @@ class BypassPanel(Panel):
         self._run(proxifyre_restart, "ProxiFyre: подхватываю запущенные программы…",
                   "Перезапускаю службу ProxiFyre…")
 
+    def on_show(self) -> None:
+        """Хук хаба при открытии вкладки: актуализирует статус и список программ."""
+        self.refresh_now()
+
     def refresh_now(self) -> None:
         if self.checking or self.busy:
             return
-        self.checking = True
-        self.hub.run_bg(bypass_status, self._state_ok, self._state_off)
+        self.load_catalog()
+        self._start_poll(lambda: self._poll_state(self.scope))
 
-    def _state_ok(self, state: dict) -> None:
+    def _state_ok(self, state: dict, gen: int | None = None) -> None:
+        if gen is not None and gen != self._state_gen:
+            return  # устаревший опрос не перезаписывает свежий статус
         self.checking = False
         self.online = True
         self._offline_noted = False
         self.state = state if isinstance(state, dict) else {}
+        heal = self.state.get("_heal")
+        action = heal.get("action") if isinstance(heal, dict) else None
+        # Логируем не только успех: «failed»/«error» раньше пропадали молча,
+        # и пользователь думал, что утечка исправлена. Пишем при смене action,
+        # чтобы тик каждые 3 секунды не забивал лог.
+        if action in ("healed", "failed", "error") and action != self._last_heal_action:
+            if action == "healed":
+                message = (heal.get("healed") or {}).get("message", "")
+                self.append_log(self.log_box,
+                                f"🔧 Автоисправление утечки: {message}", "ok")
+            else:
+                reason = ((heal.get("healed") or {}).get("message")
+                          or heal.get("error") or action)
+                self.append_log(self.log_box,
+                                f"⚠ Автоисправление утечки не удалось: {reason}", "error")
+        self._last_heal_action = action
         rescan = self.state.get("proxyfyre_rescan")
         if isinstance(rescan, dict):
-            apps = ", ".join(map(str, rescan.get("apps") or []))
+            apps_list = rescan.get("apps") or []
+            apps = ", ".join(map(str, apps_list))
             if rescan.get("ok"):
-                self.append_log(self.log_box,
-                                f"ProxiFyre: подхвачены новые процессы ({apps})", "ok")
+                if apps:
+                    self.append_log(self.log_box,
+                                    f"ProxiFyre: подхвачены новые процессы ({apps})", "ok")
             else:
                 self.append_log(self.log_box,
                                 "ProxiFyre: не удалось подхватить новые процессы", "error")
@@ -4786,19 +4548,24 @@ class BypassPanel(Panel):
                 self._last_leak_noted = None
         self._update_controls()
 
-    def _state_off(self, exc: Exception) -> None:
+    def _state_off(self, exc: Exception, gen: int | None = None) -> None:
+        if gen is not None and gen != self._state_gen:
+            return
         self.checking = False
         self.online = False
         self.state = {}
-        self.headline_var.set("движок недоступен")
-        self.detail_var.set(str(exc))
-        self.dot_var.set("○")
-        for card in self.cards.values():
-            card["status"].configure(text="состояние неизвестно", fg=MUTED)
         if not self._offline_noted:
             self._offline_noted = True
             self.append_log(self.log_box, f"Не удалось опросить движок: {exc}", "error")
         self._update_controls()
+        # _update_controls() строит текст из пустого state и затирает сообщение
+        # об ошибке. Восстанавливаем его поверх — ошибка не должна исчезать.
+        self.headline_var.set("движок недоступен")
+        self.detail_var.set(str(exc))
+        self.dot_var.set("○")
+        self.dot_label.configure(fg=MUTED)
+        for card in self.cards.values():
+            card["status"].configure(text="состояние неизвестно", fg=MUTED)
 
     def _sync_switches(self) -> None:
         for mode, card in self.cards.items():
@@ -4863,7 +4630,8 @@ class BypassPanel(Panel):
                 state="normal" if (self.scope == "apps" and not self.busy) else "disabled"
             )
         if hasattr(self, "btn_check_ip"):
-            self.btn_check_ip.configure(state="disabled" if self.busy else "normal")
+            self.btn_check_ip.configure(
+                state="disabled" if (self.busy or self.ip_checking) else "normal")
         if hasattr(self, "btn_fix_tun"):
             tun_on = bool(((happ.get("mode") or {}).get("tun")) or happ.get("tun"))
             self.btn_fix_tun.configure(
@@ -4950,6 +4718,18 @@ class BypassPanel(Panel):
                     f"{count} программ через "
                     f"SOCKS 127.0.0.1:{port} · остальные напрямую",
                     OK,
+                )
+            if happ_on and not proxyfyre.get("running"):
+                if not self.selected_apps:
+                    return (
+                        "Happ подключён · выберите программы",
+                        "Отметьте программы в списке ниже, чтобы направить их через туннель",
+                        WARN,
+                    )
+                return (
+                    "Happ подключён, служба перенаправления не запущена",
+                    "Нажмите «Подхватить программы» или перезапустите службу",
+                    WARN,
                 )
             if proxyfyre.get("running"):
                 return (
@@ -5056,14 +4836,23 @@ class BypassPanel(Panel):
 
     # -- общий запуск фоновой задачи ----------------------------------------- #
     def _run(self, work, status_now: str, log_now: str) -> None:
+        if self.busy:
+            return  # две фоновые операции меняли состояние наперегонки
         self.busy = True
+        self._state_gen += 1
+        self.checking = False
+        self._last_error = ""
         self._update_controls()
         self.append_log(self.log_box, log_now)
         self.hub.set_status(f"Bypass: {status_now}")
         self.hub.run_bg(work, self._run_done, self._run_fail)
 
     def _run_done(self, result: dict) -> None:
+        if not self.winfo_exists():
+            return
         self.busy = False
+        self._state_gen += 1
+        self.checking = False
         result = result if isinstance(result, dict) else {}
         detail = str(result.get("detail") or "")
         ok = bool(result.get("ok", True))
@@ -5072,14 +4861,25 @@ class BypassPanel(Panel):
         self.hub.set_status("Bypass: готово" if ok else "Bypass: не выполнено")
         self.refresh_now()
         self._update_controls()
+        if getattr(self, "_pending_apps_apply", False):
+            self._pending_apps_apply = False
+            self._schedule_apply()
 
     def _run_fail(self, exc: Exception) -> None:
+        if not self.winfo_exists():
+            return
         self.busy = False
+        self._state_gen += 1
+        self.checking = False
+        self._last_error = str(exc)
         self.append_log(self.log_box, f"Ошибка: {exc}", "error")
         self.hub.set_status("Bypass: ошибка")
         self.hub.toast(f"Bypass: {exc}", kind="error", ms=4000)
         self.refresh_now()
         self._update_controls()
+        if getattr(self, "_pending_apps_apply", False):
+            self._pending_apps_apply = False
+            self._schedule_apply()
 
 
 # --------------------------------------------------------------------------- #
@@ -6096,20 +5896,1666 @@ class MailWindow(tk.Toplevel):
         self.destroy()
 
 
+
+class ShortsAutopilotPanel(Panel):
+    """Управление приложением Shorts Autopilot: статус, запуск/остановка, DaVinci, логи."""
+
+    def __init__(self, master: tk.Misc, hub) -> None:
+        super().__init__(master, hub)
+        self.shorts_dir = APP_DIR / "shorts-autopilot"
+        self.python_exe = Path(r"C:\Users\admin\.workbuddy-ai\binaries\python\envs\shorts-gui\Scripts\python.exe")
+        self.pythonw_exe = Path(r"C:\Users\admin\.workbuddy-ai\binaries\python\envs\shorts-gui\Scripts\pythonw.exe")
+        self._running_pid: int | None = None
+        self._poll_job = None
+        self._last_log_size = 0
+        self._build()
+        self.refresh_status()
+        self.update_log(initial=True)
+        self._schedule_poll()
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        # -- Карточки статуса сверху --
+        cards = tk.Frame(self, bg=BG)
+        cards.grid(row=0, column=0, sticky="ew", pady=(0, px(12)))
+        cards.columnconfigure(0, weight=1)
+        cards.columnconfigure(1, weight=1)
+        cards.columnconfigure(2, weight=1)
+
+        # Карточка 1: Служба Shorts Autopilot
+        c1 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        c1.grid(row=0, column=0, sticky="nsew", padx=(0, px(6)))
+        tk.Label(c1, text="Служба Autopilot", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.lbl_svc_status = tk.Label(c1, text="○ Остановлен", bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"))
+        self.lbl_svc_status.pack(anchor="w", pady=(px(4), 0))
+        self.lbl_svc_pid = tk.Label(c1, text="Фоновый мониторинг ссылок", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_svc_pid.pack(anchor="w")
+
+        # Карточка 2: Веб-панель
+        c2 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        c2.grid(row=0, column=1, sticky="nsew", padx=px(4))
+        tk.Label(c2, text="Веб-панель (UI)", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.lbl_web_status = tk.Label(c2, text="○ Офлайн", bg=CARD, fg=MUTED, font=("Segoe UI", 12, "bold"))
+        self.lbl_web_status.pack(anchor="w", pady=(px(4), 0))
+        tk.Label(c2, text="http://127.0.0.1:8765", bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w")
+
+        # Карточка 3: DaVinci Resolve
+        c3 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        c3.grid(row=0, column=2, sticky="nsew", padx=(px(6), 0))
+        tk.Label(c3, text="DaVinci Resolve", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.lbl_davinci_status = tk.Label(c3, text="○ Закрыт", bg=CARD, fg=MUTED, font=("Segoe UI", 12, "bold"))
+        self.lbl_davinci_status.pack(anchor="w", pady=(px(4), 0))
+        self.lbl_davinci_info = tk.Label(c3, text="Timeline: 1080x1920 @ 60 fps", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_davinci_info.pack(anchor="w")
+
+        # -- Кнопки управления --
+        toolbar = tk.Frame(self, bg=BG)
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, px(12)))
+
+        self.btn_start = flat_button(toolbar, "▶ Запустить Autopilot", self.start_autopilot, kind="primary")
+        self.btn_start.pack(side="left")
+
+        self.btn_stop = flat_button(toolbar, "⏹ Остановить", self.stop_autopilot, kind="danger")
+        self.btn_stop.pack(side="left", padx=(px(8), 0))
+
+        self.btn_web = flat_button(toolbar, "🌐 Открыть веб-панель", self.open_webui, kind="ghost")
+        self.btn_web.pack(side="left", padx=(px(8), 0))
+
+        self.btn_tests = flat_button(toolbar, "🧪 Прогнать тесты", self.run_tests_bg, kind="ghost")
+        self.btn_tests.pack(side="left", padx=(px(8), 0))
+
+        self.btn_folder = flat_button(toolbar, "📂 Папка проекта", self.open_folder, kind="ghost")
+        self.btn_folder.pack(side="right")
+
+        self.btn_cfg = flat_button(toolbar, "⚙ config.json", self.open_config, kind="ghost")
+        self.btn_cfg.pack(side="right", padx=(0, px(8)))
+
+        # -- Журнал событий --
+        log_frame, self.log_box = self.make_log(self, height=12, label="Лог Shorts Autopilot")
+        log_frame.grid(row=2, column=0, sticky="nsew")
+        self.append_log(self.log_box, "Shorts Autopilot подключён в качестве приложения.")
+
+    def _schedule_poll(self) -> None:
+        if self._poll_job:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+        self._poll_job = self.after(3000, self._on_poll)
+
+    def _on_poll(self) -> None:
+        self.refresh_status()
+        self.update_log()
+        self._schedule_poll()
+
+    def refresh_status(self) -> None:
+        pid = self._find_pid()
+        self._running_pid = pid
+        if pid:
+            self.lbl_svc_status.configure(text=f"● Работает (PID {pid})", fg=OK)
+            self.lbl_svc_pid.configure(text="Перехват ссылок и автоконвейер активны")
+            self.btn_start.configure(state="disabled")
+            self.btn_stop.configure(state="normal")
+        else:
+            self.lbl_svc_status.configure(text="○ Остановлен", fg=MUTED)
+            self.lbl_svc_pid.configure(text="Нажмите «Запустить Autopilot» для старта")
+            self.btn_start.configure(state="normal")
+            self.btn_stop.configure(state="disabled")
+
+        web_ok = self._check_webui()
+        if web_ok:
+            self.lbl_web_status.configure(text="● Онлайн", fg=OK)
+            self.btn_web.configure(state="normal")
+        else:
+            self.lbl_web_status.configure(text="○ Офлайн", fg=MUTED)
+
+        davinci_ok = self._check_process("Resolve.exe")
+        if davinci_ok:
+            self.lbl_davinci_status.configure(text="● Запущен", fg=OK)
+        else:
+            self.lbl_davinci_status.configure(text="○ Закрыт", fg=MUTED)
+
+    def _find_pid(self) -> int | None:
+        pid_file = self.shorts_dir / "state" / ".single_instance.pid"
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+                if pid > 0 and self._is_pid_alive(pid):
+                    return pid
+            except (OSError, ValueError):
+                pass
+        return None
+
+    def _is_pid_alive(self, pid: int) -> bool:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _check_process(self, exe_name: str) -> bool:
+        try:
+            exe_low = exe_name.lower()
+            return any(exe_low in p.lower() for p in ps_run("Get-Process | Select-Object -ExpandProperty ProcessName").splitlines())
+        except Exception:
+            return False
+
+    def _check_webui(self) -> bool:
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8765/api/state", headers={"User-Agent": "Tools/1.0"})
+            with urllib.request.urlopen(req, timeout=0.8) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def start_autopilot(self) -> None:
+        py_bin = self.pythonw_exe if self.pythonw_exe.exists() else (self.python_exe if self.python_exe.exists() else Path("pythonw.exe"))
+        main_script = self.shorts_dir / "app" / "main.py"
+        if not main_script.exists():
+            self.hub.toast("Скрипт app/main.py не найден!", kind="error")
+            return
+        try:
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["TMPDIR"] = str(self.shorts_dir / "state" / "pytest-tmp")
+            subprocess.Popen(
+                [str(py_bin), str(main_script), "--ui"],
+                cwd=str(self.shorts_dir),
+                env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self.hub.toast("Shorts Autopilot запущен", kind="ok")
+            self.append_log(self.log_box, "Запущена служба Shorts Autopilot (--ui)...")
+            self.after(1500, self.refresh_status)
+        except Exception as exc:
+            self.hub.toast(f"Ошибка запуска: {exc}", kind="error")
+            self.append_log(self.log_box, f"Ошибка запуска: {exc}", tag="error")
+
+    def stop_autopilot(self) -> None:
+        pid = self._find_pid()
+        if not pid:
+            self.hub.toast("Процесс не найден", kind="warn")
+            self.refresh_status()
+            return
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=5)
+            lock = self.shorts_dir / "state" / ".single_instance.pid"
+            if lock.exists():
+                try:
+                    lock.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self.hub.toast("Shorts Autopilot остановлен", kind="ok")
+            self.append_log(self.log_box, f"Служба (PID {pid}) остановлена.")
+            self.after(500, self.refresh_status)
+        except Exception as exc:
+            self.hub.toast(f"Ошибка остановки: {exc}", kind="error")
+            self.append_log(self.log_box, f"Ошибка остановки: {exc}", tag="error")
+
+    def open_webui(self) -> None:
+        if not self._check_webui():
+            self.hub.toast("Запускаю службу Shorts Autopilot для веб-панели...", kind="ok")
+            self.start_autopilot()
+            self.after(1800, lambda: webbrowser.open("http://127.0.0.1:8765"))
+            return
+        webbrowser.open("http://127.0.0.1:8765")
+
+    def open_folder(self) -> None:
+        os.startfile(str(self.shorts_dir))
+
+    def open_config(self) -> None:
+        cfg = self.shorts_dir / "config.json"
+        if cfg.exists():
+            os.startfile(str(cfg))
+
+    def run_tests_bg(self) -> None:
+        self.btn_tests.configure(state="disabled")
+        self.append_log(self.log_box, "Запуск пакета тестов run_tests.bat в фоне...")
+
+        def work():
+            bat = self.shorts_dir / "run_tests.bat"
+            res = subprocess.run([str(bat)], cwd=str(self.shorts_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")
+            return res.returncode, res.stdout, res.stderr
+
+        def on_done(result):
+            code, out, err = result
+            self.btn_tests.configure(state="normal")
+            if code == 0:
+                self.hub.toast("Все тесты успешно пройдены!", kind="ok")
+                self.append_log(self.log_box, "Тесты run_tests.bat: ВСЕ 949 ТЕСТОВ И 30 СЦЕНАРИЕВ ПРОЙДЕНЫ УСПЕШНО!", tag="ok")
+            else:
+                self.hub.toast("Тесты завершились с ошибкой", kind="error")
+                self.append_log(self.log_box, f"Ошибка тестов:\n{err or out}", tag="error")
+
+        def on_error(exc):
+            self.btn_tests.configure(state="normal")
+            self.hub.toast(f"Сбой тестов: {exc}", kind="error")
+            self.append_log(self.log_box, f"Сбой запуска тестов: {exc}", tag="error")
+
+        self.hub.run_bg(work, on_done, on_error)
+
+    def update_log(self, initial: bool = False) -> None:
+        log_file = self.shorts_dir / "logs" / "app.log"
+        if not log_file.exists():
+            return
+        try:
+            size = log_file.stat().st_size
+            if size == getattr(self, "_last_log_size", 0) and not initial:
+                return
+            self._last_log_size = size
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-30:]
+            if initial:
+                self.log_box.delete("1.0", "end")
+            for line in (lines if initial else lines[-10:]):
+                tag = None
+                if "ERROR" in line:
+                    tag = "error"
+                elif "WARNING" in line:
+                    tag = "warn"
+                elif "УСПЕШНО" in line or "готово" in line:
+                    tag = "ok"
+                self.append_log(self.log_box, line.rstrip(), tag=tag)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+#  Дневник МО · Контроль балла — вкладка хаба
+# --------------------------------------------------------------------------- #
+# Подпроект живёт в diary-grades/. Его модули называются слишком общо
+# (models / config / grade_math), поэтому НЕ добавляем папку в sys.path:
+# загружаем ядро в изолированном неймспейсе, на время подменив sys.modules.
+_DIARY_CORE = None
+
+
+def diary_grades_core():
+    """(config, grade_math, demo_data, models) подпроекта diary-grades или None."""
+    global _DIARY_CORE
+    if _DIARY_CORE is not None:
+        return _DIARY_CORE
+    import importlib.util
+    import types
+
+    folder = APP_DIR / "diary-grades"
+    if not (folder / "grade_math.py").exists():
+        return None
+    package_name = "_tools_diary_core"
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(folder)]
+    sys.modules[package_name] = package
+
+    def load(name: str):
+        spec = importlib.util.spec_from_file_location(
+            f"{package_name}.{name}", folder / f"{name}.py"
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Не удалось загрузить {name}.py из {folder}")
+        module = importlib.util.module_from_spec(spec)
+        # Регистрация до exec_module обязательна: в models.py dataclass(slots=True)
+        # с отложенными аннотациям обращается к модулю через sys.modules.
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    sentinel = object()
+    previous = sys.modules.get("models", sentinel)
+    try:
+        models_module = load("models")
+        sys.modules["models"] = models_module
+        try:
+            config_module = load("config")
+            math_module = load("grade_math")
+            demo_module = load("demo_data")
+        finally:
+            if previous is sentinel:
+                sys.modules.pop("models", None)
+            else:
+                sys.modules["models"] = previous
+    except Exception:  # noqa: BLE001 — отсутствие подпроекта не роняет хаб
+        log_exception()
+        return None
+    _DIARY_CORE = (config_module, math_module, demo_module, models_module)
+    return _DIARY_CORE
+
+
+# Мосты вызываются отдельным процессом из .venv подпроекта: у хаба может не быть
+# Playwright, а sync_playwright нельзя гонять в потоке с уже работающим Tk.
+_DIARY_BRIDGE_PREAMBLE = """
+import json, sys
+for _stream in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+from datetime import datetime
+import config, diary_client
+from models import DiaryError, SubjectGrades
+
+def save(result):
+    # После обновления в таблице должны остаться ВСЕ предметы из шаблона,
+    # а не только те, что портал прислал на первой странице.
+    subjects = list(result.subjects)
+    known = {s.name.casefold() for s in subjects}
+    for name in config.expected_subjects():
+        key = name.casefold()
+        if key not in known:
+            known.add(key)
+            subjects.append(SubjectGrades(name, (), result.period, 'pending'))
+    config.atomic_write_json(config.CACHE_FILE, {
+        'updated_at': datetime.now().isoformat(timespec='seconds'),
+        'period': result.period,
+        'source': result.source,
+        'subjects': [
+            {'name': s.name, 'marks': list(s.marks), 'period': s.period,
+             'official_average': getattr(s, 'official_average', '')}
+            for s in subjects
+        ],
+    })
+    print(json.dumps({'ok': True, 'subjects': len(subjects),
+                      'with_marks': sum(1 for s in subjects if s.marks),
+                      'period': result.period}, ensure_ascii=False))
+
+def fail(message):
+    print(json.dumps({'ok': False, 'error': str(message)}, ensure_ascii=False))
+    sys.exit(1)
+"""
+
+_DIARY_FETCH_CODE = _DIARY_BRIDGE_PREAMBLE + """
+try:
+    save(diary_client.fetch_grades(config.current_period()))
+except DiaryError as exc:
+    fail(exc)
+except Exception as exc:
+    fail('Сбой сборщика: ' + str(exc))
+"""
+
+_DIARY_LOGIN_CODE = _DIARY_BRIDGE_PREAMBLE + """
+settings = config.load_settings()
+if not diary_client.interactive_login(timeout_s=int(settings.get('login_timeout_s', 300))):
+    fail('Вход через Госуслуги не выполнен или истекло время ожидания.')
+try:
+    save(diary_client.fetch_grades(config.current_period()))
+except DiaryError as exc:
+    fail('Вход выполнен, сессия сохранена, но оценки не получены: ' + str(exc))
+except Exception as exc:
+    fail('Сбой сборщика: ' + str(exc))
+"""
+
+_DIARY_IMPORT_CODE = """
+import json, sys
+for _stream in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+from datetime import datetime
+from pathlib import Path
+import config, parsers
+from models import SubjectGrades
+try:
+    path = Path(sys.argv[1])
+    subjects = parsers.validate_subjects(parsers.parse_file(path))
+    # Заготовки без оценок (real_grades.json) не выбрасываем молча: иначе в окне
+    # остаётся «одна оценка» и непонятно, что остальные предметы просто не загружены.
+    try:
+        raw = json.loads(path.read_text(encoding='utf-8-sig'))
+    except Exception:
+        raw = None
+    if isinstance(raw, dict):
+        seen = {s.name.casefold() for s in subjects}
+        for item in raw.get('subjects') or []:
+            if not isinstance(item, dict):
+                continue
+            name = parsers.clean_name(str(item.get('name') or ''))
+            if not name or name.casefold() in seen:
+                continue
+            subjects.append(SubjectGrades(name, (), '', 'pending'))
+            seen.add(name.casefold())
+    if not subjects:
+        raise ValueError('Предметы в файле не найдены.')
+    config.atomic_write_json(config.CACHE_FILE, {
+        'updated_at': datetime.now().isoformat(timespec='seconds'),
+        'period': config.current_period().label,
+        'source': 'import',
+        'subjects': [
+            {'name': s.name, 'marks': list(s.marks), 'period': s.period,
+             'official_average': getattr(s, 'official_average', '')}
+            for s in subjects
+        ],
+    })
+    print(json.dumps({'ok': True, 'subjects': len(subjects),
+                      'with_marks': sum(1 for s in subjects if s.marks),
+                      'period': config.current_period().label}, ensure_ascii=False))
+except Exception as exc:
+    print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))
+    sys.exit(1)
+"""
+
+
+class DiaryGradesPanel(Panel):
+    """Оценки электронного дневника МО прямо среди остальных инструментов хаба."""
+
+    COLUMNS = (
+        ("Предмет", 145, 3),
+        ("Средний балл", 90, 0),
+        ("Текущие оценки", 205, 4),
+        ("До 5-ки", 80, 0),
+        ("Запас прочности", 145, 2),
+    )
+    BADGES = {
+        "red": ("#4a1f24", "#ff8a8a"),
+        "yellow": ("#4a3a12", "#ffd166"),
+        "green": ("#14432c", "#a7f3c4"),
+    }
+
+    def __init__(self, master: tk.Misc, hub) -> None:
+        super().__init__(master, hub)
+        self.dir = APP_DIR / "diary-grades"
+        core = diary_grades_core()
+        self.cfg, self.gm, self.demo, self.models = core if core else (None,) * 4
+        self.reports = []
+        self.filtered = []
+        self._row_widgets: list[list[tk.Label]] = []
+        self._selected_index = -1
+        self.source_label = "—"
+        self.demo_note = ""
+        self.period_label = "—"
+        self.cache_stamp = None
+        self._busy = False
+        self._poll_job = None
+        self._last_fetch = 0.0
+        self._initial_fetch_done = False
+        self._build()
+        self.reload()
+        self._schedule_poll()
+
+    # -- разметка ---------------------------------------------------------- #
+    @staticmethod
+    def _card(parent: tk.Misc, column: int, title: str):
+        frame = tk.Frame(parent, bg=CARD, highlightbackground=BORDER,
+                         highlightthickness=1, padx=px(12), pady=px(8))
+        frame.grid(row=0, column=column, sticky="nsew",
+                   padx=(0 if column == 0 else px(6), 0))
+        tk.Label(frame, text=title, bg=CARD, fg=MUTED,
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x")
+        label = tk.Label(frame, text="—", bg=CARD, fg=FG,
+                         font=("Segoe UI", 11, "bold"), anchor="w")
+        label.pack(fill="x", pady=(px(3), 0))
+        return label
+
+    def _configure_columns(self, frame: tk.Misc) -> None:
+        for index, (_name, minsize, weight) in enumerate(self.COLUMNS):
+            frame.columnconfigure(index, weight=weight, minsize=px(minsize))
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        cards = tk.Frame(self, bg=BG)
+        cards.grid(row=0, column=0, sticky="ew", pady=(0, px(10)))
+        for index in range(4):
+            cards.columnconfigure(index, weight=1)
+        self.lbl_source = self._card(cards, 0, "Источник")
+        self.lbl_period = self._card(cards, 1, "Период")
+        self.lbl_count = self._card(cards, 2, "Предметов")
+        self.lbl_session = self._card(cards, 3, "Сессия ЕСИА")
+
+        toolbar = tk.Frame(self, bg=BG)
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, px(10)))
+        self.btn_refresh = flat_button(toolbar, "▶ Обновить оценки", self._refresh)
+        self.btn_refresh.pack(side="left")
+        flat_button(toolbar, "Войти заново", self._login, kind="ghost").pack(
+            side="left", padx=(px(6), 0))
+        flat_button(toolbar, "Окно", lambda: self._open_app("--no-login"),
+                    kind="ghost").pack(side="left", padx=(px(6), 0))
+        flat_button(toolbar, "Демо", self._demo, kind="ghost").pack(
+            side="left", padx=(px(6), 0))
+        flat_button(toolbar, "Импорт", self._import_file, kind="ghost").pack(
+            side="left", padx=(px(6), 0))
+        flat_button(toolbar, "Папка", self._open_folder, kind="ghost").pack(side="right")
+        self.search_var = tk.StringVar()
+        ttk.Entry(toolbar, textvariable=self.search_var, width=12).pack(
+            side="right", padx=(0, px(6)))
+        tk.Label(toolbar, text="Поиск:", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(side="right", padx=(0, px(6)))
+        self.search_var.trace_add("write", lambda *_: self._render_rows())
+
+        table = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        table.grid(row=2, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(1, weight=1)
+
+        head = tk.Frame(table, bg=FIELD, height=px(30))
+        head.grid(row=0, column=0, sticky="ew")
+        head.grid_propagate(False)
+        self._configure_columns(head)
+        for index, (name, _size, _weight) in enumerate(self.COLUMNS):
+            tk.Label(head, text=name, bg=FIELD, fg=MUTED, anchor="w",
+                     font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=index, sticky="ew", padx=px(8))
+
+        self.canvas = tk.Canvas(table, bg=CARD, bd=0, highlightthickness=0)
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.canvas.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.canvas.configure(yscrollcommand=scroll.set)
+        self.rows_frame = tk.Frame(self.canvas, bg=CARD)
+        self._rows_window = self.canvas.create_window(
+            (0, 0), window=self.rows_frame, anchor="nw")
+        self.rows_frame.bind(
+            "<Configure>",
+            lambda _event: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind(
+            "<Configure>",
+            lambda event: self.canvas.itemconfigure(self._rows_window, width=event.width))
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.rows_frame.bind("<MouseWheel>", self._on_wheel)
+
+        details = tk.Frame(self, bg=BG)
+        details.grid(row=3, column=0, sticky="ew", pady=(px(10), 0))
+        tk.Label(details, text="Разбор расчёта — клик по строке таблицы",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8), anchor="w").pack(fill="x")
+        self.details = dark_text(details, height=5)
+        self.details.pack(fill="x")
+        self.details.configure(state="disabled")
+
+        self.footer_var = tk.StringVar(value="—")
+        tk.Label(self, textvariable=self.footer_var, bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8), anchor="w").grid(row=4, column=0, sticky="ew")
+
+        log_frame, self.log_box = self.make_log(self, height=4, label="Журнал дневника")
+        log_frame.grid(row=5, column=0, sticky="ew", pady=(px(8), 0))
+        self._log("Вкладка «Дневник МО» подключена к diary-grades/.")
+
+    # -- данные ------------------------------------------------------------ #
+    def _stamp(self):
+        try:
+            stat = self.cfg.CACHE_FILE.stat()
+            return (stat.st_mtime_ns, stat.st_size)
+        except (OSError, AttributeError):
+            return None
+
+    def reload(self) -> None:
+        if self.gm is None:
+            self.source_label = "ЯДРО НЕ НАЙДЕНО"
+            self.lbl_source.configure(text=self.source_label, fg=DANGER)
+            self._show_message(f"Не найдено ядро подпроекта: {self.dir}")
+            return
+
+        subjects = []
+        payload = None
+        try:
+            payload = json.loads(self.cfg.CACHE_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError, AttributeError):
+            pass
+        for item in (payload or {}).get("subjects") or []:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            try:
+                subjects.append(self.models.SubjectGrades(
+                    item["name"], tuple(item.get("marks") or ()),
+                    item.get("period", ""), "cache",
+                    official_average=str(item.get("official_average") or "")))
+            except (TypeError, ValueError):
+                continue
+
+        if subjects:
+            self.source_label = "КЭШ" if (payload or {}).get("source") != "demo" else "КЭШ · ДЕМО"
+            self.period_label = (payload or {}).get("period") or self.cfg.current_period().label
+            self.demo_note = ""
+        else:
+            result = self.demo.demo_result(self.cfg.current_period().label)
+            subjects = list(result.subjects)
+            self.source_label = "ДЕМО-ДАННЫЕ"
+            self.demo_note = "  ·  не реальные оценки"
+            self.period_label = result.period
+            self._log("Кэша нет: показаны демо-данные, это не реальные оценки.", "warn")
+
+        try:
+            self.reports = self.gm.sort_reports(self.gm.build_reports(subjects))
+        except (ValueError, TypeError) as exc:
+            self.reports = []
+            self._log(f"Ошибка расчёта: {exc}", "error")
+
+        missing = sum(1 for r in self.reports if not r.count)
+        # «Частично» — только когда не хватает оценок, которые должны быть.
+        # Предметы профиля без оценок за период (пустые в шаблоне) нормой и
+        # не должны окрашивать плашку в жёлтый при сохранённой сессии.
+        gaps = self._cache_has_gaps() if "КЭШ" in self.source_label else False
+        if gaps:
+            self.source_label += " · ЧАСТИЧНО"
+        demo_like = ("ДЕМО" in self.source_label or "НЕ НАЙДЕНО" in self.source_label
+                     or bool(gaps))
+        self.lbl_source.configure(text=self.source_label, fg=WARN if demo_like else OK)
+        self.lbl_period.configure(text=self.period_label)
+        self.lbl_count.configure(
+            text=f"{len(self.reports)} · с оценками {len(self.reports) - missing}"
+            if missing else str(len(self.reports)))
+        self._refresh_session_card()
+        self.cache_stamp = self._stamp()
+        self._render_rows()
+
+    def on_show(self) -> None:
+        """Хаб вызывает при каждом переключении на вкладку."""
+        self.reload()
+
+    def _refresh_session_card(self) -> None:
+        try:
+            ok = bool(self.cfg.session_exists())
+        except Exception:  # noqa: BLE001
+            ok = False
+        self.lbl_session.configure(text="● Сохранена" if ok else "○ Нет входа",
+                                   fg=OK if ok else WARN)
+
+    def _schedule_poll(self) -> None:
+        try:
+            self._poll_job = self.after(2000, self._on_poll)
+        except (tk.TclError, AttributeError):
+            self._poll_job = None
+
+    def _on_poll(self) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except (tk.TclError, AttributeError):
+            return
+        try:
+            stamp = self._stamp()
+            if stamp != self.cache_stamp:
+                self.reload()
+                self._log("Кэш обновлён — таблица перечитана.", "ok")
+        except Exception:  # noqa: BLE001 — опрос не должен ронять окно
+            pass
+        # Файл сессии мог появиться после входа ЕСИА, даже если кэш ещё не
+        # обновился (сбор оценок мог завершиться ошибкой). Карточку «Сессия
+        # ЕСИА» обновляем на каждом опросе, а не только при смене кэша.
+        try:
+            self._refresh_session_card()
+        except Exception:  # noqa: BLE001
+            pass
+        self._maybe_auto_refresh()
+        self._schedule_poll()
+
+    def _cache_has_gaps(self) -> bool:
+        """Есть ли предметы, по которым ждали оценки, но их нет в кэше.
+
+        Предметы из профиля портала без оценок («Вероятность и статистика»,
+        «Математика») помечены в шаблоне пустым ``marks`` и дырами не считаются:
+        иначе каждый запуск дёргал бы скрытый браузер без всякой пользы.
+        """
+        try:
+            raw = json.loads(self.cfg.SUBJECTS_FILE.read_text(encoding="utf-8-sig"))
+            known_empty = {
+                str(item.get("name") or "").strip().casefold()
+                for item in raw.get("subjects") or []
+                if isinstance(item, dict) and not (item.get("marks") or ())
+            }
+            payload = json.loads(self.cfg.CACHE_FILE.read_text(encoding="utf-8"))
+            return any(
+                not (item.get("marks") or ())
+                and str(item.get("name") or "").strip().casefold() not in known_empty
+                for item in payload.get("subjects") or []
+                if isinstance(item, dict)
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _maybe_auto_refresh(self) -> None:
+        """Скрыто обновляет ВСЕ предметы при сохранённой сессии.
+
+        Первый раз — сразу, если после входа в кэше ещё есть пустые предметы:
+        пользователь вошёл через ЕСИА и ждёт оценки, а не таймер. Дальше —
+        раз в ``auto_refresh_min`` минут. Без сессии ничего не делаем и окно
+        входа не дёргаем.
+        """
+        if self.cfg is None or self._busy:
+            return
+        try:
+            minutes = float(self.cfg.load_settings().get("auto_refresh_min", 30))
+            has_session = bool(self.cfg.session_exists())
+        except Exception:  # noqa: BLE001
+            return
+        if minutes <= 0 or not has_session:
+            return
+        now = time.monotonic()
+        if not self._last_fetch:
+            self._last_fetch = now
+            if not self._initial_fetch_done and self._cache_has_gaps():
+                self._initial_fetch_done = True
+                self._start_bg("Догружаем все предметы после входа…",
+                               _DIARY_FETCH_CODE, (), 240)
+            return
+        if now - self._last_fetch < minutes * 60:
+            return
+        self._last_fetch = now
+        self._start_bg("Автообновление всех предметов…", _DIARY_FETCH_CODE, (), 240)
+
+    # -- таблица ----------------------------------------------------------- #
+    def _on_wheel(self, event) -> None:
+        try:
+            self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _render_rows(self) -> None:
+        for child in self.rows_frame.winfo_children():
+            child.destroy()
+        self._row_widgets = []
+        self._configure_columns(self.rows_frame)
+        needle = (self.search_var.get() if hasattr(self, "search_var") else "").strip().casefold()
+        self.filtered = [r for r in self.reports
+                         if not needle or needle in r.name.casefold()]
+
+        for index, report in enumerate(self.filtered):
+            self._add_row(index, report)
+
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        missing = sum(1 for r in self.reports if not r.count)
+        tail = f"  ·  без оценок: {missing} (в периоде оценок нет)" if missing else ""
+        self.footer_var.set(
+            f"Показано {len(self.filtered)} из {len(self.reports)}  ·  порог 4.50  ·  "
+            f"худшие сверху  ·  {self.source_label}"
+            + self.demo_note + tail)
+        if self.filtered:
+            self._select(0, self.filtered[0])
+        elif self.reports:
+            self._show_message("Ничего не найдено. Измени запрос в поиске.")
+        else:
+            self._show_message("Данных нет. Нажми «Обновить оценки», «Войти заново» или «Демо».")
+
+    def _add_row(self, index: int, report) -> None:
+        background = CARD if index % 2 == 0 else CARD_HOVER
+        empty = not report.count and not getattr(report, "official_average", "")
+        badge_bg, badge_fg = (("#2a3040", MUTED) if empty
+                              else self.BADGES.get(report.badge, self.BADGES["red"]))
+        fives = "—" if report.on_five else f"{report.fives_needed} × «5»"
+        if empty:
+            avg_display = "—"
+        elif hasattr(report, "average_str"):
+            avg_display = str(report.average_str)
+        elif self.models and hasattr(self.models, "format_average") and getattr(report, "count", 0):
+            avg_display = self.models.format_average(report.total, report.count)
+        else:
+            from decimal import Decimal, ROUND_HALF_UP
+            total = getattr(report, "total", None)
+            cnt = getattr(report, "count", None)
+            if total is not None and cnt:
+                avg_display = str((Decimal(total) / Decimal(cnt)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            else:
+                avg_display = str(Decimal(str(getattr(report, "average", 0))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        values = (
+            report.name,
+            avg_display,
+            "нет оценок в периоде" if empty else report.marks_text(),
+            "—" if empty else fives,
+            self.gm.reserve_text(report.reserve),
+        )
+        widgets: list[tk.Label] = []
+        for column, value in enumerate(values):
+            if column == 1:
+                label = tk.Label(self.rows_frame, text=value, bg=badge_bg, fg=badge_fg,
+                                 font=("Segoe UI", 9, "bold"), anchor="center",
+                                 padx=px(8), pady=px(3))
+                label.grid(row=index, column=column, sticky="w",
+                           padx=px(8), pady=px(3))
+            else:
+                label = tk.Label(self.rows_frame, text=value, bg=background,
+                                 fg=FG if column == 0 else MUTED,
+                                 font=("Segoe UI", 9, "bold" if column == 0 else "normal"),
+                                 anchor="w", pady=px(5))
+                label.grid(row=index, column=column, sticky="ew", padx=px(8))
+            label.bind("<Button-1>",
+                       lambda _event, r=report, i=index: self._select(i, r))
+            label.bind("<MouseWheel>", self._on_wheel)
+            widgets.append(label)
+        self._row_widgets.append(widgets)
+
+    def _select(self, index: int, report) -> None:
+        self._selected_index = index
+        for row_index, widgets in enumerate(self._row_widgets):
+            background = CARD if row_index % 2 == 0 else CARD_HOVER
+            if row_index == index:
+                background = "#1e2636"
+            for column, label in enumerate(widgets):
+                if column != 1:       # цветной бейдж среднего балла не закрашиваем
+                    label.configure(bg=background)
+        self._show_message(self.gm.explain(report))
+
+    def _show_message(self, text: str) -> None:
+        try:
+            self.details.configure(state="normal")
+            self.details.delete("1.0", "end")
+            self.details.insert("1.0", text)
+            self.details.configure(state="disabled")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _log(self, line: str, tag: str | None = None) -> None:
+        try:
+            self.append_log(self.log_box, line, tag)
+        except (tk.TclError, AttributeError):
+            pass
+
+    # -- действия ---------------------------------------------------------- #
+    def _python(self, name: str):
+        for folder in (".venv/Scripts", ".venv/bin"):
+            exe = self.dir / folder / name
+            if exe.exists():
+                return exe
+        return None
+
+    def _run_bridge(self, code: str, argv=(), timeout: int = 180) -> dict:
+        """Запускает мост в .venv подпроекта. Вызывается ТОЛЬКО из фонового потока."""
+        python = self._python("python.exe")
+        if python is None:
+            return {"ok": False,
+                    "error": "Окружение .venv не готово: один раз запусти diary-grades/run.bat"}
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        command = [str(python), "-c", code, *(str(arg) for arg in argv)]
+        try:
+            proc = subprocess.run(
+                command, cwd=str(self.dir), env=env, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"Превышено время ожидания ({timeout} с)"}
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        output = (proc.stdout or "").strip()
+        try:
+            return json.loads(output.splitlines()[-1]) if output else {
+                "ok": False, "error": (proc.stderr or "Пустой ответ моста").strip()[:400]}
+        except ValueError:
+            return {"ok": False, "error": (proc.stderr or output)[:400]}
+
+    def _start_bg(self, label: str, code: str, argv=(), timeout: int = 180) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self.btn_refresh.configure(state="disabled")
+        self._log(label)
+        self.hub.set_status("Дневник МО: " + label)
+
+        def work():
+            return self._run_bridge(code, argv, timeout)
+
+        def on_done(data):
+            self._busy = False
+            self.btn_refresh.configure(state="normal")
+            if data.get("ok"):
+                self.reload()
+                if "with_marks" in data:
+                    message = (f"Готово: {data.get('subjects', '?')} предметов, "
+                               f"с оценками {data['with_marks']}, {data.get('period', '')}")
+                else:
+                    message = f"Готово: {data.get('subjects', '?')} предметов, {data.get('period', '')}"
+                self._log(message, "ok")
+                self.hub.toast(message, kind="ok")
+            else:
+                message = str(data.get("error") or "Неизвестная ошибка")
+                self._log(message, "error")
+                self.hub.toast(message[:100], kind="error")
+                self._refresh_session_card()
+            self.hub.set_status("Готово")
+
+        def on_error(exc):
+            self._busy = False
+            self.btn_refresh.configure(state="normal")
+            self._log(f"Сбой: {exc}", "error")
+            self.hub.toast(f"Сбой: {exc}", kind="error")
+            self.hub.set_status("Готово")
+
+        self.hub.run_bg(work, on_done, on_error)
+
+    def _refresh(self) -> None:
+        if self.cfg is None:
+            self.hub.toast("Ядро diary-grades не найдено", kind="error")
+            return
+        try:
+            has_session = bool(self.cfg.session_exists())
+        except Exception:  # noqa: BLE001
+            has_session = False
+        if not has_session:
+            self._log("Сессии нет — открываем браузер для входа через Госуслуги.", "warn")
+            self._login()
+            return
+        self._start_bg("Забираем оценки из дневника (браузер скрыт)…",
+                       _DIARY_FETCH_CODE, (), 180)
+
+    def _login(self) -> None:
+        if self.cfg is None:
+            return
+        self._log("Открываем Chromium: войди через Госуслуги (ЕСИА).")
+        self._start_bg("Ожидаем ручной вход в ЕСИА…", _DIARY_LOGIN_CODE, (), 420)
+
+    def _demo(self) -> None:
+        if self.gm is None:
+            return
+        result = self.demo.demo_result(self.cfg.current_period().label)
+        self.reports = self.gm.sort_reports(self.gm.build_reports(result.subjects))
+        self.source_label = "ДЕМО-ДАННЫЕ"
+        self.demo_note = "  ·  не реальные оценки"
+        self.period_label = result.period
+        self.lbl_source.configure(text=self.source_label, fg=WARN)
+        self.lbl_period.configure(text=self.period_label)
+        self.lbl_count.configure(text=str(len(self.reports)))
+        self.cache_stamp = self._stamp()
+        self._render_rows()
+        self._log("Показаны демо-данные; кэш реальных оценок не перезаписан.", "warn")
+
+    def _import_file(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self, title="Сохранённая страница оценок или JSON дневника",
+            filetypes=[("HTML / JSON / TXT", "*.html *.htm *.json *.txt"),
+                       ("Все файлы", "*.*")])
+        if not path:
+            return
+        self._start_bg(f"Импорт: {Path(path).name}", _DIARY_IMPORT_CODE, (path,), 90)
+
+    def _open_app(self, *args: str) -> None:
+        pythonw = self._python("pythonw.exe")
+        try:
+            if pythonw is not None:
+                command = [str(pythonw), str(self.dir / "app.pyw"), *args]
+            else:
+                command = ["cmd.exe", "/c", str(self.dir / "run.bat")]
+            subprocess.Popen(command, cwd=str(self.dir),
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as exc:
+            self._log(f"Не удалось открыть окно: {exc}", "error")
+            self.hub.toast("Не удалось открыть окно дневника", kind="error")
+            return
+        self._log("Отдельное окно приложения запущено.")
+        self.hub.toast("Окно дневника открыто", kind="ok")
+
+    def _open_folder(self) -> None:
+        try:
+            os.startfile(str(self.dir))
+        except Exception as exc:  # noqa: BLE001
+            self.hub.toast(f"Папка не открылась: {exc}", kind="error")
+
+
+
+
+class AIScreenAgentPanel(Panel):
+    """AI Screen Bridge (Computer Use): авто-прохождение тестов через Gemini Vision."""
+
+    def __init__(self, master: tk.Misc, hub) -> None:
+        super().__init__(master, hub)
+        self.dir = APP_DIR / "ai-screen-agent"
+        self.script = self.dir / "screen_agent.py"
+        self.config_file = self.dir / "config.json"
+        self._proc: subprocess.Popen | None = None
+        self._poll_job = None
+        self._build()
+        self.refresh()
+        self._schedule_poll()
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        cards = tk.Frame(self, bg=BG)
+        cards.grid(row=0, column=0, sticky="ew", pady=(0, px(12)))
+        cards.columnconfigure(0, weight=1)
+        cards.columnconfigure(1, weight=1)
+        cards.columnconfigure(2, weight=1)
+
+        c1 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        c1.grid(row=0, column=0, sticky="nsew", padx=(0, px(6)))
+        tk.Label(c1, text="Статус агента", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.lbl_status = tk.Label(c1, text="○ Остановлен", bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"))
+        self.lbl_status.pack(anchor="w", pady=(px(4), 0))
+        self.lbl_info = tk.Label(c1, text="Плавающее окно поверх тестов", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_info.pack(anchor="w")
+
+        c2 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        c2.grid(row=0, column=1, sticky="nsew", padx=px(4))
+        tk.Label(c2, text="Интеллект (Мозг)", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.lbl_model = tk.Label(c2, text="Gemini 2.5 Flash", bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"))
+        self.lbl_model.pack(anchor="w", pady=(px(4), 0))
+        self.lbl_key = tk.Label(c2, text="Ключ не настроен", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_key.pack(anchor="w")
+
+        c3 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        c3.grid(row=0, column=2, sticky="nsew", padx=(px(6), 0))
+        tk.Label(c3, text="Область экрана (Глаза)", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.lbl_roi = tk.Label(c3, text="Не выбрана", bg=CARD, fg=MUTED, font=("Segoe UI", 12, "bold"))
+        self.lbl_roi.pack(anchor="w", pady=(px(4), 0))
+        self.lbl_roi_hint = tk.Label(c3, text="Координаты теста на экране", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_roi_hint.pack(anchor="w")
+
+        ctrl = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        ctrl.grid(row=1, column=0, sticky="ew", pady=(0, px(12)))
+
+        bar = tk.Frame(ctrl, bg=CARD)
+        bar.pack(fill="x", pady=(0, px(10)))
+
+        self.btn_start = flat_button(bar, "▶ Запустить окно агента", self.start_agent, kind="primary")
+        self.btn_start.pack(side="left", padx=(0, px(8)))
+
+        self.btn_stop = flat_button(bar, "⏹ Закрыть агент", self.stop_agent, kind="ghost")
+        self.btn_stop.pack(side="left", padx=(0, px(8)))
+
+        flat_button(bar, "📁 Папка агента", self.open_folder, kind="ghost").pack(side="left", padx=(0, px(8)))
+        flat_button(bar, "🔄 Обновить", self.refresh, kind="ghost").pack(side="left")
+
+        key_row = tk.Frame(ctrl, bg=CARD)
+        key_row.pack(fill="x", pady=px(3))
+        tk.Label(key_row, text="Gemini API Key:", bg=CARD, fg=FG, width=15, anchor="w").pack(side="left")
+        self.key_var = tk.StringVar()
+        self.key_entry = ttk.Entry(key_row, textvariable=self.key_var, show="*")
+        self.key_entry.pack(side="left", fill="x", expand=True, padx=(0, px(6)))
+
+        self.btn_eye = flat_button(key_row, "👁", self.toggle_show_key, kind="ghost")
+        self.btn_eye.pack(side="left", padx=(0, px(6)))
+
+        self.btn_paste = flat_button(key_row, "📋 Вставить", self.paste_key, kind="primary")
+        self.btn_paste.pack(side="left", padx=(0, px(6)))
+
+        flat_button(key_row, "Сохранить", self.save_key, kind="ghost").pack(side="left")
+
+        # Привязка Ctrl+V в любой раскладке и ПКМ для вставки
+        self.key_entry.bind("<Control-v>", lambda e: (self.paste_key(), "break")[1])
+        self.key_entry.bind("<Control-V>", lambda e: (self.paste_key(), "break")[1])
+        self.key_entry.bind("<Control-KeyPress>", lambda e: (self.paste_key(), "break")[1] if getattr(e, "keycode", 0) == 86 or (e.keysym or "").lower() in ("v", "м") else None)
+
+        def _on_right_click(event):
+            m = tk.Menu(self.key_entry, tearoff=0, bg=CARD, fg=FG)
+            m.add_command(label="Вставить из буфера", command=self.paste_key)
+            m.add_command(label="Копировать", command=lambda: (self.clipboard_clear(), self.clipboard_append(self.key_var.get())))
+            m.add_command(label="Очистить", command=lambda: self.key_var.set(""))
+            m.tk_popup(event.x_root, event.y_root)
+
+        self.key_entry.bind("<Button-3>", _on_right_click)
+
+        hint = tk.Label(ctrl, text="Подсказка: запустите окно агента, выделите рамку с тестом в браузере и нажмите СТАРТ.",
+                        bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        hint.pack(anchor="w", pady=(px(6), 0))
+
+        log_frame, self.log_box = self.make_log(self, height=14, label="Лог событий AI Screen Agent")
+        log_frame.grid(row=2, column=0, sticky="nsew")
+        self.append_log(self.log_box, "AI Screen Agent интегрирован в хаб инструментов.")
+        self.append_log(self.log_box, "Нажмите «▶ Запустить окно агента» для открытия окна управления над тестом.")
+
+    def _is_running(self) -> bool:
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+        try:
+            out = ps_run('Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%screen_agent.py%'" | Select-Object -ExpandProperty ProcessId')
+            pids = [int(p.strip()) for p in out.splitlines() if p.strip().isdigit()]
+            return len(pids) > 0
+        except Exception:
+            return False
+
+    def start_agent(self) -> None:
+        if self._is_running():
+            self.hub.toast("Окно агента уже запущено", kind="warn")
+            return
+        pythonw = APP_DIR.parent / "AppData" / "Local" / "Programs" / "Python" / "Python313" / "pythonw.exe"
+        if not pythonw.exists():
+            pythonw = Path(sys.executable).parent / "pythonw.exe"
+        py_exe = str(pythonw if pythonw.exists() else sys.executable)
+
+        try:
+            env = os.environ.copy()
+            env["PYTHONUTF8"] = "1"
+            self._proc = subprocess.Popen(
+                [py_exe, str(self.script)],
+                cwd=str(self.dir),
+                env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+            self.hub.toast("Окно агента запущено", kind="ok")
+            self.append_log(self.log_box, f"Запущен процесс агента (PID: {self._proc.pid}).")
+            self.after(500, self.refresh)
+        except Exception as exc:
+            self.hub.toast(f"Ошибка запуска: {exc}", kind="error")
+            self.append_log(self.log_box, f"Ошибка запуска: {exc}", tag="error")
+
+    def stop_agent(self) -> None:
+        stopped = False
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+                stopped = True
+            except Exception:
+                pass
+            self._proc = None
+
+        try:
+            out = ps_run('Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%screen_agent.py%'" | Select-Object -ExpandProperty ProcessId')
+            for line in out.splitlines():
+                if line.strip().isdigit():
+                    subprocess.run(["taskkill", "/PID", line.strip(), "/T", "/F"], capture_output=True)
+                    stopped = True
+        except Exception:
+            pass
+
+        if stopped:
+            self.hub.toast("Агент остановлен", kind="ok")
+            self.append_log(self.log_box, "Процесс агента остановлен.")
+        else:
+            self.hub.toast("Процесс не был запущен", kind="info")
+        self.refresh()
+
+    def open_folder(self) -> None:
+        try:
+            os.startfile(str(self.dir))
+        except Exception as exc:
+            self.hub.toast(f"Ошибка открытия папки: {exc}", kind="error")
+
+    def toggle_show_key(self) -> None:
+        if self.key_entry.cget("show") == "*":
+            self.key_entry.configure(show="")
+            self.btn_eye.configure(text="🔒")
+        else:
+            self.key_entry.configure(show="*")
+            self.btn_eye.configure(text="👁")
+
+    def paste_key(self) -> None:
+        try:
+            val = self.clipboard_get()
+            if val:
+                val = val.strip().strip('"\' \t\r\n')
+                self.key_var.set(val)
+                self.save_key()
+                self.hub.toast("Ключ вставлен из буфера и сохранён", kind="ok")
+                self.append_log(self.log_box, "✅ API ключ вставлен из буфера обмена и сохранён!")
+        except Exception as exc:
+            self.hub.toast(f"Буфер пуст или недоступен: {exc}", kind="warn")
+
+    def save_key(self) -> None:
+        new_key = self.key_var.get().strip()
+        if not new_key:
+            self.hub.toast("Введите ключ!", kind="warn")
+            return
+        cfg = {}
+        if self.config_file.exists():
+            try:
+                cfg = json.loads(self.config_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        cfg["api_key"] = new_key
+        try:
+            self.config_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.hub.toast("Ключ сохранён", kind="ok")
+            self.append_log(self.log_box, "Gemini API Key сохранён в config.json.")
+            self.refresh()
+        except Exception as exc:
+            self.hub.toast(f"Ошибка сохранения: {exc}", kind="error")
+
+    def refresh(self) -> None:
+        if self.config_file.exists():
+            try:
+                cfg = json.loads(self.config_file.read_text(encoding="utf-8"))
+                key = cfg.get("api_key", "")
+                if key and not self.key_var.get():
+                    self.key_var.set(key)
+                if key:
+                    if key.startswith("sk-apx"):
+                        p_name = "● APInex (Gemini/Claude)"
+                    elif key.startswith("AIza"):
+                        p_name = "● Google AI Studio"
+                    elif key.startswith("sk-"):
+                        p_name = "● OpenAI / Proxy"
+                    else:
+                        p_name = "● Ключ настроен"
+                    self.lbl_key.config(text=p_name, fg=OK)
+                else:
+                    self.lbl_key.config(text="○ Ключ не настроен", fg="#ff8a8a")
+
+                self.lbl_model.config(text=cfg.get("model", "gemini-2.5-flash"))
+
+                roi = cfg.get("roi")
+                if roi and isinstance(roi, (list, tuple)) and len(roi) == 4:
+                    self.lbl_roi.config(text=f"{roi[2]}x{roi[3]} px", fg=FG)
+                    self.lbl_roi_hint.config(text=f"X: {roi[0]}, Y: {roi[1]}")
+                else:
+                    self.lbl_roi.config(text="Не выбрана", fg=MUTED)
+            except Exception:
+                pass
+
+        if self._is_running():
+            self.lbl_status.config(text="● Запущен", fg=OK)
+        else:
+            self.lbl_status.config(text="○ Остановлен", fg=FG)
+
+    def _schedule_poll(self) -> None:
+        self.refresh()
+        self._poll_job = self.after(3000, self._schedule_poll)
+
+    def on_show(self) -> None:
+        self.refresh()
+
+
+
+class AutoCopyPanel(Panel):
+    """AutoCopy: автоматическое копирование выделенного текста в буфер обмена."""
+
+    def __init__(self, master: tk.Misc, hub) -> None:
+        super().__init__(master, hub)
+        self.script = APP_DIR / "autocopy.py"
+        self.config_file = CONFIG_PATH
+        self._proc: subprocess.Popen | None = None
+        self._poll_job = None
+        self._build()
+        self.refresh()
+        self._schedule_poll()
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(3, weight=1)
+
+        cards = tk.Frame(self, bg=BG)
+        cards.grid(row=0, column=0, sticky="ew", pady=(0, px(12)))
+        cards.columnconfigure(0, weight=1)
+        cards.columnconfigure(1, weight=1)
+        cards.columnconfigure(2, weight=1)
+
+        c1 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        c1.grid(row=0, column=0, sticky="nsew", padx=(0, px(6)))
+        tk.Label(c1, text="Служба AutoCopy", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.lbl_status = tk.Label(c1, text="○ Остановлена", bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"))
+        self.lbl_status.pack(anchor="w", pady=(px(4), 0))
+        self.lbl_pid = tk.Label(c1, text="Служба не активна", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_pid.pack(anchor="w")
+
+        c2 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        c2.grid(row=0, column=1, sticky="nsew", padx=px(4))
+        tk.Label(c2, text="Всплывающая подсказка", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.lbl_notify = tk.Label(c2, text="● Включена", bg=CARD, fg=OK, font=("Segoe UI", 12, "bold"))
+        self.lbl_notify.pack(anchor="w", pady=(px(4), 0))
+        self.lbl_notify_hint = tk.Label(c2, text="Окно около курсора мыши", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_notify_hint.pack(anchor="w")
+
+        c3 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        c3.grid(row=0, column=2, sticky="nsew", padx=(px(6), 0))
+        tk.Label(c3, text="Автозагрузка", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        self.lbl_startup = tk.Label(c3, text="● Активна", bg=CARD, fg=OK, font=("Segoe UI", 12, "bold"))
+        self.lbl_startup.pack(anchor="w", pady=(px(4), 0))
+        self.lbl_startup_hint = tk.Label(c3, text="Запуск со стартом Windows", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_startup_hint.pack(anchor="w")
+
+        ctrl = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        ctrl.grid(row=1, column=0, sticky="ew", pady=(0, px(12)))
+
+        bar = tk.Frame(ctrl, bg=CARD)
+        bar.pack(fill="x", pady=(0, px(10)))
+
+        self.btn_start = flat_button(bar, "▶ Запустить AutoCopy", self.start_service, kind="primary")
+        self.btn_start.pack(side="left", padx=(0, px(8)))
+
+        self.btn_stop = flat_button(bar, "⏹ Остановить", self.stop_service, kind="ghost")
+        self.btn_stop.pack(side="left", padx=(0, px(8)))
+
+        flat_button(bar, "🔄 Обновить", self.refresh, kind="ghost").pack(side="left", padx=(0, px(8)))
+        flat_button(bar, "📁 Папка скрипта", self.open_folder, kind="ghost").pack(side="left")
+
+        opts = tk.Frame(ctrl, bg=CARD)
+        opts.pack(fill="x", pady=(px(4), 0))
+
+        self.var_notify = tk.BooleanVar(value=True)
+        cb1 = ttk.Checkbutton(opts, text="Показывать всплывающую подсказку у курсора", variable=self.var_notify, command=self.save_settings)
+        cb1.pack(anchor="w", pady=px(2))
+
+        self.var_middle = tk.BooleanVar(value=False)
+        cb2 = ttk.Checkbutton(opts, text="Вставлять по клику на колесико мыши (среднюю кнопку)", variable=self.var_middle, command=self.save_settings)
+        cb2.pack(anchor="w", pady=px(2))
+
+        self.var_autostart = tk.BooleanVar(value=True)
+        cb3 = ttk.Checkbutton(opts, text="Запускать AutoCopy при включении Windows (автозагрузка)", variable=self.var_autostart, command=self.toggle_autostart_setting)
+        cb3.pack(anchor="w", pady=px(2))
+
+        test_frame = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
+        test_frame.grid(row=2, column=0, sticky="ew", pady=(0, px(12)))
+
+        tk.Label(test_frame, text="Быстрая проверка работы:", bg=CARD, fg=FG, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(test_frame, text="Выделите мышкой любой фрагмент текста в поле ниже или кликните дважды по слову — он моментально скопируется:",
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(px(2), px(6)))
+
+        test_entry = tk.Text(test_frame, height=2, bg=FIELD, fg=FG, insertbackground=FG,
+                             relief="flat", highlightbackground=BORDER, highlightthickness=1, font=("Segoe UI", 10), padx=px(8), pady=px(6))
+        test_entry.insert("1.0", "AutoCopy работает идеально! Выделите это предложение, чтобы проверить копирование.")
+        test_entry.pack(fill="x")
+        self.attach_copy(test_entry, label="Тестовый текст", readonly=False)
+
+        self.lbl_clip_preview = tk.Label(test_frame, text="В буфере обмена сейчас: —", bg=CARD, fg=MUTED, font=("Segoe UI", 9), anchor="w")
+        self.lbl_clip_preview.pack(fill="x", pady=(px(6), 0))
+
+        log_frame, self.log_box = self.make_log(self, height=8, label="Лог событий AutoCopy")
+        log_frame.grid(row=3, column=0, sticky="nsew")
+        self.append_log(self.log_box, "Вкладка AutoCopy готова к работе.")
+
+    def _is_running(self) -> tuple[bool, int | None]:
+        try:
+            out = ps_run("""Get-CimInstance Win32_Process -Filter "(Name LIKE 'python%' AND CommandLine LIKE '%autocopy%') OR Name = 'AutoCopy.exe'" | Select-Object -ExpandProperty ProcessId""")
+            pids = [int(p.strip()) for p in out.splitlines() if p.strip().isdigit()]
+            if pids:
+                return True, pids[0]
+        except Exception:
+            pass
+        return False, None
+
+    def start_service(self) -> None:
+        running, pid = self._is_running()
+        if running:
+            self.hub.toast(f"AutoCopy уже работает (PID: {pid})", kind="info")
+            return
+        pythonw = APP_DIR.parent / "AppData" / "Local" / "Programs" / "Python" / "Python313" / "pythonw.exe"
+        if not pythonw.exists():
+            pythonw = Path(sys.executable).parent / "pythonw.exe"
+        py_exe = str(pythonw if pythonw.exists() else sys.executable)
+
+        try:
+            cmd = f'"{py_exe}" "{self.script}"'
+            ps_run(f"""Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = '{cmd}'; CurrentDirectory = '{APP_DIR}' }}""")
+            self.hub.toast("AutoCopy запущен в фоне", kind="ok")
+            self.append_log(self.log_box, "Служба AutoCopy запущена.")
+            self.after(500, self.refresh)
+        except Exception as exc:
+            self.hub.toast(f"Ошибка запуска: {exc}", kind="error")
+            self.append_log(self.log_box, f"Ошибка запуска: {exc}", tag="error")
+
+    def stop_service(self) -> None:
+        stopped = False
+        try:
+            out = ps_run("""Get-CimInstance Win32_Process -Filter "(Name LIKE 'python%' AND CommandLine LIKE '%autocopy%') OR Name = 'AutoCopy.exe'" | Select-Object -ExpandProperty ProcessId""")
+            for line in out.splitlines():
+                if line.strip().isdigit():
+                    subprocess.run(["taskkill", "/PID", line.strip(), "/T", "/F"], capture_output=True)
+                    stopped = True
+        except Exception:
+            pass
+
+        if stopped:
+            self.lbl_status.config(text="○ Остановлен", fg=MUTED)
+            self.lbl_pid.config(text="Служба не активна")
+            self.btn_start.configure(state="normal")
+            self.btn_stop.configure(state="disabled")
+            self.hub.toast("AutoCopy остановлен", kind="ok")
+            self.append_log(self.log_box, "Служба AutoCopy остановлена.")
+        else:
+            self.hub.toast("AutoCopy не был запущен", kind="info")
+        self.after(300, self.refresh)
+
+    def open_folder(self) -> None:
+        try:
+            os.startfile(str(APP_DIR))
+        except Exception as exc:
+            self.hub.toast(f"Ошибка открытия папки: {exc}", kind="error")
+
+    def save_settings(self) -> None:
+        cfg = config_read()
+        ac = cfg.get("autocopy", {})
+        ac["show_notifications"] = self.var_notify.get()
+        ac["middle_click_paste"] = self.var_middle.get()
+        cfg["autocopy"] = ac
+        config_write(cfg)
+        self.hub.toast("Настройки сохранены", kind="ok")
+        self.refresh()
+
+    def toggle_autostart_setting(self) -> None:
+        enabled = self.var_autostart.get()
+        try:
+            pythonw = APP_DIR.parent / "AppData" / "Local" / "Programs" / "Python" / "Python313" / "pythonw.exe"
+            if not pythonw.exists():
+                pythonw = Path(sys.executable).parent / "pythonw.exe"
+            py_exe = str(pythonw if pythonw.exists() else sys.executable)
+            script_path = str(self.script)
+
+            startup_lnk = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "AutoCopy.lnk"
+            if enabled:
+                ps_run(f'''
+                    $WshShell = New-Object -ComObject WScript.Shell
+                    $Shortcut = $WshShell.CreateShortcut("{startup_lnk}")
+                    $Shortcut.TargetPath = "{py_exe}"
+                    $Shortcut.Arguments = '"{script_path}"'
+                    $Shortcut.WorkingDirectory = "{APP_DIR}"
+                    $Shortcut.Save()
+                ''')
+                ps_run(f'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -Name "AutoCopyUtility" -Value \'"{py_exe}" "{script_path}"\'')
+                self.hub.toast("Автозагрузка включена", kind="ok")
+            else:
+                if startup_lnk.exists():
+                    try:
+                        startup_lnk.unlink()
+                    except Exception:
+                        pass
+                ps_run('Remove-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -Name "AutoCopyUtility" -ErrorAction SilentlyContinue')
+                self.hub.toast("Автозагрузка отключена", kind="ok")
+        except Exception as exc:
+            self.hub.toast(f"Ошибка настройки автозагрузки: {exc}", kind="error")
+        self.save_settings()
+
+    def refresh(self) -> None:
+        cfg = config_read()
+        ac = cfg.get("autocopy", {})
+        self.var_notify.set(ac.get("show_notifications", True))
+        self.var_middle.set(ac.get("middle_click_paste", False))
+
+        is_run, pid = self._is_running()
+        if is_run:
+            self.lbl_status.config(text="● Запущен", fg=OK)
+            self.lbl_pid.config(text=f"PID: {pid} (работает в фоне)")
+            self.btn_start.configure(state="disabled")
+            self.btn_stop.configure(state="normal")
+        else:
+            self.lbl_status.config(text="○ Остановлен", fg=MUTED)
+            self.lbl_pid.config(text="Служба не активна")
+            self.btn_start.configure(state="normal")
+            self.btn_stop.configure(state="disabled")
+
+        if self.var_notify.get():
+            self.lbl_notify.config(text="● Включена", fg=OK)
+        else:
+            self.lbl_notify.config(text="○ Выключена", fg=MUTED)
+
+        startup_lnk = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "AutoCopy.lnk"
+        if startup_lnk.exists():
+            self.lbl_startup.config(text="● Активна", fg=OK)
+            self.var_autostart.set(True)
+        else:
+            self.lbl_startup.config(text="○ Отключена", fg=MUTED)
+            self.var_autostart.set(False)
+
+        try:
+            import pyperclip  # лениво: только для предпросмотра буфера обмена
+
+            clip = pyperclip.paste()
+            if clip:
+                cleaned = " ".join(clip.split())
+                if len(cleaned) > 50:
+                    cleaned = cleaned[:47] + "..."
+                self.lbl_clip_preview.config(text=f"В буфере обмена сейчас: «{cleaned}»")
+            else:
+                self.lbl_clip_preview.config(text="В буфере обмена сейчас: (пусто)")
+        except Exception:
+            pass
+
+    def _schedule_poll(self) -> None:
+        self.refresh()
+        self._poll_job = self.after(3000, self._schedule_poll)
+
+    def on_show(self) -> None:
+        self.refresh()
+
+
 NAV = (
     ("autoclicker", "AutoClicker", "клики по экрану"),
+    ("autocopy", "AutoCopy", "копирование при выделении"),
     ("clean", "Пустые файлы", "0 байт и пустые папки"),
     ("dns", "DNS", "Quad9 · Xbox · DoH"),
-    ("cleanup", "Очистка Windows", "кэши · корзина"),
     ("github", "GitHub", "бэкап проектов"),
     ("bypass", "Bypass", "обход DPI: глобально и по приложениям"),
     ("leads", "Лиды 2GIS", "контакты без сайта"),
+    ("diary", "Дневник МО", "оценки · запас до пятёрки"),
+    ("shorts", "Shorts Autopilot", "клипы · DaVinci · YouTube"),
+    ("ai_agent", "AI Screen Agent", "Computer Use · тесты"),
+    ("shutdown", "Страж выключения", "когда агенты закончат — выключить ПК"),
 )
+
+class ShutdownWatcherPanel(Panel):
+    """Следит за агентами: когда все закончат — выключает ПК через 60 с."""
+
+    def __init__(self, master: tk.Misc, hub) -> None:
+        super().__init__(master, hub)
+        self.watcher: wsh.Watcher | None = None
+        self._poll_job: str | None = None
+        self._build()
+        self._refresh_status()
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        # --- кнопки --- #
+        bar = tk.Frame(self, bg=BG)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, px(8)))
+        flat_button(bar, "▶ Старт стража", self.start_watcher, kind="ghost").pack(side="left")
+        self.btn_stop = flat_button(bar, "■ Стоп стража", self.stop_watcher, kind="danger")
+        self.btn_stop["state"] = "disabled"
+        self.btn_stop.pack(side="left", padx=(px(8), 0))
+        flat_button(bar, "✕ Отменить выключение", self.cancel_shutdown, kind="ghost").pack(side="left", padx=(px(8), 0))
+        self.lbl_timer = tk.Label(bar, bg=BG, fg=WARN,
+                                  font=("Segoe UI", 9, "bold"))
+        self.lbl_timer.pack(side="left", padx=(px(10), 0))
+
+        tk.Label(self, text="Отслеживаемые агенты (редактируй список в shutdown_watcher.py → DEFAULT_AGENTS)",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w")
+
+        # --- таблица агентов --- #
+        self.tree = ttk.Treeview(self, columns=("mode", "target", "status", "note"),
+                                 show="headings", selectmode="none",
+                                 height=8)
+        for col, head in (("mode", "Режим"), ("target", "Цель"),
+                          ("status", "Состояние"), ("note", "Примечание")):
+            self.tree.heading(col, text=head)
+            self.tree.column(col, width=px(150))
+        self.tree.grid(row=2, column=0, sticky="nsew")
+
+        # --- лог --- #
+        log_frame = tk.Frame(self, bg=BG)
+        log_frame.grid(row=3, column=0, sticky="nsew", pady=(px(8), 0))
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+        self.log = tk.Text(
+            log_frame, bg=LOG_BG, fg=LOG_FG, insertbackground=FG,
+            font=("Consolas", 9), state="disabled", wrap="word",
+        )
+        self.log.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.log.config(yscrollcommand=scroll.set)
+
+    def _status_color(self, status: wsh.Status) -> str:
+        return {
+            wsh.Status.DONE: OK,
+            wsh.Status.WORKING: ACCENT,
+            wsh.Status.NOT_SEEN: MUTED,
+        }[status]
+
+    def _watchers(self) -> list[wsh.Agent]:
+        return list(wsh.DEFAULT_AGENTS)
+
+    # --- управление --- #
+    def start_watcher(self) -> None:
+        self.stop_watcher()
+        agents = self._watchers()
+        if not agents:
+            self.log_lines(["Список агентов пуст — добавь DEFAULT_AGENTS в shutdown_watcher.py"])
+            return
+        self.watcher = wsh.Watcher(agents)
+        self.btn_stop.config(state="normal")
+        self.tree.delete(*self.tree.get_children())
+        self.watcher.start(on_update=lambda: self.hub.post(self._refresh_status))
+        self._schedule_poll()
+        self.log_lines(["Страж запущен:", *[f"  • {a.name} ({a.mode}: {a.exe or a.marker})" for a in agents]])
+
+    def stop_watcher(self) -> None:
+        if self.watcher:
+            self.watcher.stop()
+        self.watcher = None
+        self.btn_stop.config(state="disabled")
+        self.lbl_timer.config(text="")
+
+    def cancel_shutdown(self) -> None:
+        if self.watcher and self.watcher.armed:
+            self.watcher.cancel_shutdown()
+            self.lbl_timer.config(text="выключение отменено", fg=OK)
+            self._refresh_status()
+
+    # --- отрисовка --- #
+    def on_show(self) -> None:
+        self._refresh_status()
+
+    def _log_pane(self, text: str) -> None:
+        self.log.config(state="normal")
+        self.log.insert("end", f"{text}\n")
+        self.log.see("end")
+        self.log.config(state="disabled")
+
+    def _schedule_poll(self) -> None:
+        if self.watcher:
+            self._poll_job = self.after(2500, self._poll)
+
+    def _poll(self) -> None:
+        if self.watcher and self.watcher.armed:
+            self._refresh_status()
+        self._schedule_poll()
+
+    def _refresh_status(self) -> None:
+        if self.watcher is None:
+            return
+        results = self.watcher.summary()
+        for child in self.tree.get_children():
+            self.tree.delete(child)
+        for agent, res in zip(self.watcher.agents, results):
+            iid = self.tree.insert("", "end", values=(
+                agent.mode,
+                agent.exe or agent.marker or "—",
+                res.status.value,
+                res.note,
+            ))
+            self.tree.item(iid, tags=(res.status.value,))
+            self.tree.tag_configure(res.status.value,
+                                    foreground=self._status_color(res.status))
+        if self.watcher.armed:
+            left = self.watcher.pending_seconds()
+            self.lbl_timer.config(
+                text=f"⚠ Выключение через {left} с" + "!" * bool(left % 2),
+                fg=DANGER if left <= 10 else WARN,
+            )
+            if left <= 0:
+                self.lbl_timer.config(text="Выключение!", fg=DANGER)
+        # приём новых строк лога
+        lines = self.watcher.take_lines(400)
+        shown = getattr(self, "_log_shown", [])
+        for line in lines[len(shown):]:
+            self._log_pane(line)
+        self._log_shown = lines
+
 
 HEADERS = {
     "autoclicker": (
         "AutoClicker",
         "Клики по точкам, областям и картинкам. F6 — старт/стоп, F7 — точка под курсором.",
+    ),
+    "autocopy": (
+        "AutoCopy · Автоматическое копирование",
+        "Копирует выделенный мышью текст сразу в буфер обмена и показывает подсказку у курсора.",
     ),
     "clean": (
         "Пустые файлы и папки",
@@ -6118,10 +7564,6 @@ HEADERS = {
     "dns": (
         "DNS",
         "Профили Quad9 и Xbox, DHCP и DNS-over-HTTPS. Нужны права администратора.",
-    ),
-    "cleanup": (
-        "Очистка Windows",
-        "Temp, кэши, корзина и Windows.old. Личные файлы не затрагиваются.",
     ),
     "github": (
         "GitHub",
@@ -6134,6 +7576,22 @@ HEADERS = {
     "leads": (
         "Лиды 2GIS",
         "Организации из выдачи 2GIS: телефон, e-mail, сайт, мессенджеры и приоритет под аутрич. Горячие копятся в пуле на 5 дней.",
+    ),
+    "diary": (
+        "Дневник МО · Контроль балла",
+        "Средний балл, «5» до 4.50 и запас прочности. Вход через Госуслуги — один раз.",
+    ),
+    "shorts": (
+        "Shorts Autopilot",
+        "Автоматизация YouTube Shorts: скачивание через MAX, SEO-генерация через Google AI, монтаж в DaVinci Resolve и загрузка на YouTube.",
+    ),
+    "ai_agent": (
+        "AI Screen Agent (Computer Use)",
+        "Автономное прохождение тестов через Gemini Vision. Захват экрана, выбор ответов и клики мышкой.",
+    ),
+    "shutdown": (
+        "Страж выключения",
+        "Следит за ИИ-агентами (WorkBuddy, OpenCode, Antigravity) и выключает ПК, когда все завершат работу.",
     ),
 }
 
@@ -6210,12 +7668,16 @@ class Hub(tk.Tk):
 
         self.factories = {
             "autoclicker": lambda: AutoClickerPanel(self.content, self),
+            "autocopy": lambda: AutoCopyPanel(self.content, self),
             "clean": lambda: CleanPanel(self.content, self),
             "dns": lambda: DnsPanel(self.content, self),
-            "cleanup": lambda: CleanupPanel(self.content, self),
             "github": lambda: GitHubPanel(self.content, self),
             "bypass": lambda: BypassPanel(self.content, self),
             "leads": lambda: LeadsPanel(self.content, self),
+            "diary": lambda: DiaryGradesPanel(self.content, self),
+            "shorts": lambda: ShortsAutopilotPanel(self.content, self),
+            "ai_agent": lambda: AIScreenAgentPanel(self.content, self),
+            "shutdown": lambda: ShutdownWatcherPanel(self.content, self),
         }
 
         self._build()
@@ -6274,7 +7736,7 @@ class Hub(tk.Tk):
         self.status_var = tk.StringVar(value="Готово")
         tk.Label(status_bar, textvariable=self.status_var, bg="#0f1115", fg=MUTED,
                  font=("Segoe UI", 8), anchor="w").pack(side="left", padx=px(14))
-        tk.Label(status_bar, text="Ctrl+1…7 — переключение разделов", bg="#0f1115",
+        tk.Label(status_bar, text="Ctrl+1…9 — переключение разделов", bg="#0f1115",
                  fg="#5f6773", font=("Segoe UI", 8), anchor="e").pack(side="right", padx=px(14))
 
         head = tk.Frame(main, bg=BG)
@@ -6292,7 +7754,8 @@ class Hub(tk.Tk):
         self.content.columnconfigure(0, weight=1)
 
         for index, (key, _title, _subtitle) in enumerate(NAV, 1):
-            self.bind_all(f"<Control-Key-{index}>", lambda _event, k=key: self.show(k))
+            key_char = str(index % 10)
+            self.bind_all(f"<Control-Key-{key_char}>", lambda _event, k=key: self.show(k))
 
     # -- разделы ----------------------------------------------------------- #
     def show(self, key: str) -> None:
@@ -6424,9 +7887,8 @@ def main() -> int:
     parser.add_argument("--tab", choices=[key for key, _t, _s in NAV], default="autoclicker")
     args, _unknown = parser.parse_known_args()
 
-    if HAS_DEPS:
-        pyautogui.PAUSE = 0
-        pyautogui.FAILSAFE = True
+    # pyautogui.PAUSE / FAILSAFE настраиваются в load_autoclicker_deps()
+    # сразу после ленивого импорта — здесь он ещё не загружен.
 
     # Собранный Tools.exe запрашивает права манифестом. Исходник запускаем
     # обычным процессом: иначе двойной клик сначала закрывает pythonw, а затем

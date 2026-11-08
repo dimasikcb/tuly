@@ -1,9 +1,13 @@
 """Смоук панели Bypass: поиск, выбор программ, переключатели (Tk без mainloop)."""
 from __future__ import annotations
 
-import tkinter as tk
 import unittest
 from unittest import mock
+
+try:
+    import tkinter as tk
+except ImportError as exc:  # GUI-тесты требуют tkinter (есть не во всех сборках Python)
+    raise unittest.SkipTest(f"tkinter недоступен: {exc}") from exc
 
 import sys
 from pathlib import Path

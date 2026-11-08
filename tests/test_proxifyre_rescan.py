@@ -53,7 +53,9 @@ class RescanTest(unittest.TestCase):
         self.pids.append((11, r"C:\Apps\browser.exe"))
         result = app.proxifyre_rescan()
         self.assertTrue(result["ok"])
-        self.assertEqual(result["apps"], [11])
+        # GUI пишет apps в лог как имена программ, а не числа-PID.
+        self.assertEqual(result["apps"], ["browser.exe"])
+        self.assertEqual(result["pids"], [11])
         self.assertEqual(self.calls, ["stop", "start"])
 
     def test_cooldown_blocks_second_restart(self) -> None:

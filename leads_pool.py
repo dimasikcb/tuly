@@ -281,7 +281,8 @@ def pool_add(pool_file, leads: list[dict]) -> int:
     rows = pool_load(pool_file)
     known = {pool_key(row) for row in rows}
     stamp = _now().isoformat(timespec="seconds")
-    added = 0
+    added = 0       # сколько реально НОВЫХ записей (возвращаемое значение)
+    changed = 0     # были ли вообще изменения — по ним решаем сохранять файл
     by_key = {pool_key(row): row for row in rows}
     for lead in hot:
         key = pool_key(lead)
@@ -293,21 +294,23 @@ def pool_add(pool_file, leads: list[dict]) -> int:
             new_card = str(lead.get("url") or lead.get("card") or "").strip()
             if not (existing.get("card") or "").strip() and new_card:
                 existing["card"] = new_card
-                added += 1
+                changed += 1
             new_topic = str(lead.get("topic") or lead.get("query") or "").strip()
             if not (existing.get("topic") or "").strip() and new_topic:
                 existing["topic"] = new_topic
+                changed += 1
             for ch in ("telegram", "max", "vk", "email"):
                 if not (existing.get(ch) or "").strip():
                     val = _pool_value(ch, _pick_contact(lead, ch))
                     if val:
                         existing[ch] = val
+                        changed += 1
             continue
         new_row = _lead_to_pool_row(lead, stamp)
         rows.append(new_row)
         by_key[key] = new_row
         added += 1
-    if added:
+    if added or changed:
         _pool_save(pool_file, rows)
     return added
 

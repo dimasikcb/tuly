@@ -43,3 +43,22 @@ archive/
 buildout/
 build_*.log
 .tmp_*
+
+# --- секреты и локальные настройки (2026-11-07) ---
+leads_mail_settings.json
+ai-screen-agent/config.json
+shorts-autopilot/config.json
+
+# --- кэши, профили браузера, артефакты ---
+.pytest_cache/
+Tools.exe.prev_*
+browser-profile/
+**/browser-profile/
+**/debug/
+shorts-autopilot/state/
+shorts-autopilot/library/
+*.ldb
+*.pma
+**/Cache_Data/
+**/IndexedDB/
+**/GPUCache/

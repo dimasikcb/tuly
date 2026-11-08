@@ -1,0 +1,30 @@
+# ── Разовая установка окружения (один раз; дальше run.bat / run.sh всё делают сами) ──
+#
+# Windows 11, из папки проекта, в «Командной строке»:
+#   py -3 -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#   .venv\Scripts\python.exe -m playwright install chromium
+#   run.bat                        ← дальше один клик, без терминала
+# ВАЖНО: нужен системный Python с tk (tcl/tk, "py -3"). Встроенные/портативные
+# сборки без tkinter (например, Python внутри IDE) не подойдут — проверка:
+#   py -3 -c "import tkinter; print(tkinter.TkVersion)"
+#
+# Fedora Linux:
+#   sudo dnf install python3 python3-pip python3-tkinter python3-virtualenv python3-devel libX11-devel gtk3
+#   python3 -m venv .venv
+#   .venv/bin/python -m pip install -r requirements.txt
+#   .venv/bin/python -m playwright install chromium
+#   chmod +x run.sh diary.desktop
+#   ln -s "$PWD/diary.desktop" ~/.local/share/applications/diary.desktop
+#   ./run.sh                       ← или запуск из меню приложений
+#
+# Если Chromium жалуется на системные библиотеки (только Fedora):
+#   sudo .venv/bin/python -m playwright install-deps chromium
+#
+# Python: 3.10+. GUI — CustomTkinter (тёмная тема), браузер — Playwright/Chromium.
+# Приложение не хранит пароль: сохраняется только storage_state (cookies) в data/.
+# ---------------------------------------------------------------------------------------
+
+customtkinter>=5.2.2
+playwright>=1.48
+pillow>=10.0

@@ -58,7 +58,15 @@ class ApplyTest(unittest.TestCase):
                                   f"{int(bool(kw.get('system_proxy')))}")),
             mock.patch.object(app, "happ_tunnel_restart",
                               lambda *a, **k: self._record("restart")),
+            # Не трогаем реальный %LOCALAPPDATA%/Happ/config.json в тестах.
+            mock.patch.object(app, "happ_config_tun_ensure", lambda *a, **k: False),
+            mock.patch.object(app, "happ_direct_ru_ensure", lambda *a, **k: False),
+            mock.patch.object(app, "happ_tun_disable", lambda *a, **k: self._record("tun_disable")),
+            mock.patch.object(app, "happ_tun_enable", lambda *a, **k: self._record("tun_enable")),
+            mock.patch.object(app, "set_windows_system_proxy", lambda *a, **k: self._record("set_sys_proxy")),
+            mock.patch.object(app, "happ_tun_active", lambda: False),
             mock.patch.object(app, "happ_socks_port", lambda *a, **k: 10808),
+            mock.patch.object(app, "_wait_port", lambda p, *a, **k: self.port_ok),
             mock.patch.object(app, "port_open", lambda *a, **k: self.port_ok),
         ]
         for patch in self.patches:
@@ -139,6 +147,24 @@ class ApplyTest(unittest.TestCase):
         app.bypass_apply("apps", "happ")
         self.assertIn("restart", self.calls)
 
+    def test_changed_auto_route_forces_restart(self) -> None:
+        # happ_config_tun_ensure() переписал config.json — без перезапуска
+        # туннеля новый auto_route не применится.
+        self.happ_connected = True
+        self.mode_state = {"tun": True, "system_proxy": True}
+        with mock.patch.object(app, "happ_config_tun_ensure", lambda *a, **k: True):
+            app.bypass_apply("all", "happ")
+        self.assertIn("restart", self.calls)
+
+    def test_restart_even_without_happ_exe_pid(self) -> None:
+        # Раньше `elif need_restart and happ_pids` молча пропускал перезапуск,
+        # когда подключён core, а клиент Happ.exe в tasklist не виден.
+        self.happ_connected = True
+        self.mode_state = {"tun": False, "system_proxy": False}
+        with mock.patch.object(app, "_image_pids", lambda name: []):
+            app.bypass_apply("all", "happ")
+        self.assertIn("restart", self.calls)
+
     def test_unknown_scope_rejected(self) -> None:
         with self.assertRaises(RuntimeError):
             app.bypass_apply("some", "happ")
@@ -156,16 +182,20 @@ class ApplyTest(unittest.TestCase):
 class StopTest(unittest.TestCase):
     def test_stop_happ_also_stops_proxyfyre(self) -> None:
         calls: list[str] = []
-        with mock.patch.object(app, "proxifyre_stop",
+        with mock.patch.object(app, "happ_auto_disconnect",
+                               lambda: calls.append("registry") or True), \
+             mock.patch.object(app, "proxifyre_stop",
                                lambda: calls.append("pf") or {"detail": "pf"}):
             with mock.patch.object(app, "bypass_happ_stop",
                                    lambda: calls.append("happ") or {"detail": "happ"}):
                 result = app.bypass_stop("happ")
-        self.assertEqual(calls, ["pf", "happ"])
+        self.assertIn("registry", calls)
+        self.assertEqual(calls, ["pf", "happ", "registry"])
         self.assertEqual(result["detail"], "pf\nhapp")
 
     def test_stop_happ_survives_proxyfyre_error(self) -> None:
-        with mock.patch.object(app, "proxifyre_stop",
+        with mock.patch.object(app, "happ_auto_disconnect", lambda: True), \
+             mock.patch.object(app, "proxifyre_stop",
                                mock.Mock(side_effect=RuntimeError("нет прав"))):
             with mock.patch.object(app, "bypass_happ_stop",
                                    lambda: {"detail": "happ off"}):

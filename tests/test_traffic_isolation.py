@@ -42,6 +42,8 @@ class TrafficIsolationTest(unittest.TestCase):
              mock.patch.object(app, "happ_connected", lambda *a, **k: True), \
              mock.patch.object(app, "happ_mode_read", lambda: {"tun": False, "system_proxy": False}), \
              mock.patch.object(app, "happ_mode_write", lambda **kw: None), \
+             mock.patch.object(app, "happ_tun_active", lambda: False), \
+             mock.patch.object(app, "happ_tun_enable", lambda: True), \
              mock.patch.object(app, "bypass_happ_start", lambda: {"ok": True}), \
              mock.patch.object(app, "happ_socks_port", lambda: 10808), \
              mock.patch.object(app, "port_open", lambda *a, **k: True), \

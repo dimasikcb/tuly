@@ -5,6 +5,35 @@
 
 Почему отдельно от `tools.pyw`: раньше эти строки жили в GUI-файле, и
 проверить логику «что включается и в каком порядке» без окна было нельзя.
+
+== Обзор архитектуры ==
+
+Пути:
+  * `%LOCALAPPDATA%/Tools/bypass/state.json`  — PID наших процессов;
+  * `%LOCALAPPDATA%/Tools/bypass/goodbyedpi/` — скачанный GoodbyeDPI;
+  * `%LOCALAPPDATA%/Happ/config.json`         — конфиг ядра Happ;
+  * `HKCU/Software/Happ/.../AdvancedSettings` — `tun`, `systemProxy` (REG_SZ);
+  * `HKCU/.../Internet Settings`              — `ProxyEnable` системы.
+
+Поток включения (`bypass_apply(scope, mode)`):
+  1. `happ_mode_write` + `happ_config_tun_ensure` — режим TUN/прокси;
+  2. `bypass_happ_start` (или `bypass_gbd_start`) — поднять ядро;
+  3. `_wait_port` — дождаться SOCKS 127.0.0.1:10808;
+  4. `proxifyre_start(apps, port)` — перенаправить выбранные `.exe`;
+  5. `set_windows_system_proxy(False)` — системный прокси не должен
+     перехватывать невыбранные программы.
+
+Поток выключения (`bypass_stop`): ProxiFyre -> Happ disconnect ->
+реестр Happ (`tun=false`, `systemProxy=false`) -> TUN off -> kill ядер ->
+`ipconfig /flushdns`.
+
+Диагностика: `bypass_status` отдаёт `leak` (TUN / системный прокси /
+осиротевшие ядра); `bypass_diagnose` — публичная сводка, `bypass_auto_heal`
+чинит утечки, `bypass_auto_heal_if_leak` вызывается из GUI-таймера.
+
+Проверка обхода: `bypass_check_direct_ip` (прямой IP + страна),
+`bypass_check_proxy_ip` (IP через SOCKS), `bypass_compare_connections`
+(вердикт «ОБХОД РАБОТАЕТ» / «НЕ РАБОТАЕТ» / «SOCKS НЕ ДОСТУПЕН»).
 """
 
 from __future__ import annotations
@@ -109,10 +138,12 @@ def bypass_cfg() -> dict:
 
 
 def bypass_cfg_save(**updates) -> None:
+    """Сохраняет настройки bypass в config.json, не трогая другие разделы."""
     config_update(bypass={**bypass_cfg(), **updates})
 
 
 def bypass_admin() -> bool:
+    """Проверяет, запущен ли процесс с правами администратора Windows."""
     try:
         shell32 = ctypes.windll.shell32
         shell32.IsUserAnAdmin.restype = ctypes.c_int
@@ -123,6 +154,7 @@ def bypass_admin() -> bool:
 
 
 def _bypass_track() -> dict:
+    """Читает state.json с PID запущенных нами процессов."""
     try:
         data = json.loads(BYPASS_STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -133,6 +165,7 @@ def _bypass_track() -> dict:
 
 
 def _track_save(data: dict) -> None:
+    """Атомарно записывает state.json."""
     BYPASS_DIR.mkdir(parents=True, exist_ok=True)
     BYPASS_STATE_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
@@ -140,6 +173,7 @@ def _track_save(data: dict) -> None:
 
 
 def _image_pids(image: str) -> list[int]:
+    """Возвращает PID процессов по имени исполняемого файла."""
     try:
         rc, out, _ = run_tool(
             ["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"], timeout=30,
@@ -162,6 +196,7 @@ def _image_pids(image: str) -> list[int]:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Проверяет, жив ли процесс с указанным PID."""
     try:
         rc, out, _ = run_tool(
             ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], timeout=30,
@@ -172,6 +207,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _user32():
+    """Ленивый доступ к user32.dll для работы с окнами Happ."""
     u32 = ctypes.windll.user32
     try:
         u32.GetWindowThreadProcessId.restype = ctypes.c_ulong
@@ -188,6 +224,7 @@ def _user32():
 
 
 def _shell_execute(op: str, file: str, params: str = "", directory: str = "", show: int = 0) -> int:
+    """ShellExecuteW с параметрами; возвращает код (>32 = успех)."""
     shell32 = ctypes.windll.shell32
     try:
         shell32.ShellExecuteW.restype = ctypes.c_void_p
@@ -254,12 +291,19 @@ def _restore_happ_windows(pids) -> int:
 
 
 def _running_images() -> set[str]:
-    """Имена всех запущенных процессов одним вызовом tasklist."""
-    rc, out, _err = run_tool(["tasklist", "/FO", "CSV", "/NH"], timeout=30)
+    """Имена всех запущенных процессов одним вызовом tasklist.
+
+    `run_tool` может упасть (нет tasklist, таймаут, UAC) — опрос статуса
+    и диагностика не должны падать из-за одной системной команды.
+    """
+    try:
+        rc, out, _err = run_tool(["tasklist", "/FO", "CSV", "/NH"], timeout=30)
+    except Exception:  # noqa: BLE001
+        return set()
     names: set[str] = set()
     if rc != 0:
         return names
-    for line in out.splitlines():
+    for line in (out or "").splitlines():
         if '"' in line:
             names.add(line.strip().split('","')[0].strip('"').lower())
     return names
@@ -299,18 +343,43 @@ def set_windows_system_proxy(enable: bool, server: str = "") -> bool:
         return False
 
 
-def happ_tun_active() -> bool:
-    """Проверяет, перехватывает ли TUN-адаптер Happ (happ-xray / happ-tun) системный трафик."""
-    if not happ_connected():
+def _iface_connected(out: str) -> bool:
+    """Активен ли интерфейс по выводу `netsh interface show interface`.
+
+    Нельзя писать `"connected" in out.lower()`: "Disconnected" содержит
+    "connected", поэтому отключённый адаптер определялся как работающий —
+    утечка TUN не диагностировалась и `happ_tun_disable()` уходил в
+    бесконечное ожидание. Отрицания проверяем первыми, для ru/en вывода.
+    """
+    low = str(out or "").lower()
+    if "disconnected" in low or "отключен" in low or "отключено" in low:
         return False
+    return "connected" in low or "подключен" in low
+
+
+def happ_tun_active() -> bool:
+    """Перехватывает ли TUN-адаптер Happ системный трафик.
+
+    Адаптер проверяем ДО `happ_connected()`: иначе осиротевший TUN (Happ уже
+    отключён, а интерфейс ещё маршрутизирует 0.0.0.0/0) считается выключенным
+    и утечка после выключения обхода не диагностируется.
+    """
     try:
         rc, out, _ = run_tool(["route", "print", "0.0.0.0"], timeout=3)
-        if rc == 0 and ("172.19." in out or "172.18." in out or "happ-xray" in out or "happ-tun" in out):
+        if rc == 0 and ("172.19.0.1" in out or "172.18.0.1" in out
+                        or "happ-xray" in out or "happ-tun" in out):
             return True
     except Exception:  # noqa: BLE001
         pass
-    mode = happ_mode_read()
-    return bool(mode.get("tun"))
+    for iface in ("happ-xray", "happ-tun"):
+        try:
+            rc, out, _ = run_tool(
+                ["netsh", "interface", "show", "interface", iface], timeout=3)
+            if rc == 0 and _iface_connected(out):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return bool(happ_mode_read().get("tun")) and happ_connected()
 
 
 def happ_tun_disable(wait: float = 4.0) -> bool:
@@ -338,7 +407,7 @@ def happ_tun_disable(wait: float = 4.0) -> bool:
             try:
                 rc, out, _ = run_tool(["netsh", "interface", "show", "interface", iface],
                                       timeout=3)
-                if rc == 0 and ("connected" in out.lower() or "подключен" in out.lower()):
+                if rc == 0 and _iface_connected(out):
                     done = False
             except Exception:  # noqa: BLE001
                 done = False
@@ -478,6 +547,7 @@ def happ_send(command: str) -> bool:
 
 
 def _tail(path: Path, limit: int = 400) -> str:
+    """Возвращает хвост лог-файла объёмом не более `limit` символов."""
     try:
         return path.read_text(encoding="utf-8", errors="replace").strip()[-limit:]
     except Exception:  # noqa: BLE001
@@ -525,7 +595,10 @@ def bypass_status(_timeout: float = 1.5) -> dict:
     # запустил выбранную программу позже, перезапускаем службу автоматически,
     # чтобы она тоже попала под перенаправление.
     result["proxyfyre"] = proxifyre_status()
-    result["proxifyre"] = result["proxyfyre"]
+    # Ключ proxyfyre_rescan читает BypassPanel._state_ok в tools.pyw — не
+    # переименовывать на proxifyre_*: иначе лог «подхвачены новые процессы»
+    # перестанет появляться. Ранее здесь ошибочно переписывалось полное
+    # состояние службы значением по опечатке result["proxifyre"].
     result["proxyfyre_rescan"] = rescan
     result["scope"] = cfg["scope"]
     result["apps"] = cfg["apps"]
@@ -540,7 +613,8 @@ def _bypass_leak_diagnosis(scope: str) -> dict:
     """Проверяет, не остаётся ли после выключения обхода перехват трафика."""
     happ_on = happ_connected()
     happ_app_running = bool(_image_pids(Path(bypass_cfg()["happ_path"]).name))
-    cores_leak = bool(not happ_app_running and (_image_pids("xray.exe") or _image_pids("sing-box.exe")))
+    cores_leak = bool(not happ_app_running and any(
+        _image_pids(image) for image in (*HAPP_CORE_IMAGES, "happd.exe")))
     tun_leak = bool(happ_tun_active() and (scope == "apps" or not happ_on))
     enable, server = happ_system_proxy()
     proxy_leak = bool(enable and ("127.0.0.1" in server or "localhost" in server or "::1" in server)
@@ -552,7 +626,140 @@ def _bypass_leak_diagnosis(scope: str) -> dict:
     }
 
 
+def _bypass_active() -> bool:
+    """Обход включён: Happ подключён или служба ProxiFyre работает.
+
+    Автоисцеление имеет право гасить TUN / системный прокси / ядра только когда
+    обход ВЫКЛЮЧЕН. Иначе GUI-таймер «лечит» работающий обход «весь трафик»,
+    если пользователь оставил область «Только программы».
+    """
+    try:
+        happ_name = Path(bypass_cfg()["happ_path"]).name
+        if bool(_image_pids(happ_name)) and happ_connected():
+            return True
+        if happ_connected() and not _bypass_leak_diagnosis(bypass_cfg()["scope"]).get("cores"):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return _svc_state(proxifyre_service_name()) == SVC_RUNNING
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# === Автоматическое исцеление утечек ===
+
+
+def bypass_diagnose(scope: str = "apps") -> dict:
+    """Публичная диагностика утечек трафика.
+
+    Пересылает `_bypass_leak_diagnosis` и добавляет сводку того, что именно
+    живо (процессы, порт прокси, активный TUN). Возвращает:
+        {"tun": bool, "proxy": bool, "cores": bool,
+         "what": list[str], "all_clear": bool}
+    """
+    leak = _bypass_leak_diagnosis(scope)
+    what = []
+    if leak["tun"]:
+        what.append("TUN-адаптер")
+    if leak["proxy"]:
+        _, server = happ_system_proxy()
+        what.append(f"системный прокси ({server})")
+    if leak["cores"]:
+        what.append("ядро Happ (xray/sing-box/happd)")
+    return {
+        **leak,
+        "what": what,
+        "all_clear": not any(leak.values()),
+    }
+
+
+def happ_auto_disconnect() -> bool:
+    """Защита от автовозврата Happ через ~30 сек.
+
+    Happ при `happ://disconnect` гасит VPN, но через ~30 сек включается
+    обратно из-за `tun=true`/`systemProxy=true` в реестре. Эта функция
+    записывает оба флага в False, чтобы отключение было окончательным.
+    Возвращает True, если всё записалось успешно.
+    """
+    ok = happ_mode_write(tun=False, system_proxy=False)
+    if not ok:
+        return False
+    # Дополнительно сбрасываем системный прокси Windows, если он установлен.
+    try:
+        set_windows_system_proxy(False)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def bypass_auto_heal(scope: str = "apps") -> dict:
+    """Автоматически гасит обнаруженные утечки трафика.
+
+    Сценарии:
+        * leak["tun"]     -> happ_tun_disable()
+        * leak["proxy"]   -> set_windows_system_proxy(False)
+        * leak["cores"]   -> _kill_happ_cores(): xray / sing-box / tun2proxy* / happd
+
+    Возвращает {"ok": bool, "healed": list[str], "message": str}.
+    """
+    diag = bypass_diagnose(scope)
+    if diag["all_clear"]:
+        return {"ok": True, "healed": [], "message": "Утечек не обнаружено"}
+
+    healed: list[str] = []
+    errors: list[str] = []
+
+    if diag["tun"]:
+        try:
+            happ_tun_disable()
+            healed.append("tun")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"TUN: {exc}")
+
+    if diag["proxy"]:
+        try:
+            set_windows_system_proxy(False)
+            healed.append("proxy")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"прокси: {exc}")
+
+    if diag["cores"]:
+        # CloseHandle(pid) здесь быть не должно: PID — не хэндл, такой вызов
+        # закрывает случайный дескриптор нашего процесса. Убиваем только taskkill,
+        # общим со stop() списком ядер (включая tun2proxy*).
+        _kill_happ_cores()
+        healed.append("cores")
+
+    if not healed:
+        return {"ok": False, "healed": [], "message": "; ".join(errors) or "не удалось исцелить"}
+
+    return {"ok": True, "healed": healed,
+            "message": f"Исцелено: {', '.join(healed)}"}
+
+
+def bypass_auto_heal_if_leak(scope: str = "apps", dry_run: bool = False) -> dict:
+    """Проверить утечку и (если не dry_run) исцелить её.
+
+    Обёртка для GUI: `_tick()` запускает `_poll_state()` через `Hub.run_bg()`,
+    а тот вызывает эту функцию в фоновом потоке. В главном потоке tkinter
+    её вызывать нельзя — tasklist/netsh/taskkill замораживают окно.
+    """
+    if dry_run:
+        return {"ok": True, "action": "dry_run",
+                "diagnosis": _bypass_leak_diagnosis(scope)}
+    diag = bypass_diagnose(scope)
+    if _bypass_active():
+        return {"ok": True, "action": "skipped_active", "diagnosis": diag}
+    if diag["all_clear"]:
+        return {"ok": True, "action": "nothing", "diagnosis": diag}
+    heal = bypass_auto_heal(scope)
+    return {"ok": heal["ok"], "action": "healed" if heal["ok"] else "failed",
+            "diagnosis": diag, "healed": heal}
+
+
 def bypass_gbd_start() -> dict:
+    """Запускает GoodbyeDPI с аргументами из конфига (UAC при необходимости)."""
     if not BYPASS_GBD_EXE.exists():
         raise RuntimeError("GoodbyeDPI не скачан — кнопка «Скачать GoodbyeDPI»")
     cfg = bypass_cfg()
@@ -569,7 +776,7 @@ def bypass_gbd_start() -> dict:
     log_path = BYPASS_DIR / "goodbyedpi.log"
     try:
         log_path.unlink()  # старый лог не должен путать диагностику
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError, OSError):
         pass
     exe = str(BYPASS_GBD_EXE)
     args = cfg["gbd_args"]
@@ -614,12 +821,33 @@ def bypass_gbd_start() -> dict:
     )
 
 
+def _kill_happ_cores() -> int:
+    """Жёстко гасит happd и ВСЕ ядра Happ, включая tun2proxy*.
+
+    Раньше здесь был жёстко зашитый список `(xray.exe, sing-box.exe)`,
+    а `HAPP_CORE_IMAGES` содержит ещё `tun2proxy-bin.exe` / `tun2proxy.exe`.
+    Осиротевший tun2proxy продолжал держать TUN-адаптер и маршрут 0.0.0.0/0
+    после выключения обхода. Один список — одна точка правки.
+    """
+    killed = 0
+    for image in (*HAPP_CORE_IMAGES, "happd.exe"):
+        try:
+            rc, _, _ = run_tool(["taskkill", "/F", "/IM", image], timeout=5)
+            if rc == 0:
+                killed += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return killed
+
+
 def bypass_stop(key: str) -> dict:
+    """Выключает движок (happ/gbd), гасит прокси, TUN, ядра и чистит DNS."""
     if key != "gbd":
         # Happ не закрываем — отключаем VPN и снимаем перенаправление программ,
         # иначе выбранные приложения останутся с мёртвым SOCKS и без интернета.
-        # Порядок важен: сначала выключаем VPN в Happ, ждём, пока он реально
-        # отключится (TUN, прокси и ядра), и только потом гасим остальное.
+        # Порядок важен: сначала штатно отключаем VPN и сбрасываем флаги в
+        # реестре, затем убиваем happd (иначе он снова включит TUN), и только
+        # после этого гасим сам адаптер и системный прокси.
         notes: list[str] = []
         try:
             notes.append(proxifyre_stop().get("detail") or "")
@@ -631,29 +859,29 @@ def bypass_stop(key: str) -> dict:
             # VPN не отключился штатно — гасим принудительно.
             detail = f"Happ VPN отключён вручную: {exc}"
         notes.append(detail)
+        # Даже если клиент не запущен и bypass_happ_stop вернул «и так выключен»,
+        # в реестре могли остаться tun=true / systemProxy=true — Happ подключится
+        # сам через ~30 с. Гасим их гарантированно.
+        try:
+            happ_auto_disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        # happd переподключает VPN и поднимает TUN обратно. Убиваем его ДО
+        # выключения адаптера, иначе netsh-отключение тут же откатывается.
+        _kill_happ_cores()
         # После отключения Happ прокси и TUN могут остаться активными —
         # выключаем их принудительно, чтобы трафик не утекал через прокси.
         set_windows_system_proxy(False)
         happ_tun_disable()
-        # Гасим фоновый процесс Happ (happd.exe) — он сам переподключает VPN,
-        # если в реестре остались tun/systemProxy включёнными.
-        try:
-            run_tool(["taskkill", "/F", "/IM", "happd.exe"], timeout=5)
-        except Exception:
-            pass
-        # Гарантированное завершение фонового ядра и очистка DNS кэша
-        for core_proc in ("xray.exe", "sing-box.exe"):
-            try:
-                run_tool(["taskkill", "/F", "/IM", core_proc], timeout=5)
-            except Exception:
-                pass
+        # Сброс keepalive-соединений к SOCKS-порту требует прав администратора
+        # (SetTcpEntry); без прав это best-effort и ничего не ломает.
         try:
             reset_tcp_connections(happ_socks_port())
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
         try:
             run_tool(["ipconfig", "/flushdns"], timeout=5)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
         return {"ok": True, "detail": "\n".join(filter(None, notes))}
     image, label, extra_images = "goodbyedpi.exe", "GoodbyeDPI", []
@@ -782,11 +1010,7 @@ def bypass_happ_stop() -> dict:
         "Happ не отключил VPN штатно — ядра и TUN выключены вручную, "
         "трафик должен идти напрямую. Откройте Happ и убедитесь, что VPN выключен."
     )
-    for core_proc in ("xray.exe", "sing-box.exe", "happd.exe"):
-        try:
-            run_tool(["taskkill", "/F", "/IM", core_proc], timeout=5)
-        except Exception:
-            pass
+    _kill_happ_cores()
     happ_tun_disable()
     set_windows_system_proxy(False)
     # Дополнительно гасим настройки Happ в реестре — иначе он сам
@@ -856,7 +1080,9 @@ def bypass_download(kind: str) -> dict:
     found = list(tmp.rglob("goodbyedpi.exe"))
     if not found:
         raise RuntimeError("в архиве нет goodbyedpi.exe")
-    exe_dir = found[0].parent
+    is_64 = sys.maxsize > 2**32
+    candidates_64 = [p for p in found if "x86_64" in str(p).lower()]
+    exe_dir = candidates_64[0].parent if (is_64 and candidates_64) else found[0].parent
     for item in exe_dir.iterdir():
         if item.is_dir():
             shutil.copytree(item, BYPASS_GBD_DIR / item.name, dirs_exist_ok=True)
@@ -1002,6 +1228,7 @@ def happ_socks_port_from(data) -> int:
 
 
 def happ_socks_port(config_file: Path | None = None) -> int:
+    """Читает порт локального SOCKS из config.json Happ."""
     path = Path(config_file) if config_file else HAPP_CONFIG_FILE
     try:
         data = json.loads(path.read_text("utf-8"))
@@ -1011,6 +1238,7 @@ def happ_socks_port(config_file: Path | None = None) -> int:
 
 
 def port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.4) -> bool:
+    """Проверяет, слушается ли TCP-порт на локальном хосте."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
@@ -1020,6 +1248,7 @@ def port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.4) -> bool:
 
 
 def _reg_get_int(key_path: str, name: str, default: int) -> int:
+    """Читает REG_DWORD из HKCU; при ошибке возвращает default."""
     try:
         import winreg
     except ImportError:
@@ -1033,6 +1262,7 @@ def _reg_get_int(key_path: str, name: str, default: int) -> int:
 
 
 def _reg_set_int(key_path: str, name: str, value: int) -> bool:
+    """Пишет REG_DWORD в HKCU; возвращает True при успехе."""
     try:
         import winreg
     except ImportError:
@@ -1116,6 +1346,7 @@ def happ_mode_read() -> dict:
 
 
 def happ_mode_write(tun: bool | None = None, system_proxy: bool | None = None) -> dict:
+    """Пишет tun/systemProxy в реестр Happ (+ legacy system_proxy)."""
     if tun is not None and not _reg_set_bool(HAPP_PREFS_KEY, "tun", bool(tun)):
         raise RuntimeError(
             "Не удалось изменить настройку Happ (tun) в реестре HKCU\\Software\\Happ"
@@ -1157,6 +1388,7 @@ class SERVICE_STATUS(ctypes.Structure):
 
 
 def _advapi():
+    """Ленивый доступ к advapi32.dll для управления службами Windows."""
     global _ADVAPI_READY
     api = ctypes.windll.advapi32
     if not _ADVAPI_READY:
@@ -1214,6 +1446,7 @@ def _svc_state(name: str) -> int | None:
 
 
 def _svc_start(name: str, wait: float = 12.0) -> bool:
+    """Запускает службу Windows и ждёт состояния RUNNING."""
     if sys.platform != "win32":
         return False
     if _svc_state(name) == SVC_RUNNING:
@@ -1261,6 +1494,7 @@ def _svc_start(name: str, wait: float = 12.0) -> bool:
 
 
 def _svc_stop(name: str, wait: float = 12.0) -> bool:
+    """Останавливает службу Windows и ждёт состояния STOPPED."""
     if sys.platform != "win32":
         return False
     if _svc_state(name) == SVC_STOPPED:
@@ -1326,10 +1560,12 @@ def proxifyre_service_name() -> str:
 
 def proxifyre_config_data(apps, port: int) -> dict:
     # ProxiFyre сопоставляет имена процессов; вариант без «.exe» понимают все версии.
+    """Формирует app-config.json для ProxiFyre из списка программ и порта."""
     expanded = expand_companions(normalize_apps(apps))
     names = [Path(name).stem for name in expanded]
     return {
-        "logLevel": "INFO",
+        "logLevel": "Error",
+        "bypassLan": True,
         "proxies": [{
             "appNames": names,
             "socks5ProxyEndpoint": f"127.0.0.1:{int(port)}",
@@ -1374,16 +1610,24 @@ _PROXIFYRE_LAST_RESTART = 0.0
 RESCAN_COOLDOWN = 15.0
 
 
-def _selected_pids() -> set[int]:
+def _selected_processes() -> dict[int, str]:
+    """{pid: exe_name} запущенных процессов выбранных программ."""
     expanded = expand_companions(bypass_cfg()["apps"])
     wanted = {Path(name).stem.lower() for name in expanded}
     if not wanted:
-        return set()
-    result: set[int] = set()
+        return {}
+    result: dict[int, str] = {}
     for pid, path in running_processes():
         if Path(path).stem.lower() in wanted:
-            result.add(int(pid))
+            name = Path(path).name.lower()
+            if name:
+                result[int(pid)] = name
     return result
+
+
+def _selected_pids() -> set[int]:
+    """PID запущенных процессов выбранных программ."""
+    return set(_selected_processes().keys())
 
 
 def proxifyre_snapshot() -> set[int]:
@@ -1396,14 +1640,16 @@ def proxifyre_snapshot() -> set[int]:
 def proxifyre_rescan() -> dict | None:
     """Перезапускает службу, если появился новый процесс из списка обхода.
 
-    Возвращает None, когда делать нечего, иначе {ok, apps} — что перезапускали.
+    Возвращает None, когда делать нечего, иначе `{ok, apps, pids}`:
+    `apps` — имена exe новых процессов (GUI пишет их в лог), `pids` — их PID.
     """
     if _svc_state(proxifyre_service_name()) != SVC_RUNNING:
         return None
     wanted = {Path(name).stem.lower() for name in expand_companions(bypass_cfg()["apps"])}
     if not wanted:
         return None
-    current = _selected_pids()
+    current_procs = _selected_processes()
+    current = set(current_procs.keys())
     global _PROXIFYRE_PIDS
     if _PROXIFYRE_PIDS is None:
         _PROXIFYRE_PIDS = current
@@ -1411,6 +1657,10 @@ def proxifyre_rescan() -> dict | None:
     fresh = current - _PROXIFYRE_PIDS
     if not fresh:
         _PROXIFYRE_PIDS = current & _PROXIFYRE_PIDS if current else current
+        return None
+    names = {current_procs[pid] for pid in fresh if pid in current_procs and current_procs[pid]}
+    if not names:
+        _PROXIFYRE_PIDS.update(fresh)
         return None
     # Программы плодят процессы (Electron: главный + рендереры), поэтому
     # перезапускаем не чаще, чем раз в RESCAN_COOLDOWN секунд.
@@ -1423,7 +1673,7 @@ def proxifyre_rescan() -> dict | None:
     ok = _svc_start(service)
     if ok:
         proxifyre_snapshot()
-    return {"ok": ok, "apps": sorted(fresh)}
+    return {"ok": ok, "apps": sorted(names), "pids": sorted(fresh)}
 
 
 def normalize_app_names(values) -> list[str]:
@@ -1438,6 +1688,7 @@ def normalize_app_names(values) -> list[str]:
 
 
 def proxifyre_status() -> dict:
+    """Состояние службы/драйвера ProxiFyre и список программ из конфига."""
     state = _svc_state(proxifyre_service_name())
     apps: list[str] = []
     try:
@@ -1462,6 +1713,7 @@ def proxifyre_status() -> dict:
 
 
 def _proxifyre_install() -> bool:
+    """Регистрирует службу ProxiFyre при первом запуске."""
     if not PROXIFYRE_EXE.exists():
         return False
     if is_admin():
@@ -1556,6 +1808,7 @@ def proxifyre_restart() -> dict:
 
 
 def proxifyre_stop() -> dict:
+    """Останавливает службу ProxiFyre и снимает перенаправление."""
     service = proxifyre_service_name()
     state = _svc_state(service)
     if state is None:
@@ -1640,7 +1893,11 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
                 else "Happ: без TUN — только локальный SOCKS для выбранных программ"
             )
 
-        happ_config_tun_ensure(want_tun)
+        # config.json sing-box правится на диске: без перезапуска туннеля
+        # новый auto_route не применится. Возврат True = настройки изменились.
+        if happ_config_tun_ensure(want_tun):
+            settings_changed = True
+            notes.append("Happ: auto_route обновлён — перезапускаю туннель")
 
         if want_tun:
             happ_tun_enable()
@@ -1652,11 +1909,13 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
             happ_tun_disable()
 
         # Запуск/перезапуск туннеля Happ
-        happ_pids = _image_pids(Path(cfg["happ_path"]).name)
         need_restart = settings_changed or (not want_tun and happ_tun_active())
         if not happ_connected():
             add(bypass_happ_start())
-        elif need_restart and happ_pids:
+        elif need_restart:
+            # `happ_tunnel_restart()` сам уходит в bypass_happ_start(), когда
+            # Happ.exe не запущен. Старое условие `and happ_pids` пропускало
+            # перезапуск ровно в этом случае (подключён core без клиента).
             add(happ_tunnel_restart())
 
         # Управление ProxiFyre
@@ -1674,6 +1933,10 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
             add(proxifyre_stop())
     else:
         add(bypass_gbd_start())
+        # ProxiFyre нельзя оставлять включённой без Happ: выбранные программы
+        # уйдут в мёртвый SOCKS и потеряют интернет.
+        if not happ_connected():
+            add(proxifyre_stop())
         if happ_connected():
             notes.append(
                 "GoodbyeDPI работает параллельно с Happ: выбранные программы "
@@ -1694,7 +1957,7 @@ def bypass_check_ip(timeout: float = 3.0) -> dict:
     urls = [
         "https://api.ipify.org?format=json",
         "https://ifconfig.me/all.json",
-        "https://api6.ipify.org?format=json",  # IPv6, для сопоставления
+        "https://icanhazip.com",
     ]
     results: list[str] = []
     for url in urls:
@@ -1714,7 +1977,6 @@ def bypass_check_ip(timeout: float = 3.0) -> dict:
     ip = results[0] if results else ""
     ok = bool(ip)
     leak_dns = ""
-    # DNS-leak тест: resolver.info показывает, через какой DNS-сервер был получен ответ.
     try:
         req = urllib.request.Request(
             "https://dnsleaktest.com/api.php",
@@ -1733,3 +1995,185 @@ def bypass_check_ip(timeout: float = 3.0) -> dict:
             "dns_leak": leak_dns}
 
 
+# === Проверка обхода: сравнение прямого и проброшенного трафика ===
+
+
+def _recv_exact(sock, count: int) -> bytes:
+    """Читает ровно count байт (или меньше, если соединение закрылось)."""
+    data = b""
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def bypass_check_direct_ip(timeout: float = 3.0) -> dict:
+    """Замер внешнего IP **минуя системный прокси Windows**.
+
+    `urlopen` использует глобальный ProxyHandler (реестр WinINet + env), поэтому
+    при включённом Happ «прямой» запрос на деле уходил через VPN: сравнение с
+    SOCKS давало ложный вердикт. Строим opener без прокси.
+
+    Ограничение: активный TUN-адаптер (режим «весь трафик») перехватывает
+    трафик на уровне маршрутов, его сокетом не обойти — в этом режиме прямой
+    и проброшенный IP совпадают ожидаемо, о чём сообщает вердикт.
+    """
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    results: list[str] = []
+    geo: dict = {}
+    for url in (
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.me/all.json",
+    ):
+        try:
+            req = urllib.request.Request(url,
+                                         headers={"User-Agent": "curl/7.68.0"})
+            with opener.open(req, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", errors="replace").strip()
+                if "{" in text:
+                    data = json.loads(text)
+                    ip = data.get("ip") or data.get("ip_addr")
+                else:
+                    ip = text
+                if ip and len(str(ip).split(".")) == 4:
+                    results.append(str(ip).strip())
+        except Exception:
+            pass
+    if not results:
+        return {"ok": False, "ip": "", "country": "", "org": "", "direct": True}
+
+    ip = results[0]
+    try:
+        req = urllib.request.Request(
+            f"http://ip-api.com/json/{ip}?fields=status,message,country,regionName,"
+            f"city,org,as",
+            headers={"User-Agent": "curl/7.68.0"},
+        )
+        with opener.open(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            geo["country"] = data.get("country") or ""
+            geo["org"] = data.get("org") or ""
+            geo["city"] = data.get("city") or ""
+    except Exception:
+        pass
+    return {"ok": True, "ip": ip, "country": geo.get("country", ""),
+            "org": geo.get("org", ""), "city": geo.get("city", ""), "direct": True}
+
+
+def bypass_check_proxy_ip(port: int | None = None,
+                          timeout: float = 3.0) -> dict:
+    """Замер внешнего IP **через SOCKS5 Happ** в одном соединении.
+
+    Раньше после handshake сокет закрывался и открывался новый, куда уходил
+    HTTP-запрос без SOCKS-приветствия (да ещё с литералом `Host: {host}`):
+    реальный SOCKS-сервер рвал соединение, и проверка всегда выдавала
+    «SOCKS НЕ ДОСТУПЕН» даже при работающем обходе.
+    """
+    port = int(port or happ_socks_port())
+
+    def fail(message: str) -> dict:
+        return {"ok": False, "error": message, "proxy_port": port}
+
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    except OSError as exc:
+        return fail(f"SOCKS на 127.0.0.1:{port} не слушается ({exc})")
+    raw = b""
+    with sock:
+        sock.settimeout(timeout)
+        try:
+            sock.sendall(b"\x05\x01\x00")  # VER, NMETHODS, NO AUTH
+            greeting = _recv_exact(sock, 2)
+            if len(greeting) < 2 or greeting[0] != 5 or greeting[1] != 0:
+                return fail("SOCKS5 не принял аутентификацию")
+            host = b"api.ipify.org"
+            sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host
+                         + (80).to_bytes(2, "big"))
+            head = _recv_exact(sock, 4)
+            if len(head) < 4 or head[1] != 0:
+                return fail(f"SOCKS CONNECT отклонён: {head[1:2]!r}")
+            atyp = head[3]
+            addr_len = {1: 4, 4: 16}.get(atyp, 0)
+            if atyp == 3:
+                length = _recv_exact(sock, 1)
+                addr_len = length[0] if length else 0
+            if addr_len:
+                _recv_exact(sock, addr_len)
+            _recv_exact(sock, 2)  # BND.PORT
+            sock.sendall(
+                b"GET /?format=json HTTP/1.1\r\n"
+                b"Host: api.ipify.org\r\n"
+                b"User-Agent: curl/7.68.0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except TimeoutError:
+                    break
+                if not chunk or len(raw) > 65536:
+                    break
+                raw += chunk
+                if b"\r\n\r\n" in raw and b"}" in raw.split(b"\r\n\r\n", 1)[-1]:
+                    break
+        except (OSError, ValueError) as exc:
+            if not raw or b"\r\n\r\n" not in raw:
+                return fail(f"SOCKS: {exc}")
+    body = raw.split(b"\r\n\r\n", 1)[-1] if b"\r\n\r\n" in raw else b""
+    try:
+        ip = str(json.loads(body.decode("utf-8", errors="replace")).get("ip") or "").strip()
+    except (ValueError, AttributeError):
+        ip = ""
+    if not ip:
+        return fail("SOCKS не вернул IP")
+    return {"ok": True, "ip": ip, "country": "", "org": "",
+            "proxy_port": port, "via": "socks5"}
+
+
+def bypass_compare_connections(direct_ip: dict | None = None,
+                               proxy_ip: dict | None = None,
+                               timeout: float = 3.0) -> dict:
+    """Сравнивает прямой и проброшенный IP и выносит вердикт."""
+    direct = direct_ip or bypass_check_direct_ip(timeout)
+    proxy = proxy_ip or bypass_check_proxy_ip(timeout=timeout)
+    port = proxy.get("proxy_port") or HAPP_SOCKS_DEFAULT
+    if not direct.get("ok") or not direct.get("ip"):
+        return {
+            "direct": direct, "proxy": proxy, "ok": False,
+            "verdict": "НЕ УДАЛОСЬ ОПРЕДЕЛИТЬ ИП",
+            "message": "Не удалось определить прямой IP",
+        }
+    if not proxy.get("ok") or not proxy.get("ip"):
+        return {
+            "direct": direct, "proxy": proxy, "ok": False,
+            "verdict": "SOCKS НЕ ДОСТУПЕН",
+            "message": f"SOCKS на 127.0.0.1:{port} не отвечает — "
+                       f"{proxy.get('error', 'причина неизвестна')}. "
+                       "Проверьте, что Happ включён и подключён.",
+        }
+    if direct["ip"] == proxy["ip"]:
+        if happ_tun_active():
+            return {
+                "direct": direct, "proxy": proxy, "ok": True,
+                "verdict": "ОБХОД РАБОТАЕТ (TUN)",
+                "message": (f"Весь трафик ПК направлен через туннель Happ (IP: {direct['ip']}). "
+                            "Прямое и прокси-подключение дают один зарубежный IP — обход работает."),
+            }
+        return {
+            "direct": direct, "proxy": proxy, "ok": False,
+            "verdict": "ОБХОД НЕ РАБОТАЕТ",
+            "message": (f"Прямой IP = прокси-IP ({direct['ip']}) — трафик не идёт через SOCKS. "
+                        "Проверьте, выбраны ли программы в режиме «Только программы». "
+                        "Если включён режим «Весь трафик» (TUN), одинаковый IP ожидаем — "
+                        "это не поломка."),
+        }
+    return {
+        "direct": direct, "proxy": proxy, "ok": True,
+        "verdict": "ОБХОД РАБОТАЕТ",
+        "message": (f"Прямое подключение -> IP: {direct['ip']} ({direct['country']})\n"
+                    f"Обход SOCKS {port} -> IP: {proxy['ip']} "
+                    f"({proxy.get('country') or 'не определено'}) — ОБХОД РАБОТАЕТ"),
+    }

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import importlib.util
 import json
 import os
 import random
@@ -61,7 +62,28 @@ def _load_deps(install: bool = False) -> bool:
     return True
 
 
-DEPS_OK = _load_deps(install=False)
+_DEPS_LOADED = False
+
+
+def _ensure_deps() -> bool:
+    """Грузит requests/selectolax один раз, при первом реальном обращении к парсеру.
+
+    Раньше _load_deps() выполнялся на уровне модуля: импорт leads2gis (а значит
+    и старт tools.pyw) тянул ~0.4 с даже когда вкладка «Лиды» не открывалась.
+    """
+    global _DEPS_LOADED, DEPS_OK
+    if _DEPS_LOADED:
+        return DEPS_OK
+    DEPS_OK = _load_deps(install=False)
+    _DEPS_LOADED = True
+    return DEPS_OK
+
+
+# Дешёвая проверка наличия пакетов без их импорта (find_spec не грузит код).
+DEPS_OK = all(
+    importlib.util.find_spec(name) is not None
+    for name in ("requests", "urllib3", "selectolax")
+)
 
 BASE = "https://2gis.ru"
 RATINGS_API = "https://public-api.reviews.2gis.com/3.0/objects/ratings/light"
@@ -318,6 +340,7 @@ def _address(tree: LexborHTMLParser, texts: list[str]) -> str:
 
 
 def parse_firm(html: str, city: str, firm_id: str, query: str = "") -> dict:
+    _ensure_deps()
     tree = LexborHTMLParser(html)
     header = _parse_header(_header_lines(tree))
 
@@ -455,6 +478,7 @@ class TwoGisClient:
     """Поиск, карточка и рейтинги через обычные GET-запросы (SSR-страницы)."""
 
     def __init__(self, timeout: int = 30, delay: float = 0.4, proxies: dict | None = None) -> None:
+        _ensure_deps()
         self.timeout = timeout
         self.delay = delay
         self._session = self._build_session(proxies)

@@ -40,7 +40,8 @@ class ProxiFyreConfigTest(unittest.TestCase):
 
     def test_config_data(self) -> None:
         data = app.proxifyre_config_data(["Chrome.exe", "chrome.exe"], 10808)
-        self.assertEqual(data["logLevel"], "INFO")
+        self.assertEqual(data["logLevel"], "Error")
+        self.assertTrue(data.get("bypassLan"))
         proxy = data["proxies"][0]
         # ProxiFyre сопоставляет имена процессов: пишем без «.exe»
         self.assertEqual(proxy["appNames"], ["Chrome"])

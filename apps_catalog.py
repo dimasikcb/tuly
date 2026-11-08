@@ -85,6 +85,9 @@ APP_COMPANIONS: dict[str, list[str]] = {
     ],
     "cursor.exe": ["cursor-server.exe", "node.exe"],
     "code.exe": ["node.exe"],
+    "steam.exe": ["steamwebhelper.exe"],
+    "epicgameslauncher.exe": ["epicwebhelper.exe"],
+    "git.exe": ["git-remote-https.exe"],
 }
 
 

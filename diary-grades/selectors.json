@@ -1,0 +1,37 @@
+{
+  "_comment": "Эвристики для authedu.mosreg.ru. Правь этот файл, если у школы/портала изменилась вёрстка — код менять не нужно.",
+  "start_url": "https://authedu.mosreg.ru",
+  "marks_page_url": "https://authedu.mosreg.ru/diary/marks/",
+  "marks_api_path": "/api/family/web/v1/marks",
+  "logged_in_markers": ["дневник", "успеваемость", "оценки", "журнал", "выход", "профиль"],
+  "expired_url_hints": ["esia.gosuslugi.ru", "/login", "/auth", "passport", "oauth"],
+  "grades_nav_texts": ["оценки", "успеваемость", "дневник", "табель", "отчёты", "журнал", "баллы"],
+  "period_nav_texts": ["четверть", "триместр", "период", "полугодие"],
+  "json_url_keywords": ["mark", "grade", "score", "diary", "journal", "progress", "subject", "lesson", "period", "estimate", "performance"],
+  "json_subject_keys": ["subject", "subject_name", "subjectName", "discipline", "disciplineName", "lesson", "lessonName", "name", "title", "предмет", "название"],
+  "json_marks_keys": ["marks", "grades", "scores", "estimates", "markValues", "values", "results", "оценки", "баллы"],
+  "json_mark_keys": ["mark", "grade", "score", "value", "estimate", "result", "point", "балл", "оценка"],
+  "subject_row_selectors": [
+    "tr[data-subject]",
+    "tr[data-discipline]",
+    "[class*='subject-row']",
+    "[class*='SubjectRow']",
+    "[class*='subject'] [class*='row']",
+    "[class*='discipline']",
+    "table tbody tr",
+    "[role='row']"
+  ],
+  "mark_selectors": [
+    "[class*='mark']",
+    "[class*='grade']",
+    "[class*='score']",
+    "[data-mark]",
+    "[data-grade]",
+    "td",
+    "[role='cell']"
+  ],
+  "skip_subject_words": [
+    "итого", "средний", "средний балл", "балл", "всего", "предмет",
+    "период", "итоговый", "оценки", "триместр", "четверть", "каникулы"
+  ]
+}

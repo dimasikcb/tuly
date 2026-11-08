@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Дневник МО - Контроль балла
+GenericName=Анализ оценок
+Comment=Средний балл, сколько пятёрок нужно и запас прочности до 4.50
+Exec=/usr/bin/env bash -c 'cd "$(dirname "$(readlink -f "%k")")" && exec ./run.sh'
+Icon=accessories-text-editor
+Terminal=false
+Categories=Education;Utility;
+StartupNotify=true
+Keywords=дневник;оценки;школа;marks;diary;
