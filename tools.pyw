@@ -2704,10 +2704,14 @@ def update_local_repo(folder: str, name: str, log) -> bool:
     if not git:
         log("git не найден")
         return False
-    rc, _out, err = run_tool([git, "add", "-A"], cwd=folder, timeout=600)
+    rc, out, err = run_tool([git, "add", "-A"], cwd=folder, timeout=600)
+    # игнорируем «invalid path» — зарезервированные имена Windows (NUL, CON и т.п.)
     if rc != 0:
-        log(f"ОШИБКА git add: {err}")
-        return False
+        bad = "\n".join(l for l in err.splitlines() if "invalid path" not in l)
+        if bad:
+            log(f"ОШИБКА git add: {bad}")
+            return False
+        log(f"git add пропущены зарезервированные имена: {err}")
     rc, status, _err = run_tool([git, "status", "--porcelain"], cwd=folder, timeout=120)
     if rc == 0 and status:
         rc, out, err = run_tool(
@@ -7142,261 +7146,11 @@ class AIScreenAgentPanel(Panel):
 
 
 
-class AutoCopyPanel(Panel):
-    """AutoCopy: автоматическое копирование выделенного текста в буфер обмена."""
-
-    def __init__(self, master: tk.Misc, hub) -> None:
-        super().__init__(master, hub)
-        self.script = APP_DIR / "autocopy.py"
-        self.config_file = CONFIG_PATH
-        self._proc: subprocess.Popen | None = None
-        self._poll_job = None
-        self._build()
-        self.refresh()
-        self._schedule_poll()
-
-    def _build(self) -> None:
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
-
-        cards = tk.Frame(self, bg=BG)
-        cards.grid(row=0, column=0, sticky="ew", pady=(0, px(12)))
-        cards.columnconfigure(0, weight=1)
-        cards.columnconfigure(1, weight=1)
-        cards.columnconfigure(2, weight=1)
-
-        c1 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
-        c1.grid(row=0, column=0, sticky="nsew", padx=(0, px(6)))
-        tk.Label(c1, text="Служба AutoCopy", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        self.lbl_status = tk.Label(c1, text="○ Остановлена", bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"))
-        self.lbl_status.pack(anchor="w", pady=(px(4), 0))
-        self.lbl_pid = tk.Label(c1, text="Служба не активна", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
-        self.lbl_pid.pack(anchor="w")
-
-        c2 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
-        c2.grid(row=0, column=1, sticky="nsew", padx=px(4))
-        tk.Label(c2, text="Всплывающая подсказка", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        self.lbl_notify = tk.Label(c2, text="● Включена", bg=CARD, fg=OK, font=("Segoe UI", 12, "bold"))
-        self.lbl_notify.pack(anchor="w", pady=(px(4), 0))
-        self.lbl_notify_hint = tk.Label(c2, text="Окно около курсора мыши", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
-        self.lbl_notify_hint.pack(anchor="w")
-
-        c3 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
-        c3.grid(row=0, column=2, sticky="nsew", padx=(px(6), 0))
-        tk.Label(c3, text="Автозагрузка", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        self.lbl_startup = tk.Label(c3, text="● Активна", bg=CARD, fg=OK, font=("Segoe UI", 12, "bold"))
-        self.lbl_startup.pack(anchor="w", pady=(px(4), 0))
-        self.lbl_startup_hint = tk.Label(c3, text="Запуск со стартом Windows", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
-        self.lbl_startup_hint.pack(anchor="w")
-
-        ctrl = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
-        ctrl.grid(row=1, column=0, sticky="ew", pady=(0, px(12)))
-
-        bar = tk.Frame(ctrl, bg=CARD)
-        bar.pack(fill="x", pady=(0, px(10)))
-
-        self.btn_start = flat_button(bar, "▶ Запустить AutoCopy", self.start_service, kind="primary")
-        self.btn_start.pack(side="left", padx=(0, px(8)))
-
-        self.btn_stop = flat_button(bar, "⏹ Остановить", self.stop_service, kind="ghost")
-        self.btn_stop.pack(side="left", padx=(0, px(8)))
-
-        flat_button(bar, "🔄 Обновить", self.refresh, kind="ghost").pack(side="left", padx=(0, px(8)))
-        flat_button(bar, "📁 Папка скрипта", self.open_folder, kind="ghost").pack(side="left")
-
-        opts = tk.Frame(ctrl, bg=CARD)
-        opts.pack(fill="x", pady=(px(4), 0))
-
-        self.var_notify = tk.BooleanVar(value=True)
-        cb1 = ttk.Checkbutton(opts, text="Показывать всплывающую подсказку у курсора", variable=self.var_notify, command=self.save_settings)
-        cb1.pack(anchor="w", pady=px(2))
-
-        self.var_middle = tk.BooleanVar(value=False)
-        cb2 = ttk.Checkbutton(opts, text="Вставлять по клику на колесико мыши (среднюю кнопку)", variable=self.var_middle, command=self.save_settings)
-        cb2.pack(anchor="w", pady=px(2))
-
-        self.var_autostart = tk.BooleanVar(value=True)
-        cb3 = ttk.Checkbutton(opts, text="Запускать AutoCopy при включении Windows (автозагрузка)", variable=self.var_autostart, command=self.toggle_autostart_setting)
-        cb3.pack(anchor="w", pady=px(2))
-
-        test_frame = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
-        test_frame.grid(row=2, column=0, sticky="ew", pady=(0, px(12)))
-
-        tk.Label(test_frame, text="Быстрая проверка работы:", bg=CARD, fg=FG, font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        tk.Label(test_frame, text="Выделите мышкой любой фрагмент текста в поле ниже или кликните дважды по слову — он моментально скопируется:",
-                 bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(px(2), px(6)))
-
-        test_entry = tk.Text(test_frame, height=2, bg=FIELD, fg=FG, insertbackground=FG,
-                             relief="flat", highlightbackground=BORDER, highlightthickness=1, font=("Segoe UI", 10), padx=px(8), pady=px(6))
-        test_entry.insert("1.0", "AutoCopy работает идеально! Выделите это предложение, чтобы проверить копирование.")
-        test_entry.pack(fill="x")
-        self.attach_copy(test_entry, label="Тестовый текст", readonly=False)
-
-        self.lbl_clip_preview = tk.Label(test_frame, text="В буфере обмена сейчас: —", bg=CARD, fg=MUTED, font=("Segoe UI", 9), anchor="w")
-        self.lbl_clip_preview.pack(fill="x", pady=(px(6), 0))
-
-        log_frame, self.log_box = self.make_log(self, height=8, label="Лог событий AutoCopy")
-        log_frame.grid(row=3, column=0, sticky="nsew")
-        self.append_log(self.log_box, "Вкладка AutoCopy готова к работе.")
-
-    def _is_running(self) -> tuple[bool, int | None]:
-        try:
-            out = ps_run("""Get-CimInstance Win32_Process -Filter "(Name LIKE 'python%' AND CommandLine LIKE '%autocopy%') OR Name = 'AutoCopy.exe'" | Select-Object -ExpandProperty ProcessId""")
-            pids = [int(p.strip()) for p in out.splitlines() if p.strip().isdigit()]
-            if pids:
-                return True, pids[0]
-        except Exception:
-            pass
-        return False, None
-
-    def start_service(self) -> None:
-        running, pid = self._is_running()
-        if running:
-            self.hub.toast(f"AutoCopy уже работает (PID: {pid})", kind="info")
-            return
-        pythonw = APP_DIR.parent / "AppData" / "Local" / "Programs" / "Python" / "Python313" / "pythonw.exe"
-        if not pythonw.exists():
-            pythonw = Path(sys.executable).parent / "pythonw.exe"
-        py_exe = str(pythonw if pythonw.exists() else sys.executable)
-
-        try:
-            cmd = f'"{py_exe}" "{self.script}"'
-            ps_run(f"""Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = '{cmd}'; CurrentDirectory = '{APP_DIR}' }}""")
-            self.hub.toast("AutoCopy запущен в фоне", kind="ok")
-            self.append_log(self.log_box, "Служба AutoCopy запущена.")
-            self.after(500, self.refresh)
-        except Exception as exc:
-            self.hub.toast(f"Ошибка запуска: {exc}", kind="error")
-            self.append_log(self.log_box, f"Ошибка запуска: {exc}", tag="error")
-
-    def stop_service(self) -> None:
-        stopped = False
-        try:
-            out = ps_run("""Get-CimInstance Win32_Process -Filter "(Name LIKE 'python%' AND CommandLine LIKE '%autocopy%') OR Name = 'AutoCopy.exe'" | Select-Object -ExpandProperty ProcessId""")
-            for line in out.splitlines():
-                if line.strip().isdigit():
-                    subprocess.run(["taskkill", "/PID", line.strip(), "/T", "/F"], capture_output=True)
-                    stopped = True
-        except Exception:
-            pass
-
-        if stopped:
-            self.lbl_status.config(text="○ Остановлен", fg=MUTED)
-            self.lbl_pid.config(text="Служба не активна")
-            self.btn_start.configure(state="normal")
-            self.btn_stop.configure(state="disabled")
-            self.hub.toast("AutoCopy остановлен", kind="ok")
-            self.append_log(self.log_box, "Служба AutoCopy остановлена.")
-        else:
-            self.hub.toast("AutoCopy не был запущен", kind="info")
-        self.after(300, self.refresh)
-
-    def open_folder(self) -> None:
-        try:
-            os.startfile(str(APP_DIR))
-        except Exception as exc:
-            self.hub.toast(f"Ошибка открытия папки: {exc}", kind="error")
-
-    def save_settings(self) -> None:
-        cfg = config_read()
-        ac = cfg.get("autocopy", {})
-        ac["show_notifications"] = self.var_notify.get()
-        ac["middle_click_paste"] = self.var_middle.get()
-        cfg["autocopy"] = ac
-        config_write(cfg)
-        self.hub.toast("Настройки сохранены", kind="ok")
-        self.refresh()
-
-    def toggle_autostart_setting(self) -> None:
-        enabled = self.var_autostart.get()
-        try:
-            pythonw = APP_DIR.parent / "AppData" / "Local" / "Programs" / "Python" / "Python313" / "pythonw.exe"
-            if not pythonw.exists():
-                pythonw = Path(sys.executable).parent / "pythonw.exe"
-            py_exe = str(pythonw if pythonw.exists() else sys.executable)
-            script_path = str(self.script)
-
-            startup_lnk = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "AutoCopy.lnk"
-            if enabled:
-                ps_run(f'''
-                    $WshShell = New-Object -ComObject WScript.Shell
-                    $Shortcut = $WshShell.CreateShortcut("{startup_lnk}")
-                    $Shortcut.TargetPath = "{py_exe}"
-                    $Shortcut.Arguments = '"{script_path}"'
-                    $Shortcut.WorkingDirectory = "{APP_DIR}"
-                    $Shortcut.Save()
-                ''')
-                ps_run(f'Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -Name "AutoCopyUtility" -Value \'"{py_exe}" "{script_path}"\'')
-                self.hub.toast("Автозагрузка включена", kind="ok")
-            else:
-                if startup_lnk.exists():
-                    try:
-                        startup_lnk.unlink()
-                    except Exception:
-                        pass
-                ps_run('Remove-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -Name "AutoCopyUtility" -ErrorAction SilentlyContinue')
-                self.hub.toast("Автозагрузка отключена", kind="ok")
-        except Exception as exc:
-            self.hub.toast(f"Ошибка настройки автозагрузки: {exc}", kind="error")
-        self.save_settings()
-
-    def refresh(self) -> None:
-        cfg = config_read()
-        ac = cfg.get("autocopy", {})
-        self.var_notify.set(ac.get("show_notifications", True))
-        self.var_middle.set(ac.get("middle_click_paste", False))
-
-        is_run, pid = self._is_running()
-        if is_run:
-            self.lbl_status.config(text="● Запущен", fg=OK)
-            self.lbl_pid.config(text=f"PID: {pid} (работает в фоне)")
-            self.btn_start.configure(state="disabled")
-            self.btn_stop.configure(state="normal")
-        else:
-            self.lbl_status.config(text="○ Остановлен", fg=MUTED)
-            self.lbl_pid.config(text="Служба не активна")
-            self.btn_start.configure(state="normal")
-            self.btn_stop.configure(state="disabled")
-
-        if self.var_notify.get():
-            self.lbl_notify.config(text="● Включена", fg=OK)
-        else:
-            self.lbl_notify.config(text="○ Выключена", fg=MUTED)
-
-        startup_lnk = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "AutoCopy.lnk"
-        if startup_lnk.exists():
-            self.lbl_startup.config(text="● Активна", fg=OK)
-            self.var_autostart.set(True)
-        else:
-            self.lbl_startup.config(text="○ Отключена", fg=MUTED)
-            self.var_autostart.set(False)
-
-        try:
-            import pyperclip  # лениво: только для предпросмотра буфера обмена
-
-            clip = pyperclip.paste()
-            if clip:
-                cleaned = " ".join(clip.split())
-                if len(cleaned) > 50:
-                    cleaned = cleaned[:47] + "..."
-                self.lbl_clip_preview.config(text=f"В буфере обмена сейчас: «{cleaned}»")
-            else:
-                self.lbl_clip_preview.config(text="В буфере обмена сейчас: (пусто)")
-        except Exception:
-            pass
-
-    def _schedule_poll(self) -> None:
-        self.refresh()
-        self._poll_job = self.after(3000, self._schedule_poll)
-
-    def on_show(self) -> None:
-        self.refresh()
 
 
 NAV = (
     ("autoclicker", "AutoClicker", "клики по экрану"),
-    ("autocopy", "AutoCopy", "копирование при выделении"),
-    ("clean", "Пустые файлы", "0 байт и пустые папки"),
+        ("clean", "Пустые файлы", "0 байт и пустые папки"),
     ("dns", "DNS", "Quad9 · Xbox · DoH"),
     ("github", "GitHub", "бэкап проектов"),
     ("bypass", "Bypass", "обход DPI: глобально и по приложениям"),
@@ -7553,10 +7307,6 @@ HEADERS = {
         "AutoClicker",
         "Клики по точкам, областям и картинкам. F6 — старт/стоп, F7 — точка под курсором.",
     ),
-    "autocopy": (
-        "AutoCopy · Автоматическое копирование",
-        "Копирует выделенный мышью текст сразу в буфер обмена и показывает подсказку у курсора.",
-    ),
     "clean": (
         "Пустые файлы и папки",
         "Сначала проверка — удаление только после подтверждения.",
@@ -7668,7 +7418,6 @@ class Hub(tk.Tk):
 
         self.factories = {
             "autoclicker": lambda: AutoClickerPanel(self.content, self),
-            "autocopy": lambda: AutoCopyPanel(self.content, self),
             "clean": lambda: CleanPanel(self.content, self),
             "dns": lambda: DnsPanel(self.content, self),
             "github": lambda: GitHubPanel(self.content, self),

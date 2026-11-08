@@ -5,10 +5,13 @@ agent_progress.py — детект прогресса для AI Screen Bridge.
 (Pillow уже есть в requirements.txt). Предназначен для интеграции
 в screen_agent.py (AIScreenAgentApp.execute_one_cycle / _loop_worker):
 
-1. diff_ratio(img_a, img_b) — доля различающихся пикселей между двумя
-   снимками ROI (уменьшенные grayscale-копии шириной SNAPSHOT_WIDTH px).
-   Если результат меньше ~1-2%, экран считается не изменившимся после
-   клика (фикс 1 аналитика: «экран не изменился»).
+1. diff_stats(img_a, img_b) -> (changed, total) и diff_ratio(img_a, img_b) —
+   число/доля различающихся пикселей между двумя снимками ROI
+   (уменьшенные grayscale-копии шириной SNAPSHOT_WIDTH px).
+   Для детекта «экран изменился после клика» используйте АБСОЛЮТНОЕ число
+   (diff_stats + MIN_CHANGED_PIXELS): доля ненадёжна, потому что клик по
+   радиокнопке/чекбоксу без широкой подсветки строки меняет лишь ~0.016%
+   кадра (~6 пикселей снапшота 256x145) и тонет в пороге типа 0.5%.
 
 2. StagnationTracker — счётчик зависания: сколько шагов подряд модель
    кликает одну и ту же точку (в пределах SAME_TARGET_TOLERANCE_PX) и
@@ -24,6 +27,7 @@ from PIL import Image, ImageChops
 # --- Пороги модуля ---
 SNAPSHOT_WIDTH = 256             # ширина уменьшенной grayscale-копии снимка для сравнения
 PIXEL_DIFF_TOLERANCE = 25        # отклонение 0-255: ниже него пиксель «не различается» (шум/сжатие JPEG)
+MIN_CHANGED_PIXELS = 4           # абс. порог «экран изменился»: >= 4 пикселей снапшота 256x145 (~0.02%)
 STAGNATION_REPEAT_LIMIT = 3      # шагов подряд в одну и ту же точку (участвует в stalled)
 STAGNATION_NO_CHANGE_LIMIT = 3   # шагов подряд без изменения экрана (участвует в stalled)
 SAME_TARGET_TOLERANCE_PX = 20    # смещение по X и Y, при котором точка считается той же (~1.5% ROI 2879x1629)
@@ -48,8 +52,8 @@ def _grayscale_copy(img, width):
     return img.convert("L").resize((width, height), _RESAMPLE_LANCZOS)
 
 
-def diff_ratio(img_a, img_b, width=SNAPSHOT_WIDTH, pixel_tolerance=PIXEL_DIFF_TOLERANCE):
-    """Доля различающихся пикселей между двумя снимками (0.0 .. 1.0).
+def diff_stats(img_a, img_b, width=SNAPSHOT_WIDTH, pixel_tolerance=PIXEL_DIFF_TOLERANCE):
+    """Число различающихся пикселей между двумя снимками: (changed, total).
 
     Оба изображения переводятся в grayscale и уменьшаются до `width` px
     по ширине; если после этого размеры всё ещё различаются (разные
@@ -58,10 +62,14 @@ def diff_ratio(img_a, img_b, width=SNAPSHOT_WIDTH, pixel_tolerance=PIXEL_DIFF_TO
     `pixel_tolerance` (по умолчанию 25 из 255 — гасит шум JPEG и
     мигающую каретку).
 
+    Абсолютное число (а не доля) — основной сигнал для детекта «экран
+    изменился после клика»: отметка радиокнопки меняет лишь несколько
+    пикселей снапшота, и в процентах она неотличима от нуля.
+
     Курсор мыши не учитывается: ImageGrab его не захватывает.
     """
     if img_a is None or img_b is None:
-        raise ValueError("diff_ratio: оба аргумента должны быть PIL.Image, а не None")
+        raise ValueError("diff_stats: оба аргумента должны быть PIL.Image, а не None")
     if pixel_tolerance < 0:
         raise ValueError(f"pixel_tolerance должен быть >= 0, получено {pixel_tolerance}")
 
@@ -73,7 +81,13 @@ def diff_ratio(img_a, img_b, width=SNAPSHOT_WIDTH, pixel_tolerance=PIXEL_DIFF_TO
     hist = ImageChops.difference(a, b).histogram()  # mode "L" -> 256 значений
     total = a.size[0] * a.size[1]
     differing = sum(hist[pixel_tolerance + 1:])
-    return differing / total
+    return differing, total
+
+
+def diff_ratio(img_a, img_b, width=SNAPSHOT_WIDTH, pixel_tolerance=PIXEL_DIFF_TOLERANCE):
+    """Доля различающихся пикселей между двумя снимками (0.0 .. 1.0)."""
+    changed, total = diff_stats(img_a, img_b, width=width, pixel_tolerance=pixel_tolerance)
+    return changed / total
 
 
 class StagnationTracker:

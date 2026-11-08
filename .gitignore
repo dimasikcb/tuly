@@ -8,6 +8,9 @@ dist/
 *.spec
 Tools.exe
 
+# зарезервированное имя устройства Windows
+/nul
+
 .workbuddy-ai/
 .env
 *.env

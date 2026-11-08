@@ -248,6 +248,30 @@ class AIScreenAgentApp:
         # Запуск цикла обработки очереди логов
         self.root.after(100, self.process_log_queue)
 
+    def _install_ui_snapshot_traces(self):
+        """Зеркалит значения Tk-переменных в self._ui_snapshot для worker-потока.
+
+        Чтение StringVar/DoubleVar.get() из не-главного потока формально
+        небезопасно (может падать «main thread is not in main loop»), поэтому
+        worker-код читает обычный dict: трассировка на запись обновляет его
+        на главном потоке (виджеты тоже пишут в переменную на главном).
+        Начальные значения dict берутся из конфига в __init__.
+        """
+        def mirror(key, getter, cast=None):
+            def _on_write(*_args):
+                try:
+                    value = getter()
+                    self._ui_snapshot[key] = cast(value) if cast is not None else value
+                except Exception:
+                    return  # мусор в поле ввода (например, задержка) — держим прошлое значение
+            return _on_write
+
+        self.api_key_var.trace_add("write", mirror("api_key", self.api_key_var.get))
+        self.model_var.trace_add("write", mirror("model", self.model_var.get))
+        self.instruction_var.trace_add("write", mirror("custom_hint", self.instruction_var.get))
+        self.smooth_mouse_var.trace_add("write", mirror("smooth_mouse", self.smooth_mouse_var.get, bool))
+        self.delay_var.trace_add("write", mirror("delay", self.delay_var.get, float))
+
     def load_config(self):
         default_config = {
             "api_key": os.environ.get("GEMINI_API_KEY", ""),
@@ -506,29 +530,63 @@ class AIScreenAgentApp:
         self.root.after(100, self.process_log_queue)
 
     def capture_roi_image(self):
-        """Захватывает выбранную область экрана в формате PIL.Image."""
+        """Захватывает выбранную область экрана в формате PIL.Image.
+
+        Если исключение окна из захвата (WDA_EXCLUDEFROMCAPTURE) не сработало
+        (старые Windows), включается fallback: на время снимка окно прячется
+        (withdraw) и возвращается после. Работает только из воркер-потока —
+        превью на главном потоке снимает «как есть», не блокируя mainloop.
+        Параллельные захваты считают глубину: окно возвращается только после
+        последнего. Пояснение в журнал пишется один раз, а не на каждый захват.
+        """
         if not self.roi:
             return None
         ensure_interactive_desktop()
         x, y, w, h = self.roi
         bbox = (x, y, x + w, y + h)
-        try:
-            img = ImageGrab.grab(bbox=bbox)
-            return img
-        except Exception as e:
-            self.log(f"Ошибка ImageGrab: {e}. Пробую альтернативный метод...")
-            try:
-                from mss import MSS
-                with MSS() as sct:
-                    monitor = {"left": x, "top": y, "width": w, "height": h}
-                    sct_img = sct.grab(monitor)
-                    return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-            except Exception as e2:
-                self.log(f"Критическая ошибка захвата экрана: {e2}")
-                return None
 
-    def capture_and_update_preview(self, click_pt=None):
-        """Обновляет холст превью с опциональной красной точкой клика."""
+        hide_fallback = (
+            not agent_window.capture_exclusion_active()
+            and threading.current_thread() is not threading.main_thread()
+        )
+        if hide_fallback:
+            with self._capture_hide_lock:
+                outermost = self._capture_hide_depth == 0
+                self._capture_hide_depth += 1
+            if not self._hide_fallback_logged:
+                self._hide_fallback_logged = True
+                self.log(
+                    "⚠️ Исключение окна из захвата не сработало — включаю fallback: "
+                    "окно будет кратко скрываться на время каждого снимка."
+                )
+            if outermost:
+                self.root.after(0, self.root.withdraw)
+                time.sleep(0.15)  # даём mainloop убрать окно с экрана до захвата
+        try:
+            try:
+                img = ImageGrab.grab(bbox=bbox)
+                return img
+            except Exception as e:
+                self.log(f"Ошибка ImageGrab: {e}. Пробую альтернативный метод...")
+                try:
+                    from mss import MSS
+                    with MSS() as sct:
+                        monitor = {"left": x, "top": y, "width": w, "height": h}
+                        sct_img = sct.grab(monitor)
+                        return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                except Exception as e2:
+                    self.log(f"Критическая ошибка захвата экрана: {e2}")
+                    return None
+        finally:
+            if hide_fallback:
+                with self._capture_hide_lock:
+                    self._capture_hide_depth -= 1
+                    restore = self._capture_hide_depth == 0
+                if restore:
+                    self.root.after(0, self.root.deiconify)
+
+    def capture_and_update_preview(self, click_pt=None, drag_pt=None):
+        """Обновляет холст превью: точка клика или линия перетаскивания (drag)."""
         img = self.capture_roi_image()
         if not img:
             return
@@ -536,11 +594,15 @@ class AIScreenAgentApp:
         canvas_w = self.preview_canvas.winfo_width() or 580
         canvas_h = self.preview_canvas.winfo_height() or 130
 
-        # Если передан клик, рисуем яркую точку
+        # Если передан клик, рисуем яркую точку; для drag — ещё и линию до конечной точки
         if click_pt:
             draw = ImageDraw.Draw(img)
             cx, cy = click_pt
             r = max(5, int(min(img.width, img.height) * 0.02))
+            if drag_pt:
+                dx, dy = drag_pt
+                draw.line((cx, cy, dx, dy), fill="#ff0000", width=4)
+                draw.ellipse((dx - r, dy - r, dx + r, dy + r), fill="#ff0000", outline="#ffffff", width=2)
             draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill="#ff0000", outline="#ffffff", width=2)
 
         # Масштабируем превью под холст
@@ -556,9 +618,9 @@ class AIScreenAgentApp:
 
     def call_vision_api(self, img_bytes):
         """Отправляет изображение в Vision API (APInex / OpenAI / Google) и получает координаты."""
-        api_key = self.api_key_var.get().strip()
-        model_name = self.model_var.get().strip() or "free/gemini-3.8-flash"
-        custom_hint = self.instruction_var.get().strip()
+        api_key = self._ui_snapshot["api_key"].strip()
+        model_name = self._ui_snapshot["model"].strip() or "free/gemini-3.8-flash"
+        custom_hint = self._ui_snapshot["custom_hint"].strip()
         base_url = self.config.get("base_url", "").strip()
 
         if not api_key:
@@ -584,10 +646,16 @@ class AIScreenAgentApp:
             "2. Determine the correct answer.\n"
             "3. If an answer option needs to be selected, target the radio button, checkbox, or option text.\n"
             "4. If the answer is already selected or if there is a 'Next' / 'Далее' / 'Submit' / 'Ответить' / 'Продолжить' button required to advance, target that button.\n"
-            "5. If the test is completely finished (score / results page shown), set action='done'.\n"
+            "5. Matching tasks ('сопоставьте' / 'соедини' / two columns of items to pair): click the radio of an item "
+            "in ONE column, then on the next step click the radio of the matching item in the OPPOSITE column. "
+            "NEVER pair two items from the same column, and never re-connect a pair that is already linked. "
+            "If the interface clearly requires dragging a line between items, use action='drag' with "
+            "x1,y1 (start on the left item) and x2,y2 (end on the right item).\n"
+            "6. If the test is completely finished (score / results page shown), set action='done'.\n"
             "Coordinates:\n"
             "Return target coordinates 'x' and 'y' as integers normalized from 0 to 1000 relative to this image. "
-            "(x=0 is leftmost, x=1000 is rightmost, y=0 is top, y=1000 is bottom).\n"
+            "(x=0 is leftmost, x=1000 is rightmost, y=0 is top, y=1000 is bottom). "
+            "For action='drag' return 'x1','y1','x2','y2' instead of 'x','y'.\n"
             "Output MUST be valid JSON only."
         )
 
@@ -596,29 +664,34 @@ class AIScreenAgentApp:
             "Return JSON in this exact structure:\n"
             "{\n"
             '  "thought": "Short explanation: Question is X, correct answer is Y / Clicking Next button",\n'
-            '  "action": "click",\n'
-            '  "x": <0-1000>,\n'
-            '  "y": <0-1000>\n'
+            '  "action": "click" | "drag" | "done",\n'
+            '  "x": <0-1000>, "y": <0-1000>           // for action="click"\n'
+            '  "x1": <0-1000>, "y1": <0-1000>,        // for action="drag": line start\n'
+            '  "x2": <0-1000>, "y2": <0-1000>         // for action="drag": line end\n'
             "}\n"
         )
         if custom_hint:
             prompt += f"\nUser extra hint: {custom_hint}\n"
 
-        # История последних кликов: без неё каждый запрос stateless и модель
-        # повторяет уже сделанный клик в выбранную опцию. Теперь она видит,
-        # какой клик не изменил экран, и получает явное правило нажимать «Далее».
+        # История последних действий: без неё каждый запрос stateless и модель
+        # повторяет уже сделанный клик. Пометка колонки (left/right) важна для
+        # заданий-сопоставлений: выбрав элемент слева, модель должна продолжить
+        # пару в противоположной колонке, а не в той же.
         if self._action_history:
             hist_lines = [
-                f"- clicked ({hx:.0f}, {hy:.0f}) in 0-1000 image coords — "
-                + ("screen CHANGED" if changed else "screen did NOT change")
-                for hx, hy, changed in self._action_history
+                "- " + e["text"] + " in 0-1000 image coords — "
+                + ("screen CHANGED" if e["changed"] else "screen did NOT change")
+                for e in self._action_history
             ]
             prompt += (
-                "\nHistory of your recent clicks (oldest first):\n"
+                "\nHistory of your recent actions (oldest first):\n"
                 + "\n".join(hist_lines) + "\n"
-                "RULE: if your previous click on an answer option did NOT change the screen, "
-                "that option is already selected — do NOT click the same point again; "
-                "click the 'Далее' / 'Next' / 'Submit' / 'Ответить' button instead.\n"
+                "RULES:\n"
+                "- If your previous click on an answer option did NOT change the screen, that option is "
+                "already selected — do NOT click the same point again; advance with 'Далее'/'Next'/'Submit'/'Ответить'.\n"
+                "- Matching tasks: if you just selected an item in one column, click its pair in the "
+                "OPPOSITE column. NEVER pair two items from the same column; never re-connect a pair "
+                "that is already linked.\n"
             )
 
         b64_img = base64.b64encode(img_bytes).decode("utf-8")
@@ -713,18 +786,44 @@ class AIScreenAgentApp:
             y = (ymin + ymax) / 2.0
             x = (xmin + xmax) / 2.0
 
-        if x is None or y is None:
+        # Перетаскивание линии (задания-сопоставления): x1,y1 -> x2,y2
+        drag = None
+        if all(k in data for k in ("x1", "y1", "x2", "y2")):
+            try:
+                drag = (float(data["x1"]), float(data["y1"]), float(data["x2"]), float(data["y2"]))
+            except (TypeError, ValueError):
+                drag = None
+
+        if (x is None or y is None) and drag is None and data.get("action") != "done":
             raise ValueError(f"Ответ модели не содержит координат: {data}")
 
-        return {
+        result = {
             "thought": data.get("thought", "Нет описания"),
             "action": data.get("action", "click"),
             "x": x,
-            "y": y
+            "y": y,
         }
+        if drag is not None:
+            result["drag"] = drag
+        return result
 
-    def execute_one_cycle(self):
-        """Выполняет один цикл: снимок -> анализ -> клик."""
+    def should_abort(self, generation):
+        """True, когда воркеру нельзя продолжать: нажат СТОП или стартовало новое поколение.
+
+        СТОП во время висящего API-вызова + быстрый СТАРТ раньше сбрасывали
+        stop_requested, старый воркер продолжал цикл, и два воркера кликали
+        одновременно; теперь СТАРТ поднимает _worker_generation, и воркер
+        предыдущего поколения выходит по несовпадению.
+        """
+        return self.stop_requested or generation != self._worker_generation
+
+    def execute_one_cycle(self, generation=None):
+        """Выполняет один цикл: снимок -> анализ -> клик.
+
+        generation передаётся воркером авто-режима: пока идёт медленный
+        API-вызов, режим могут остановить или перезапустить — после ответа
+        модели клик делается только если поколение ещё актуально.
+        """
         if not self.roi:
             self.log("❌ Сначала выделите область с тестом!")
             return False
@@ -746,7 +845,7 @@ class AIScreenAgentApp:
         img_bytes = agent_speed.encode_jpeg(api_img)
         prep_s = time.time() - prep_t0
 
-        self.log(f"🧠 Отправка в {self.model_var.get()}...")
+        self.log(f"🧠 Отправка в {self._ui_snapshot['model']}...")
         start_t = time.time()
         try:
             result = self.call_vision_api(img_bytes)
@@ -755,10 +854,15 @@ class AIScreenAgentApp:
             return False
 
         elapsed = time.time() - start_t
+
+        # API-ответ шёл секундами — за это время режим могли остановить или
+        # перезапустить; устаревшему/остановленному воркеру кликать нельзя
+        if generation is not None and self.should_abort(generation):
+            self.log("⏭️ Ответ ИИ получен, но авто-режим уже остановлен/перезапущен — клик пропущен.")
+            return False
+
         thought = result.get("thought", "")
         action = result.get("action", "click")
-        norm_x = result["x"]
-        norm_y = result["y"]
 
         self.log(f"💡 ИИ ({elapsed:.1f}с API, {prep_s:.2f}с подготовка): {thought}")
 
@@ -766,47 +870,99 @@ class AIScreenAgentApp:
             self.log("🏁 ИИ сообщает: Тест завершен!")
             return "done"
 
-        # Пересчет координат из 0-1000 в пиксели экрана
-        if norm_x <= 1.0 and norm_y <= 1.0:
-            rel_x, rel_y = norm_x, norm_y
-        elif norm_x <= 100.0 and norm_y <= 100.0 and (rw > 100 or rh > 100):
-            rel_x, rel_y = norm_x / 100.0, norm_y / 100.0
-        else:
-            rel_x, rel_y = norm_x / 1000.0, norm_y / 1000.0
-
-        local_click_x = int(rel_x * rw)
-        local_click_y = int(rel_y * rh)
-
-        screen_x = rx + local_click_x
-        screen_y = ry + local_click_y
-
-        # Защита от вылета за пределы ROI
-        screen_x = max(rx + 2, min(rx + rw - 2, screen_x))
-        screen_y = max(ry + 2, min(ry + rh - 2, screen_y))
-
-        # Детект самоклика: модель показала в наше собственное окно —
-        # не кликаем (можно было бы нажать собственную кнопку СТОП), шаг пропускаем
-        if agent_window.point_in_tool_window(screen_x, screen_y):
-            self.log(
-                f"⚠️ Точка ({screen_x}, {screen_y}) попадает в окно программы "
-                f"{agent_window.tool_window_rect()} — шаг пропущен, чтобы не кликнуть в себя."
-            )
+        # Сопоставление пар: модель может тянуть линию (drag) вместо одиночного клика
+        drag = result.get("drag") if action == "drag" else None
+        if action == "drag" and drag is None:
+            self.log("❌ Модель вернула action='drag' без координат x1,y1,x2,y2 — шаг пропущен.")
             return False
 
-        # Обновляем превью с точкой клика
-        self.root.after(0, lambda: self.capture_and_update_preview((local_click_x, local_click_y)))
+        def column_of(local_x):
+            return "left" if local_x * 2 < rw else "right"
 
-        self.log(f"👉 Клик в точку: ({screen_x}, {screen_y})")
+        if drag is not None:
+            # Тянем линию от x1,y1 к x2,y2 (задания-сопоставления с перетаскиванием)
+            rel_x1, rel_y1 = resolve_click_scale(drag[0], drag[1])
+            rel_x2, rel_y2 = resolve_click_scale(drag[2], drag[3])
+            local_from = (int(rel_x1 * rw), int(rel_y1 * rh))
+            local_to = (int(rel_x2 * rw), int(rel_y2 * rh))
+            screen_pts = []
+            for lx, ly in (local_from, local_to):
+                sx = max(rx + 2, min(rx + rw - 2, rx + lx))
+                sy = max(ry + 2, min(ry + rh - 2, ry + ly))
+                screen_pts.append((sx, sy))
+            (screen_x1, screen_y1), (screen_x2, screen_y2) = screen_pts
+            for sx, sy in screen_pts:
+                if agent_window.point_in_tool_window(sx, sy):
+                    self.log(
+                        f"⚠️ Точка перетаскивания ({sx}, {sy}) попадает в окно программы "
+                        f"{agent_window.tool_window_rect()} — шаг пропущен, чтобы не кликнуть в себя."
+                    )
+                    return False
 
-        # Перемещение и клик мышкой
-        smooth = self.smooth_mouse_var.get()
-        if smooth:
-            pyautogui.moveTo(screen_x, screen_y, duration=0.35, tween=pyautogui.easeInOutQuad)
+            # Превью: линия между точками
+            self.root.after(0, lambda: self.capture_and_update_preview(local_from, local_to))
+
+            self.log(f"👉 Перетаскивание: ({screen_x1}, {screen_y1}) -> ({screen_x2}, {screen_y2})")
+            pyautogui.moveTo(screen_x1, screen_y1)
+            time.sleep(0.08)
+            pyautogui.mouseDown()
+            if self._ui_snapshot["smooth_mouse"]:
+                pyautogui.moveTo(screen_x2, screen_y2, duration=0.35, tween=pyautogui.easeInOutQuad)
+            else:
+                pyautogui.moveTo(screen_x2, screen_y2, duration=0.15)
+            pyautogui.mouseUp()
+
+            # Общая пост-обработка (сравнение кадров, история, зависание) — по конечной точке
+            local_click_x, local_click_y = local_to
+            screen_x, screen_y = screen_x2, screen_y2
+            hist_text = (
+                f"dragged ({drag[0]:.0f}, {drag[1]:.0f}) [{column_of(local_from[0])} column] "
+                f"-> ({drag[2]:.0f}, {drag[3]:.0f}) [{column_of(local_to[0])} column]"
+            )
         else:
-            pyautogui.moveTo(screen_x, screen_y)
+            if result["x"] is None or result["y"] is None:
+                self.log("❌ Модель вернула ответ без координат x/y — шаг пропущен.")
+                return False
+            norm_x, norm_y = result["x"], result["y"]
 
-        time.sleep(0.08)
-        pyautogui.click()
+            # Пересчет координат ответа модели в пиксели экрана (см. resolve_click_scale:
+            # прежняя эвристика «обе <= 100 => проценты» ломала валидные ответы 0-1000
+            # из левого верхнего угла — (80, 40) читалось как 80%x40%, клик улетал в центр)
+            rel_x, rel_y = resolve_click_scale(norm_x, norm_y)
+
+            local_click_x = int(rel_x * rw)
+            local_click_y = int(rel_y * rh)
+
+            screen_x = rx + local_click_x
+            screen_y = ry + local_click_y
+
+            # Защита от вылета за пределы ROI
+            screen_x = max(rx + 2, min(rx + rw - 2, screen_x))
+            screen_y = max(ry + 2, min(ry + rh - 2, screen_y))
+
+            # Детект самоклика: модель показала в наше собственное окно —
+            # не кликаем (можно было бы нажать собственную кнопку СТОП), шаг пропускаем
+            if agent_window.point_in_tool_window(screen_x, screen_y):
+                self.log(
+                    f"⚠️ Точка ({screen_x}, {screen_y}) попадает в окно программы "
+                    f"{agent_window.tool_window_rect()} — шаг пропущен, чтобы не кликнуть в себя."
+                )
+                return False
+
+            # Обновляем превью с точкой клика
+            self.root.after(0, lambda: self.capture_and_update_preview((local_click_x, local_click_y)))
+
+            self.log(f"👉 Клик в точку: ({screen_x}, {screen_y})")
+
+            # Перемещение и клик мышкой
+            if self._ui_snapshot["smooth_mouse"]:
+                pyautogui.moveTo(screen_x, screen_y, duration=0.35, tween=pyautogui.easeInOutQuad)
+            else:
+                pyautogui.moveTo(screen_x, screen_y)
+
+            time.sleep(0.08)
+            pyautogui.click()
+            hist_text = f"clicked ({norm_x:.0f}, {norm_y:.0f}) [{column_of(local_click_x)} column]"
 
         # Прогресс после клика: сравниваем кадр ДО клика с текущим экраном.
         # ImageGrab курсор не захватывает, так что смещение мыши не мешает.
@@ -815,17 +971,17 @@ class AIScreenAgentApp:
         try:
             after_img = self.capture_roi_image()
             if after_img is not None:
-                ratio = agent_progress.diff_ratio(img, after_img)
-                screen_changed = ratio >= SCREEN_CHANGE_MIN_RATIO
+                changed_px, total_px = agent_progress.diff_stats(img, after_img)
+                screen_changed = changed_px >= agent_progress.MIN_CHANGED_PIXELS
                 self.log(
                     f"📊 Экран после клика {'изменился' if screen_changed else 'НЕ изменился'} "
-                    f"(diff {ratio * 100:.1f}%)."
+                    f"(различающихся пикселей: {changed_px} из {total_px}, порог {agent_progress.MIN_CHANGED_PIXELS})."
                 )
         except Exception as e:
             self.log(f"⚠️ Не удалось сравнить кадры до/после клика: {e}")
 
         # Короткая история для промпта: модель увидит её на следующем шаге
-        self._action_history.append((norm_x, norm_y, screen_changed))
+        self._action_history.append({"text": hist_text, "changed": screen_changed})
 
         # Детект зависания: та же точка + неменяющийся экран N шагов подряд.
         # 'repeat' — только предупреждение (кнопка «Далее» на одном месте —
@@ -850,15 +1006,17 @@ class AIScreenAgentApp:
 
     def do_single_step(self):
         """Выполнить один шаг вручную в отдельном потоке."""
-        if self.is_running:
+        if self.is_running or self._single_step_running:
             return
         threading.Thread(target=self._run_single_step_thread, daemon=True).start()
 
     def _run_single_step_thread(self):
+        self._single_step_running = True  # СТАРТ блокируется, пока идёт одиночный шаг
         self.step_btn.config(state="disabled")
         try:
             self.execute_one_cycle()
         finally:
+            self._single_step_running = False
             self.root.after(0, lambda: self.step_btn.config(state="normal"))
 
     def toggle_start(self):
@@ -874,17 +1032,22 @@ class AIScreenAgentApp:
         if not self.api_key_var.get().strip():
             messagebox.showwarning("Внимание", "Укажите Gemini API Key вверху окна!")
             return
+        if self._single_step_running:
+            self.log("⏳ Дождитесь окончания одиночного шага — СТАРТ пока заблокирован.")
+            return
 
         self.is_running = True
         self.stop_requested = False
         self._stagnation.reset()       # детект зависания начинает с чистого листа
         self._action_history.clear()   # история кликов для промпта — тоже
+        self._worker_generation += 1   # воркеры предыдущего поколения выйдут сами
         self.start_btn.config(text="⏹ СТОП", bg="#dc3545")
         self.select_btn.config(state="disabled")
         self.step_btn.config(state="disabled")
         self.log("▶ Авто-режим запущен. Для остановки нажмите СТОП или дерните мышь в угол.")
 
-        self.worker_thread = threading.Thread(target=self._loop_worker, daemon=True)
+        generation = self._worker_generation
+        self.worker_thread = threading.Thread(target=self._loop_worker, args=(generation,), daemon=True)
         self.worker_thread.start()
 
     def stop(self):
@@ -899,26 +1062,29 @@ class AIScreenAgentApp:
         if self.is_running:
             self.stop()
 
-    def _loop_worker(self):
+    def _loop_worker(self, generation):
         step_count = 0
-        while not self.stop_requested:
+        while not self.should_abort(generation):
             step_count += 1
             self.log(f"--- Шаг {step_count} ---")
-            res = self.execute_one_cycle()
+            res = self.execute_one_cycle(generation)
 
-            if res == "done" or self.stop_requested:
+            if res == "done" or self.should_abort(generation):
                 break
             if not res:
                 self.log("⚠️ Шаг не удался, повторная попытка через паузу...")
 
             # Ожидание задержки
-            delay = max(0.5, float(self.delay_var.get()))
+            delay = max(0.5, float(self._ui_snapshot["delay"]))
             for _ in range(int(delay * 10)):
                 if self.stop_requested:
                     break
                 time.sleep(0.1)
 
-        self.root.after(0, self.stop)
+        # Кнопки сбрасывает только актуальный воркер: устаревший (после быстрого
+        # СТОП+СТАРТ) не должен глушить уже новый запущенный режим
+        if generation == self._worker_generation:
+            self.root.after(0, self.stop)
 
 
 def main():

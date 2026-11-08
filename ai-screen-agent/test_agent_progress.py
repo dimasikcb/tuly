@@ -18,7 +18,15 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agent_progress
-from agent_progress import STATUS_OK, STATUS_REPEAT, STATUS_STALLED, StagnationTracker, diff_ratio
+from agent_progress import (
+    MIN_CHANGED_PIXELS,
+    STATUS_OK,
+    STATUS_REPEAT,
+    STATUS_STALLED,
+    StagnationTracker,
+    diff_ratio,
+    diff_stats,
+)
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -26,6 +34,44 @@ MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 def solid(size, color, mode="L"):
     """Однотонная картинка."""
     return Image.new(mode, size, color)
+
+
+class DiffStatsTests(unittest.TestCase):
+    def test_identical_zero_changed(self):
+        img = solid((320, 200), 90)
+        changed, total = diff_stats(img, img.copy())
+        snap_h = round(200 * agent_progress.SNAPSHOT_WIDTH / 320)
+        self.assertEqual(changed, 0)
+        self.assertEqual(total, agent_progress.SNAPSHOT_WIDTH * snap_h)
+
+    def test_black_vs_white_all_changed(self):
+        changed, total = diff_stats(solid((320, 200), 0), solid((320, 200), 255))
+        snap_h = round(200 * agent_progress.SNAPSHOT_WIDTH / 320)
+        self.assertEqual(changed, agent_progress.SNAPSHOT_WIDTH * snap_h)
+        self.assertEqual(total, agent_progress.SNAPSHOT_WIDTH * snap_h)
+
+    def test_radio_click_highlight_crosses_threshold(self):
+        # Реальный кейс: подсветка/отметка 48x48 px на кадре 2880x1800 в снапшоте
+        # 256 px по ширине даёт ~4x4 пикселя — абс. порог MIN_CHANGED_PIXELS
+        # должен это ловить (доля ~0.02% в пороге 0.5% тонула).
+        a = solid((2880, 1800), 30)
+        b = a.copy()
+        for x in range(0, 48):
+            for y in range(0, 48):
+                b.putpixel((x, y), 220)
+        changed, _total = diff_stats(a, b)
+        self.assertGreaterEqual(changed, MIN_CHANGED_PIXELS)
+
+    def test_single_pixel_noise_below_threshold(self):
+        a = solid((2880, 1800), 30)
+        b = a.copy()
+        b.putpixel((100, 100), 255)  # один пиксель кадра — шум/каретка
+        changed, _total = diff_stats(a, b)
+        self.assertLess(changed, MIN_CHANGED_PIXELS)
+
+    def test_none_raises(self):
+        with self.assertRaises(ValueError):
+            diff_stats(None, solid((100, 100), 0))
 
 
 class DiffRatioTests(unittest.TestCase):
