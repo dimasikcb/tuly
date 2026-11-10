@@ -43,6 +43,8 @@ from bypass_core import (
     HAPP_SOCKS_DEFAULT,
     _find_happ,
     bypass_admin,
+    bypass_apps_route_disable,
+    bypass_apps_route_enable,
     bypass_apply,
     bypass_auto_heal_if_leak,
     bypass_cfg,
@@ -86,32 +88,74 @@ from winbase import (
 from leads_contacts import format_phone as _fmt_phone  # noqa: F401
 from leads_contacts import short as _short_link  # noqa: F401
 
+from scroll_settings import steps_per_wheel as _scroll_step
+
 # --------------------------------------------------------------------------- #
-#  Тёмная палитра
+#  Единая тема: HEX-цвета живут ТОЛЬКО в theme/tokens.py (см. DESIGN.md).
+#  Здесь тонкая прослойка: старые имена констант сохранены, чтобы не
+#  переписывать сотни упоминаний по всему хабу. Смена темы вызывает
+#  _refresh_palette() и apple_tk.recolor() — см. Hub._apply_theme_mode().
 # --------------------------------------------------------------------------- #
-BG = "#14161b"
-SIDEBAR = "#0f1115"
-CARD = "#1c1f26"
-CARD_HOVER = "#242833"
-FIELD = "#111318"
-BORDER = "#2b303a"
-FG = "#e7eaf0"
-MUTED = "#8a93a2"
-ACCENT = "#4c8dff"
-ACCENT_HOVER = "#3a7aeb"
-DANGER = "#e5484d"
-DANGER_HOVER = "#c73b40"
-OK = "#4fd18b"
-WARN = "#f0b429"
-LOG_BG = "#0d0f13"
-LOG_FG = "#c7d0de"
-COPIED_BG = "#1b7a4b"   # кратковременная вспышка «скопировано» в логах
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import theme as _theme
+from theme import apple_tk as _apple_tk
 
 SCALE = 1.0
 
-# цвета аватарок в списке программ (по кругу, от имени exe)
-AVATAR_COLORS = ("#4c8dff", "#4fd18b", "#f0b429", "#c084fc",
-                 "#f97362", "#38bdf8", "#f472b6", "#a3e635")
+_LEGACY_NAMES = (
+    "BG", "SIDEBAR", "CARD", "CARD_HOVER", "FIELD", "BORDER", "FG", "MUTED",
+    "ACCENT", "ACCENT_HOVER", "DANGER", "DANGER_HOVER", "OK", "WARN",
+    "LOG_BG", "LOG_FG", "COPIED_BG",
+)
+_EXTRA_ROLES = (
+    "SIDEBAR_ACTIVE", "SIDEBAR_HOVER", "SIDEBAR_TITLE", "SIDEBAR_SUBTITLE",
+    "BRAND_LABEL", "TRACK_OFF", "TRACK_DISABLED", "KNOB", "ON_AVATAR",
+    "ROW_SELECTED", "BADGE_NEUTRAL_BG", "BADGE_BAD_BG", "BADGE_BAD_INK",
+    "BADGE_WARN_BG", "BADGE_WARN_INK", "BADGE_GOOD_BG", "BADGE_GOOD_INK",
+    "OVERLAY_TIMER", "TAG_FILE", "TAG_DIR", "OVERLAY_BACKDROP",
+)
+
+
+def tc(role: str) -> str:
+    """Цвет по семантической роли из theme/tokens.py."""
+    return _theme.c(role)
+
+
+def ui_font(size: int = 9, weight: str = "normal") -> tuple:
+    """Системный UI-шрифт (SF Pro → Segoe UI Variable → Segoe UI на Windows)."""
+    return (_apple_tk.ui_family(), size, weight)
+
+
+def mono_font(size: int = 9, weight: str = "normal") -> tuple:
+    return (_apple_tk.mono_family(), size, weight)
+
+
+def _refresh_palette() -> None:
+    """Пересчитать все константы под текущую тему (в т.ч. при живой смене темы)."""
+    values = {name: _theme.alias(name) for name in _LEGACY_NAMES}
+    for name in _EXTRA_ROLES:
+        values[name] = tc(name.lower())
+    values["AVATAR_COLORS"] = _theme.AVATARS
+    globals().update(values)
+
+
+_refresh_palette()
+# Модульный слушатель идёт первым: к моменту перерисовки виджетов константы
+# уже соответствуют новой теме. Слушатель Hub регистрируется позже.
+_theme.on_change(lambda _resolved: _refresh_palette())
+
+
+def badge_colors(key: str) -> tuple[str, str]:
+    """Цвет бейджа среднего балла: (фон, текст) в текущей теме."""
+    bg_role, fg_role = {
+        "red": ("badge_bad_bg", "badge_bad_ink"),
+        "yellow": ("badge_warn_bg", "badge_warn_ink"),
+        "green": ("badge_good_bg", "badge_good_ink"),
+    }.get(key, ("badge_bad_bg", "badge_bad_ink"))
+    return tc(bg_role), tc(fg_role)
 
 
 def px(value: float) -> int:
@@ -173,142 +217,27 @@ def load_autoclicker_deps() -> None:
 
 
 # --------------------------------------------------------------------------- #
-#  Тема и мелкие помощники
+#  Тема и мелкие помощники — тонкие обёртки над theme.apple_tk
 # --------------------------------------------------------------------------- #
 def apply_dark_theme(root: tk.Misc) -> None:
-    style = ttk.Style(root)
-    try:
-        style.theme_use("clam")
-    except tk.TclError:
-        pass
-    style.configure(
-        ".",
-        background=BG,
-        foreground=FG,
-        fieldbackground=FIELD,
-        bordercolor=BORDER,
-        lightcolor=BORDER,
-        darkcolor=BORDER,
-        focuscolor=ACCENT,
-        troughcolor=FIELD,
-        arrowcolor=FG,
-        selectbackground=ACCENT,
-        selectforeground="#ffffff",
-    )
-    style.configure("TFrame", background=BG)
-    style.configure("TLabel", background=BG, foreground=FG)
-    style.configure("Muted.TLabel", background=BG, foreground=MUTED)
-    style.configure("TButton", background=CARD, foreground=FG, padding=(px(12), px(6)), borderwidth=0)
-    style.map(
-        "TButton",
-        background=[("active", CARD_HOVER), ("disabled", "#191c22")],
-        foreground=[("disabled", MUTED)],
-    )
-    style.configure("TEntry", fieldbackground=FIELD, foreground=FG, insertcolor=FG, padding=px(6), bordercolor=BORDER)
-    style.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)])
-    style.configure("TSpinbox", fieldbackground=FIELD, foreground=FG, insertcolor=FG, arrowcolor=FG, padding=px(4), arrowsize=22)
-    style.configure("TCombobox", fieldbackground=FIELD, foreground=FG, arrowcolor=FG, padding=px(4), arrowsize=22)
-    style.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)])
-    root.option_add("*TCombobox*Listbox.background", FIELD)
-    root.option_add("*TCombobox*Listbox.foreground", FG)
-    root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
-    style.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=FG, bordercolor=BORDER, rowheight=px(26))
-    style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#ffffff")])
-    style.configure("Treeview.Heading", background=FIELD, foreground=MUTED, relief="flat", padding=(px(6), px(6)))
-    style.map("Treeview.Heading", background=[("active", CARD_HOVER)])
-    style.configure("TLabelframe", background=BG, bordercolor=BORDER)
-    style.configure("TLabelframe.Label", background=BG, foreground=MUTED)
-    style.configure("TCheckbutton", background=BG, foreground=FG)
-    style.map("TCheckbutton", background=[("active", BG)], foreground=[("disabled", MUTED)])
-    for name in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
-        style.configure(name, background=CARD, troughcolor=BG, bordercolor=BG, arrowcolor=MUTED, width=px(12))
-        style.map(name, background=[("active", CARD_HOVER)])
+    _apple_tk.apply_theme(root, scale=SCALE)
 
 
 def enable_dark_titlebar(window: tk.Misc) -> None:
-    """Тёмный заголовок окна в Windows 10/11."""
-    if sys.platform != "win32":
-        return
-    try:
-        window.update_idletasks()
-        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-        value = ctypes.c_int(1)
-        for attribute in (20, 19):
-            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
-            ) == 0:
-                break
-    except Exception:
-        pass
+    _apple_tk.titlebar(window)
 
 
 def flat_button(parent: tk.Misc, text: str, command, *, kind: str = "primary", **kwargs) -> tk.Button:
-    colors = {
-        "primary": (ACCENT, "#ffffff", ACCENT_HOVER),
-        "danger": (DANGER, "#ffffff", DANGER_HOVER),
-        "ghost": (CARD, FG, CARD_HOVER),
-    }
-    bg, fg, active = colors.get(kind, colors["primary"])
-    options = dict(
-        text=text,
-        command=command,
-        bg=bg,
-        fg=fg,
-        activebackground=active,
-        activeforeground=fg,
-        disabledforeground="#7c8697",
-        relief="flat",
-        bd=0,
-        padx=px(14),
-        pady=px(7),
-        font=("Segoe UI", 9, "bold" if kind != "ghost" else "normal"),
-        cursor="hand2",
-        highlightthickness=1 if kind == "ghost" else 0,
-        highlightbackground=BORDER,
-    )
-    options.update(kwargs)
-    return tk.Button(parent, **options)
+    return _apple_tk.flat_button(parent, text, command, kind=kind, scale=SCALE, **kwargs)
 
 
-def dark_check(parent: tk.Misc, text: str, variable: tk.BooleanVar, *, bg: str = BG, command=None) -> tk.Checkbutton:
-    return tk.Checkbutton(
-        parent,
-        text=text,
-        variable=variable,
-        command=command,
-        bg=bg,
-        fg=FG,
-        activebackground=bg,
-        activeforeground=FG,
-        selectcolor=FIELD,
-        highlightthickness=0,
-        bd=0,
-        anchor="w",
-        font=("Segoe UI", 9),
-        cursor="hand2",
-    )
+def dark_check(parent: tk.Misc, text: str, variable: tk.BooleanVar, *,
+               bg: str | None = None, command=None) -> tk.Checkbutton:
+    return _apple_tk.check(parent, text, variable, bg=bg or BG, command=command)
 
 
 def dark_text(parent: tk.Misc, *, height: int = 10, wrap: str = "word", **kwargs) -> tk.Text:
-    options = dict(
-        height=height,
-        wrap=wrap,
-        bg=LOG_BG,
-        fg=LOG_FG,
-        insertbackground=FG,
-        selectbackground="#2f4a7a",
-        relief="flat",
-        bd=0,
-        highlightthickness=1,
-        highlightbackground=BORDER,
-        highlightcolor=BORDER,
-        font=("Consolas", 9),
-        padx=px(8),
-        pady=px(6),
-    )
-    options.update(kwargs)
-    return tk.Text(parent, **options)
-
+    return _apple_tk.log_view(parent, height=height, wrap=wrap, **kwargs)
 
 def _iter_widgets(root: tk.Misc):
     for child in root.winfo_children():
@@ -361,8 +290,9 @@ def enable_input_paste(root: tk.Misc) -> None:
         w = event.widget
         if not isinstance(w, (tk.Entry, tk.Text, ttk.Entry)):
             return None
-        menu = tk.Menu(w, tearoff=0, bg=CARD, fg=FG, activebackground=ACCENT,
-                       activeforeground="#0d1117", bd=0)
+        menu = tk.Menu(w, tearoff=0, bg=CARD, fg=FG,
+                       activebackground=tc("accent_fill"),
+                       activeforeground=tc("on_accent"), bd=0)
         menu.add_command(label="Вставить", command=lambda: w.event_generate("<<Paste>>"))
         menu.add_command(label="Копировать", command=lambda: w.event_generate("<<Copy>>"))
         menu.add_command(label="Вырезать", command=lambda: w.event_generate("<<Cut>>"))
@@ -448,7 +378,7 @@ class DarkMessageBox:
         body = tk.Frame(win, bg=CARD, padx=px(22), pady=px(18))
         body.pack(fill="both", expand=True)
         tk.Label(
-            body, text=title, bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"), anchor="w"
+            body, text=title, bg=CARD, fg=FG, font=ui_font(12, "bold"), anchor="w"
         ).pack(fill="x")
         tk.Label(
             body,
@@ -458,7 +388,7 @@ class DarkMessageBox:
             justify="left",
             anchor="w",
             wraplength=px(470),
-            font=("Segoe UI", 9),
+            font=ui_font(9),
         ).pack(fill="x", pady=(px(10), 0))
 
         result = {"value": False}
@@ -516,9 +446,9 @@ class DarkMessageBox:
         body = tk.Frame(win, bg=CARD, padx=px(22), pady=px(18))
         body.pack(fill="both", expand=True)
         tk.Label(body, text=title, bg=CARD, fg=FG,
-                 font=("Segoe UI", 12, "bold"), anchor="w").pack(fill="x")
+                 font=ui_font(12, "bold"), anchor="w").pack(fill="x")
         tk.Label(body, text=message, bg=CARD, fg=MUTED, justify="left", anchor="w",
-                 wraplength=px(430), font=("Segoe UI", 9)).pack(fill="x", pady=(px(10), 0))
+                 wraplength=px(430), font=ui_font(9)).pack(fill="x", pady=(px(10), 0))
 
         value = tk.StringVar(value=initial)
         entry = ttk.Entry(body, textvariable=value)
@@ -888,36 +818,36 @@ class OverlaySelector:
         self.win = tk.Toplevel(master)
         self.win.overrideredirect(True)
         self.win.geometry(f"{self.vw}x{self.vh}+{self.vx}+{self.vy}")
-        self.win.configure(bg="black")
+        self.win.configure(bg=OVERLAY_BACKDROP)
         self.win.attributes("-topmost", True)
         try:
             self.win.attributes("-alpha", 0.35)
         except tk.TclError:
             pass
 
-        self.canvas = tk.Canvas(self.win, bg="black", highlightthickness=0, cursor="crosshair")
+        self.canvas = tk.Canvas(self.win, bg=OVERLAY_BACKDROP, highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
 
         hint = "Кликните, чтобы поставить точку" if mode == "point" \
             else "Протяните мышь, чтобы выделить область"
         self.canvas.create_text(
             self.vw // 2, px(46), text=f"{hint}   ·   Esc / ПКМ — отмена",
-            fill="#7CFC00", font=("Segoe UI", 15, "bold"),
+            fill=tc("roi"), font=ui_font(15, "bold"),
         )
         self.rect = self.canvas.create_rectangle(
-            0, 0, 0, 0, outline="#7CFC00", width=3, state="hidden"
+            0, 0, 0, 0, outline=tc("roi"), width=3, state="hidden"
         )
         self.size_text = self.canvas.create_text(
-            0, 0, text="", fill="#7CFC00", font=("Segoe UI", 11, "bold"), state="hidden"
+            0, 0, text="", fill=tc("roi"), font=ui_font(11, "bold"), state="hidden"
         )
         self.info = self.canvas.create_text(
-            0, 0, text="", fill="#FFD24A", font=("Consolas", 11, "bold"), anchor="nw"
+            0, 0, text="", fill=tc("overlay_timer"), font=mono_font(11, "bold"), anchor="nw"
         )
         self.cross_h = self.canvas.create_line(
-            0, 0, 0, 0, fill="#7CFC00", dash=(4, 4), state="hidden"
+            0, 0, 0, 0, fill=tc("roi"), dash=(4, 4), state="hidden"
         )
         self.cross_v = self.canvas.create_line(
-            0, 0, 0, 0, fill="#7CFC00", dash=(4, 4), state="hidden"
+            0, 0, 0, 0, fill=tc("roi"), dash=(4, 4), state="hidden"
         )
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
@@ -1004,7 +934,7 @@ class Panel(ttk.Frame):
         ttk.Label(head, text="Лог — выдели мышью, Ctrl+C или «Копировать всё»",
                   style="Muted.TLabel").pack(side="left")
         text = dark_text(frame, height=height, wrap=wrap)
-        text.tag_configure("error", foreground="#ff6b6b")
+        text.tag_configure("error", foreground=tc("log_err"))
         text.tag_configure("ok", foreground=OK)
         copy_btn = flat_button(head, "Копировать всё", lambda: None, kind="ghost")
         copy_btn.pack(side="right")
@@ -1786,10 +1716,10 @@ class CleanPanel(Panel):
         scroll_x.grid(row=2, column=0, sticky="ew")
         wrap.rowconfigure(1, weight=1)
         wrap.columnconfigure(0, weight=1)
-        self.list.tag_configure("file", foreground="#9aa4b2")
-        self.list.tag_configure("dir", foreground="#7aa2ff")
-        self.list.tag_configure("error", foreground="#ff6b6b")
-        self.list.tag_configure("head", foreground=FG, font=("Consolas", 9, "bold"))
+        self.list.tag_configure("file", foreground=TAG_FILE)
+        self.list.tag_configure("dir", foreground=TAG_DIR)
+        self.list.tag_configure("error", foreground=tc("log_err"))
+        self.list.tag_configure("head", foreground=FG, font=mono_font(9, "bold"))
         self.list.tag_configure("hint", foreground=MUTED)
         self.attach_copy(self.list, label="Список", readonly=True)
         self._write("Список пуст. Выберите папку и нажмите «Проверить».\n", "hint")
@@ -1981,7 +1911,7 @@ class DnsPanel(Panel):
         head = tk.Frame(inner, bg=CARD)
         head.pack(fill="x")
         tk.Label(head, text="Текущее состояние", bg=CARD, fg=FG,
-                 font=("Segoe UI", 10, "bold")).pack(side="left")
+                 font=ui_font(10, "bold")).pack(side="left")
         self.refresh_btn = flat_button(head, "Обновить", self.refresh_state, kind="ghost",
                                        padx=px(10), pady=px(4))
         self.refresh_btn.pack(side="right")
@@ -1997,9 +1927,9 @@ class DnsPanel(Panel):
             row = tk.Frame(inner, bg=CARD)
             row.pack(fill="x", pady=(px(8) if title == "Адаптер:" else px(3), 0))
             tk.Label(row, text=title, bg=CARD, fg=MUTED, width=12, anchor="w",
-                     font=("Segoe UI", 9)).pack(side="left")
+                     font=ui_font(9)).pack(side="left")
             tk.Label(row, textvariable=variable, bg=CARD, fg=FG, anchor="w",
-                     font=("Segoe UI", 9)).pack(side="left")
+                     font=ui_font(9)).pack(side="left")
 
         buttons_one = ttk.Frame(self)
         buttons_one.pack(fill="x", pady=(px(14), px(6)))
@@ -3132,21 +3062,21 @@ class GitHubPanel(Panel):
         body = tk.Frame(win, bg=CARD, padx=px(22), pady=px(18))
         body.pack(fill="both", expand=True)
         tk.Label(body, text="Токен GitHub", bg=CARD, fg=FG,
-                 font=("Segoe UI", 12, "bold"), anchor="w").pack(fill="x")
+                 font=ui_font(12, "bold"), anchor="w").pack(fill="x")
         tk.Label(
             body,
             text=("Удаление репозиториев требует права delete_repo. Создайте "
                   "classic PAT со scope repo и delete_repo, скопируйте его и "
                   "вставьте здесь — приложение заменит токен в hosts.yml GitHub CLI."),
             bg=CARD, fg=MUTED, justify="left", anchor="w",
-            wraplength=px(520), font=("Segoe UI", 9),
+            wraplength=px(520), font=ui_font(9),
         ).pack(fill="x", pady=(px(10), 0))
 
         tk.Label(body, text=f"Сейчас: {mask_token(current)}", bg=CARD, fg=ACCENT,
-                 anchor="w", font=("Consolas", 9)).pack(fill="x", pady=(px(10), 0))
+                 anchor="w", font=mono_font(9)).pack(fill="x", pady=(px(10), 0))
 
         link = tk.Label(body, text="Создать токен на GitHub ↗", bg=CARD, fg=ACCENT,
-                        cursor="hand2", font=("Segoe UI", 9, "underline"), anchor="w")
+                        cursor="hand2", font=ui_font(9, "underline"), anchor="w")
         link.pack(fill="x", pady=(px(6), 0))
         link.bind(
             "<Button-1>",
@@ -3675,7 +3605,8 @@ def _round_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
 class Switch(tk.Canvas):
     """Переключатель в стиле iOS: скруглённый трек + белый кружок."""
 
-    def __init__(self, parent, value: bool = False, command=None, *, bg: str = CARD):
+    def __init__(self, parent, value: bool = False, command=None, *, bg: str | None = None):
+        bg = bg or CARD
         self._tw, self._th = px(46), px(26)
         super().__init__(parent, width=self._tw, height=self._th, bg=bg,
                          highlightthickness=0, cursor="hand2")
@@ -3688,9 +3619,9 @@ class Switch(tk.Canvas):
     def _draw(self) -> None:
         self.delete("all")
         if not self.enabled:
-            track = "#2a2f39"
+            track = TRACK_DISABLED
         else:
-            track = OK if self.value else "#3a4150"
+            track = OK if self.value else TRACK_OFF
         _round_rect(self, 1, 1, self._tw - 1, self._th - 1, (self._th - 2) / 2,
                     fill=track, outline="")
         radius = (self._th - 8) / 2
@@ -3698,7 +3629,7 @@ class Switch(tk.Canvas):
         center_x = (self._tw - 4 - radius) if self.value else (4 + radius)
         self.create_oval(center_x - radius, center_y - radius,
                          center_x + radius, center_y + radius,
-                         fill="#ffffff", outline="")
+                         fill=KNOB, outline="")
 
     def set(self, value: bool, *, notify: bool = False) -> None:
         self.value = bool(value)
@@ -3720,14 +3651,16 @@ class Switch(tk.Canvas):
 class Segmented(tk.Canvas):
     """Сегментированный контрол в стиле macOS."""
 
-    def __init__(self, parent, options, value, command, *, bg: str = BG):
+    def __init__(self, parent, options, value, command, *, bg: str | None = None):
         import tkinter.font as tkfont
+
+        bg = bg or BG
 
         self.options = list(options)
         self.value = value
         self.command = command
         self.enabled = True
-        self._font = ("Segoe UI", 9, "bold")
+        self._font = ui_font(9, "bold")
         metrics = tkfont.Font(font=self._font)
         self._widths = [max(px(132), metrics.measure(label) + px(38))
                         for _key, label in self.options]
@@ -3748,10 +3681,10 @@ class Segmented(tk.Canvas):
             if active:
                 _round_rect(self, x, px(3), x + width - px(3), self._h - px(3),
                             (self._h - px(6)) / 2,
-                            fill=ACCENT if self.enabled else "#2b303a", outline="")
+                            fill=ACCENT if self.enabled else BORDER, outline="")
             self.create_text(
                 x + (width - px(3)) / 2, self._h / 2, text=label,
-                fill="#ffffff" if (active and self.enabled) else MUTED,
+                fill=tc("on_accent") if (active and self.enabled) else MUTED,
                 font=self._font,
             )
             x += width
@@ -3783,13 +3716,13 @@ class AppRow(tk.Frame):
     """Строка программы: аватар, имя, путь, бейдж «запущена», галочка."""
 
     def __init__(self, parent, entry: AppEntry, selected: bool, on_toggle, *,
-                 bg: str = CARD):
+                 bg: str | None = None):
+        bg = bg or CARD
         super().__init__(parent, bg=bg)
         self.entry = entry
         self.selected = bool(selected)
         self.on_toggle = on_toggle
         self._bg = bg
-        self._hover = CARD_HOVER
         self._parts: list[tk.Widget] = []
 
         # Полоска слева: сразу видно, какие программы уже выбраны.
@@ -3805,20 +3738,20 @@ class AppRow(tk.Frame):
         body.pack(side="left", fill="x", expand=True)
         self._parts.append(body)
         self.name_label = tk.Label(body, text=entry.name, bg=bg, fg=FG,
-                                   font=("Segoe UI", 10, "bold"), anchor="w")
+                                   font=ui_font(10, "bold"), anchor="w")
         self.name_label.pack(fill="x")
         self._parts.append(self.name_label)
         subtitle = entry.path or entry.exe
         if len(subtitle) > 78:
             subtitle = subtitle[:36] + "…" + subtitle[-38:]
         self.path_label = tk.Label(body, text=subtitle, bg=bg, fg=MUTED,
-                                   font=("Segoe UI", 8), anchor="w")
+                                   font=ui_font(8), anchor="w")
         self.path_label.pack(fill="x")
         self._parts.append(self.path_label)
 
         if entry.running:
             badge = tk.Label(self, text="запущена", bg=bg, fg=OK,
-                             font=("Segoe UI", 8, "bold"))
+                             font=ui_font(8, "bold"))
             badge.pack(side="right", padx=(0, px(10)))
             self._parts.append(badge)
 
@@ -3834,7 +3767,7 @@ class AppRow(tk.Frame):
         self._paint()
 
     def _base_color(self) -> str:
-        return "#1a2333" if self.selected else self._bg
+        return ROW_SELECTED if self.selected else CARD
 
     def _paint(self) -> None:
         self._tint(self._base_color())
@@ -3843,13 +3776,13 @@ class AppRow(tk.Frame):
         color = AVATAR_COLORS[sum(self.entry.exe.lower().encode()) % len(AVATAR_COLORS)]
         self.avatar.create_oval(1, 1, px(33), px(33), fill=color, outline="")
         letter = (self.entry.name or self.entry.exe)[:1].upper()
-        self.avatar.create_text(px(17), px(17), text=letter, fill="#0d0f13",
-                                font=("Segoe UI", 12, "bold"))
+        self.avatar.create_text(px(17), px(17), text=letter, fill=ON_AVATAR,
+                                font=ui_font(12, "bold"))
         self.box.delete("all")
         if self.selected:
             _round_rect(self.box, 1, 1, px(21), px(21), px(6), fill=ACCENT, outline="")
-            self.box.create_text(px(11), px(11), text="✓", fill="#ffffff",
-                                 font=("Segoe UI", 10, "bold"))
+            self.box.create_text(px(11), px(11), text="✓", fill=tc("on_accent"),
+                                 font=ui_font(10, "bold"))
         else:
             _round_rect(self.box, 1, 1, px(21), px(21), px(6), fill="", outline=BORDER,
                         width=2)
@@ -3862,7 +3795,7 @@ class AppRow(tk.Frame):
                 pass
 
     def _enter(self, _event=None) -> None:
-        self._tint(self._hover)
+        self._tint(CARD_HOVER)
 
     def _leave(self, _event=None) -> None:
         self._tint(self._base_color())
@@ -3880,7 +3813,8 @@ class AppRow(tk.Frame):
 class ScrollList(tk.Frame):
     """Прокручиваемый контейнер для строк списка."""
 
-    def __init__(self, parent, *, bg: str = CARD):
+    def __init__(self, parent, *, bg: str | None = None):
+        bg = bg or CARD
         super().__init__(parent, bg=bg)
         self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
         self.bar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
@@ -3916,7 +3850,7 @@ class ScrollList(tk.Frame):
 
     def _scroll(self, event) -> None:
         try:
-            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+            self.canvas.yview_scroll(int(-event.delta / 120) * _scroll_step(), "units")
         except tk.TclError:
             pass
 
@@ -3974,8 +3908,8 @@ class BypassPanel(Panel):
     # -- разметка ----------------------------------------------------------- #
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=4)
-        self.rowconfigure(5, weight=1)
+        self.rowconfigure(4, weight=4)   # список программ
+        self.rowconfigure(6, weight=1)   # лог
 
         top = tk.Frame(self, bg=BG)
         top.grid(row=0, column=0, sticky="ew")
@@ -3985,7 +3919,7 @@ class BypassPanel(Panel):
         )
         self.scope_control.pack(side="left")
         self.scope_hint = tk.Label(
-            top, text="", bg=BG, fg=MUTED, font=("Segoe UI", 9), anchor="w",
+            top, text="", bg=BG, fg=MUTED, font=ui_font(9), anchor="w",
             justify="left",
         )
         self.scope_hint.pack(side="left", padx=(px(14), 0), fill="x", expand=True)
@@ -3996,13 +3930,35 @@ class BypassPanel(Panel):
         cards.columnconfigure(1, weight=1)
         self.cards = {
             "happ": self._engine_card(cards, 0, "happ", "Happ",
-                                      "VPN + обход по выбранным программам"),
+                                      "VPN: весь трафик через Happ"),
             "gbd": self._engine_card(cards, 1, "gbd", "GoodbyeDPI",
                                      "обход DPI для всего интернета"),
         }
 
+        # Отдельная карточка «Обход по программам» — разграничение с VPN:
+        # ProxiFyre направляет выбранные программы в SOCKS Happ, VPN не трогает.
+        apps_route = tk.Frame(self, bg=CARD, highlightbackground=BORDER,
+                              highlightthickness=1)
+        apps_route.grid(row=2, column=0, sticky="ew", pady=(px(10), 0))
+        ar_head = tk.Frame(apps_route, bg=CARD)
+        ar_head.pack(fill="x", padx=px(14), pady=(px(12), 0))
+        ar_text = tk.Frame(ar_head, bg=CARD)
+        ar_text.pack(side="left", fill="x", expand=True)
+        tk.Label(ar_text, text="Обход по программам", bg=CARD, fg=FG,
+                 font=ui_font(10, "bold"), anchor="w").pack(fill="x")
+        tk.Label(ar_text, text="выбранные программы — через прокси Happ "
+                  "(ProxiFyre), сам VPN не включается и не выключается",
+                 bg=CARD, fg=MUTED, font=ui_font(8), anchor="w").pack(fill="x")
+        self.apps_route_switch = Switch(ar_head, False, self._on_apps_route,
+                                        bg=CARD)
+        self.apps_route_switch.pack(side="right")
+        self.apps_route_status = tk.Label(apps_route, text="проверяю…", bg=CARD,
+                                          fg=MUTED, font=ui_font(9), anchor="w",
+                                          justify="left", wraplength=px(640))
+        self.apps_route_status.pack(fill="x", padx=px(14), pady=(px(8), px(12)))
+
         tools = tk.Frame(self, bg=BG)
-        tools.grid(row=2, column=0, sticky="ew", pady=(px(8), 0))
+        tools.grid(row=3, column=0, sticky="ew", pady=(px(8), 0))
         self.btn_happ_path = flat_button(tools, "Путь Happ…", self.configure_dialog,
                                          kind="ghost")
         self.btn_happ_path.pack(side="left")
@@ -4025,27 +3981,27 @@ class BypassPanel(Panel):
         self.btn_check_ip.pack(side="right", padx=(0, px(8)))
 
         self.apps_card = self._apps_card(self)
-        self.apps_card.grid(row=3, column=0, sticky="nsew", pady=(px(10), 0))
+        self.apps_card.grid(row=4, column=0, sticky="nsew", pady=(px(10), 0))
 
         status = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        status.grid(row=4, column=0, sticky="ew", pady=(px(10), 0))
+        status.grid(row=5, column=0, sticky="ew", pady=(px(10), 0))
         inner = tk.Frame(status, bg=CARD)
         inner.pack(fill="x", padx=px(14), pady=px(10))
         self.dot_var = tk.StringVar(value="○")
         self.dot_label = tk.Label(inner, textvariable=self.dot_var, bg=CARD, fg=MUTED,
-                                  font=("Segoe UI", 12, "bold"), width=2)
+                                  font=ui_font(12, "bold"), width=2)
         self.dot_label.pack(side="left")
         self.headline_var = tk.StringVar(value="проверяю…")
         tk.Label(inner, textvariable=self.headline_var, bg=CARD, fg=FG,
-                 font=("Segoe UI", 10, "bold"), anchor="w").pack(side="left")
+                 font=ui_font(10, "bold"), anchor="w").pack(side="left")
         self.detail_var = tk.StringVar(value="")
         tk.Label(inner, textvariable=self.detail_var, bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 9), anchor="w", justify="left",
+                 font=ui_font(9), anchor="w", justify="left",
                  wraplength=px(640)).pack(side="left", fill="x", expand=True,
                                           padx=(px(12), 0))
 
         log_frame, self.log_box = self.make_log(self, height=5)
-        log_frame.grid(row=5, column=0, sticky="nsew", pady=(px(10), 0))
+        log_frame.grid(row=6, column=0, sticky="nsew", pady=(px(10), 0))
         self.append_log(self.log_box, "Проверяю движки и локальный SOCKS Happ…")
 
     def _engine_card(self, parent, column: int, key: str, title: str,
@@ -4062,16 +4018,16 @@ class BypassPanel(Panel):
         avatar.pack(side="left")
         _round_rect(avatar, 1, 1, px(29), px(29), px(9), fill=CARD_HOVER, outline="")
         avatar.create_text(px(15), px(15), text=title[:1], fill=FG,
-                           font=("Segoe UI", 12, "bold"))
+                           font=ui_font(12, "bold"))
 
         text = tk.Frame(head, bg=CARD, cursor="hand2")
         text.pack(side="left", padx=(px(10), 0), fill="x", expand=True)
         title_label = tk.Label(text, text=title, bg=CARD, fg=FG,
-                               font=("Segoe UI", 10, "bold"), anchor="w",
+                               font=ui_font(10, "bold"), anchor="w",
                                cursor="hand2")
         title_label.pack(fill="x")
         subtitle_label = tk.Label(text, text=subtitle, bg=CARD, fg=MUTED,
-                                  font=("Segoe UI", 8), anchor="w", cursor="hand2")
+                                  font=ui_font(8), anchor="w", cursor="hand2")
         subtitle_label.pack(fill="x")
 
         switch = Switch(head, False, lambda value, k=key: self._on_switch(k, value),
@@ -4079,7 +4035,7 @@ class BypassPanel(Panel):
         switch.pack(side="right")
 
         status_label = tk.Label(card, text="проверяю…", bg=CARD, fg=MUTED,
-                                font=("Segoe UI", 9), anchor="w", justify="left",
+                                font=ui_font(9), anchor="w", justify="left",
                                 wraplength=px(300), cursor="hand2")
         status_label.pack(fill="x", padx=px(14), pady=(px(8), px(12)))
 
@@ -4093,10 +4049,10 @@ class BypassPanel(Panel):
         head = tk.Frame(card, bg=CARD)
         head.pack(fill="x", padx=px(14), pady=(px(12), px(6)))
         tk.Label(head, text="Программы через обход", bg=CARD, fg=FG,
-                 font=("Segoe UI", 10, "bold")).pack(side="left")
+                 font=ui_font(10, "bold")).pack(side="left")
         self.count_var = tk.StringVar(value="выбрано 0")
         tk.Label(head, textvariable=self.count_var, bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(side="left", padx=(px(10), 0))
+                 font=ui_font(9)).pack(side="left", padx=(px(10), 0))
         self.only_bypass_btn = flat_button(
             head, "Только обход", self._toggle_only_bypass, kind="ghost")
         self.only_bypass_btn.pack(side="right")
@@ -4110,17 +4066,17 @@ class BypassPanel(Panel):
                               highlightthickness=1)
         search_row.pack(fill="x", padx=px(14), pady=(0, px(8)))
         tk.Label(search_row, text="⌕", bg=FIELD, fg=MUTED,
-                 font=("Segoe UI", 12)).pack(side="left", padx=(px(10), px(4)))
+                 font=ui_font(12)).pack(side="left", padx=(px(10), px(4)))
         self.search_var = tk.StringVar()
         self.search_entry = tk.Entry(
             search_row, textvariable=self.search_var, bg=FIELD, fg=FG,
-            insertbackground=FG, relief="flat", bd=0, font=("Segoe UI", 10),
+            insertbackground=FG, relief="flat", bd=0, font=ui_font(10),
             highlightthickness=0,
         )
         self.search_entry.pack(side="left", fill="x", expand=True, pady=px(7))
         self.search_var.trace_add("write", lambda *_args: self._on_search())
         self.placeholder = tk.Label(search_row, text="Поиск программы — имя или путь",
-                                    bg=FIELD, fg="#5f6773", font=("Segoe UI", 10),
+                                    bg=FIELD, fg=tc("label_tertiary"), font=ui_font(10),
                                     cursor="xterm")
         self.placeholder.place(in_=self.search_entry, x=px(2), rely=0.5, anchor="w")
         self.search_entry.bind("<Button-1>", lambda _e: self.placeholder.place_forget())
@@ -4132,7 +4088,7 @@ class BypassPanel(Panel):
         self.app_list = ScrollList(card, bg=CARD)
         self.app_list.pack(fill="both", expand=True, padx=px(6), pady=(0, px(4)))
         self.empty_label = tk.Label(
-            card, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 9),
+            card, text="", bg=CARD, fg=MUTED, font=ui_font(9),
             anchor="w", justify="left", wraplength=px(700),
         )
         self.empty_label.pack(fill="x", padx=px(14), pady=(0, px(10)))
@@ -4387,6 +4343,22 @@ class BypassPanel(Panel):
         else:
             self._start_mode(mode)
 
+    def _on_apps_route(self, value: bool) -> None:
+        """Переключатель «Обход по программам»: только ProxiFyre, VPN не трогаем."""
+        if self.busy:
+            self._sync_switches()
+            return
+        if value:
+            if not self.selected_apps:
+                self.hub.toast("Отметьте программы в списке ниже", kind="warn")
+                self.apps_route_switch.set(False)
+                return
+            self._run(bypass_apps_route_enable, "включаю обход по программам…",
+                      "Включаю обход по программам (ProxiFyre)")
+        else:
+            self._run(bypass_apps_route_disable, "выключаю обход по программам…",
+                      "Выключаю обход по программам")
+
     # -- статус -------------------------------------------------------------- #
     def _poll_state(self, scope: str) -> dict:
         """Опрос состояния + автоисцеление в ОДНОМ фоновом потоке.
@@ -4570,10 +4542,13 @@ class BypassPanel(Panel):
         self.dot_label.configure(fg=MUTED)
         for card in self.cards.values():
             card["status"].configure(text="состояние неизвестно", fg=MUTED)
+        self.apps_route_status.configure(text="состояние неизвестно", fg=MUTED)
 
     def _sync_switches(self) -> None:
         for mode, card in self.cards.items():
             card["switch"].set(self._engine_on(mode))
+        pf = self.state.get("proxyfyre") or {}
+        self.apps_route_switch.set(bool(pf.get("running")))
 
     def _update_controls(self) -> None:
         happ = self.state.get("happ") or {}
@@ -4611,17 +4586,30 @@ class BypassPanel(Panel):
                 text="Весь трафик через Happ: TUN-адаптер и системный прокси."
             )
 
-        # секция программ
-        show_apps = self.scope == "apps"
-        if show_apps:
-            if not self.apps_card.winfo_manager():
-                self.apps_card.grid(row=3, column=0, sticky="nsew", pady=(px(10), 0))
-            self.rowconfigure(3, weight=4)
-            self.rowconfigure(5, weight=1)
+        # карточка «Обход по программам»: живёт независимо от VPN,
+        # состояние берём из статуса службы ProxiFyre
+        pf = self.state.get("proxyfyre") or {}
+        ar_on = bool(pf.get("running"))
+        self.apps_route_switch.set(ar_on)
+        self.apps_route_switch.set_enabled(not self.busy)
+        if not pf.get("installed", True):
+            self.apps_route_status.configure(
+                text="ProxiFyre не установлен — включите Happ с областью "
+                     "«Только программы», он установится автоматически",
+                fg=WARN)
+        elif ar_on:
+            count = len(pf.get("apps") or [])
+            self.apps_route_status.configure(
+                text=f"включён — перенаправляется программ: {count}"
+                     + (" (список изменился — перезапуск службы)"
+                        if pf.get("pending") else ""),
+                fg=OK)
         else:
-            self.apps_card.grid_remove()
-            self.rowconfigure(3, weight=0)   # иначе пустая дыра на месте списка
-            self.rowconfigure(5, weight=1)
+            self.apps_route_status.configure(
+                text="выключен — маршрутизации по программам нет",
+                fg=MUTED)
+
+        # секция программ — нужна и для «Обхода по программам», поэтому видна всегда
         self.count_var.set(f"выбрано {len(self.selected_apps)} из {len(self.catalog)}")
 
         # кнопки
@@ -4631,7 +4619,7 @@ class BypassPanel(Panel):
             state="disabled" if self.busy or self.checking else "normal")
         if hasattr(self, "btn_catch"):
             self.btn_catch.configure(
-                state="normal" if (self.scope == "apps" and not self.busy) else "disabled"
+                state="normal" if not self.busy else "disabled"
             )
         if hasattr(self, "btn_check_ip"):
             self.btn_check_ip.configure(
@@ -4795,7 +4783,7 @@ class BypassPanel(Panel):
         dialog.grab_set()
 
         tk.Label(dialog, text="Файл Happ.exe (клиент Happ):", bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=px(16), pady=(px(14), px(4)))
+                 font=ui_font(9)).pack(anchor="w", padx=px(16), pady=(px(14), px(4)))
         path_var = tk.StringVar(value=cfg["happ_path"])
         entry = tk.Entry(dialog, textvariable=path_var, bg=FIELD, fg=FG,
                          insertbackground=FG, relief="flat", width=52)
@@ -5083,7 +5071,7 @@ class LeadsPanel(Panel):
 
         def caption(row: int, column: int, text: str) -> None:
             tk.Label(body, text=text, bg=CARD, fg=MUTED, anchor="w",
-                     font=("Segoe UI", 9)).grid(
+                     font=ui_font(9)).grid(
                 row=row, column=column, sticky="w", padx=(0, px(8)), pady=px(5))
 
         caption(0, 0, "Город")
@@ -5106,7 +5094,7 @@ class LeadsPanel(Panel):
         ttk.Entry(body, textvariable=self.reviews_var, width=8).grid(
             row=1, column=3, sticky="w", padx=(px(16), 0), pady=px(5))
         tk.Label(body, text="12 фирм на страницу выдачи 2ГИС", bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 8)).grid(row=2, column=0, columnspan=4, sticky="w")
+                 font=ui_font(8)).grid(row=2, column=0, columnspan=4, sticky="w")
 
         options = tk.Frame(body, bg=CARD)
         options.grid(row=3, column=0, columnspan=4, sticky="w", pady=(px(8), 0))
@@ -5403,8 +5391,9 @@ class LeadsPanel(Panel):
         if not iid:
             return
         self.result_tree.selection_set(iid)
-        menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG, activebackground=ACCENT,
-                       activeforeground="#0d1117", bd=0)
+        menu = tk.Menu(self, tearoff=0, bg=CARD, fg=FG,
+                       activebackground=tc("accent_fill"),
+                       activeforeground=tc("on_accent"), bd=0)
         for title, url in self._row_links.get(iid, []):
             menu.add_command(label=f"{title}: {url}",
                              command=lambda u=url: webbrowser.open(u))
@@ -5458,7 +5447,7 @@ class MailWindow(tk.Toplevel):
             f"{win_w}x{win_h}+{max(0, (sw - win_w) // 2)}+{max(0, (sh - win_h) // 3)}")
         self.minsize(min(px(760), win_w), min(px(560), win_h))
         self.configure(bg=BG)
-        self.option_add("*Font", ("Segoe UI", 9))
+        self.option_add("*Font", ui_font(9))
         apply_dark_theme(self)
 
         self.settings = leads_mail.load_settings(self.settings_path)
@@ -5512,7 +5501,7 @@ class MailWindow(tk.Toplevel):
         canvas.bind("<Configure>", _fit)
 
         def _wheel(event):
-            canvas.yview_scroll(int(-event.delta / 120), "units")
+            canvas.yview_scroll(int(-event.delta / 120) * _scroll_step(), "units")
             return "break"
 
         canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
@@ -5931,27 +5920,27 @@ class ShortsAutopilotPanel(Panel):
         # Карточка 1: Служба Shorts Autopilot
         c1 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
         c1.grid(row=0, column=0, sticky="nsew", padx=(0, px(6)))
-        tk.Label(c1, text="Служба Autopilot", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        self.lbl_svc_status = tk.Label(c1, text="○ Остановлен", bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"))
+        tk.Label(c1, text="Служба Autopilot", bg=CARD, fg=MUTED, font=ui_font(9)).pack(anchor="w")
+        self.lbl_svc_status = tk.Label(c1, text="○ Остановлен", bg=CARD, fg=FG, font=ui_font(12, "bold"))
         self.lbl_svc_status.pack(anchor="w", pady=(px(4), 0))
-        self.lbl_svc_pid = tk.Label(c1, text="Фоновый мониторинг ссылок", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_svc_pid = tk.Label(c1, text="Фоновый мониторинг ссылок", bg=CARD, fg=MUTED, font=ui_font(8))
         self.lbl_svc_pid.pack(anchor="w")
 
         # Карточка 2: Веб-панель
         c2 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
         c2.grid(row=0, column=1, sticky="nsew", padx=px(4))
-        tk.Label(c2, text="Веб-панель (UI)", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        self.lbl_web_status = tk.Label(c2, text="○ Офлайн", bg=CARD, fg=MUTED, font=("Segoe UI", 12, "bold"))
+        tk.Label(c2, text="Веб-панель (UI)", bg=CARD, fg=MUTED, font=ui_font(9)).pack(anchor="w")
+        self.lbl_web_status = tk.Label(c2, text="○ Офлайн", bg=CARD, fg=MUTED, font=ui_font(12, "bold"))
         self.lbl_web_status.pack(anchor="w", pady=(px(4), 0))
-        tk.Label(c2, text="http://127.0.0.1:8765", bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w")
+        tk.Label(c2, text="http://127.0.0.1:8765", bg=CARD, fg=MUTED, font=ui_font(8)).pack(anchor="w")
 
         # Карточка 3: DaVinci Resolve
         c3 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
         c3.grid(row=0, column=2, sticky="nsew", padx=(px(6), 0))
-        tk.Label(c3, text="DaVinci Resolve", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        self.lbl_davinci_status = tk.Label(c3, text="○ Закрыт", bg=CARD, fg=MUTED, font=("Segoe UI", 12, "bold"))
+        tk.Label(c3, text="DaVinci Resolve", bg=CARD, fg=MUTED, font=ui_font(9)).pack(anchor="w")
+        self.lbl_davinci_status = tk.Label(c3, text="○ Закрыт", bg=CARD, fg=MUTED, font=ui_font(12, "bold"))
         self.lbl_davinci_status.pack(anchor="w", pady=(px(4), 0))
-        self.lbl_davinci_info = tk.Label(c3, text="Timeline: 1080x1920 @ 60 fps", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_davinci_info = tk.Label(c3, text="Timeline: 1080x1920 @ 60 fps", bg=CARD, fg=MUTED, font=ui_font(8))
         self.lbl_davinci_info.pack(anchor="w")
 
         # -- Кнопки управления --
@@ -6259,7 +6248,12 @@ def save(result):
         'period': result.period,
         'source': result.source,
         'subjects': [
-            {'name': s.name, 'marks': list(s.marks), 'period': s.period,
+            {'name': s.name,
+             # Mark наследует int: list(s.marks) в JSON пишет голые числа и
+             # молча теряет вес «5₂», из-за чего средний разошёлся с дневником.
+             'marks': [m.to_dict_or_int() if hasattr(m, 'to_dict_or_int') else int(m)
+                       for m in s.marks],
+             'period': s.period,
              'official_average': getattr(s, 'official_average', '')}
             for s in subjects
         ],
@@ -6332,7 +6326,11 @@ try:
         'period': config.current_period().label,
         'source': 'import',
         'subjects': [
-            {'name': s.name, 'marks': list(s.marks), 'period': s.period,
+            {'name': s.name,
+             # Как и в fetch-мосту: сохраняем вес оценки, не голый int.
+             'marks': [m.to_dict_or_int() if hasattr(m, 'to_dict_or_int') else int(m)
+                       for m in s.marks],
+             'period': s.period,
              'official_average': getattr(s, 'official_average', '')}
             for s in subjects
         ],
@@ -6356,10 +6354,10 @@ class DiaryGradesPanel(Panel):
         ("До 5-ки", 80, 0),
         ("Запас прочности", 145, 2),
     )
-    BADGES = {
-        "red": ("#4a1f24", "#ff8a8a"),
-        "yellow": ("#4a3a12", "#ffd166"),
-        "green": ("#14432c", "#a7f3c4"),
+    BADGE_ROLES = {
+        "red": ("badge_bad_bg", "badge_bad_ink"),
+        "yellow": ("badge_warn_bg", "badge_warn_ink"),
+        "green": ("badge_good_bg", "badge_good_ink"),
     }
 
     def __init__(self, master: tk.Misc, hub) -> None:
@@ -6371,6 +6369,7 @@ class DiaryGradesPanel(Panel):
         self.filtered = []
         self._row_widgets: list[list[tk.Label]] = []
         self._selected_index = -1
+        self._sort_mode = "average"  # "average" | "alpha"
         self.source_label = "—"
         self.demo_note = ""
         self.period_label = "—"
@@ -6391,9 +6390,9 @@ class DiaryGradesPanel(Panel):
         frame.grid(row=0, column=column, sticky="nsew",
                    padx=(0 if column == 0 else px(6), 0))
         tk.Label(frame, text=title, bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 8), anchor="w").pack(fill="x")
+                 font=ui_font(8), anchor="w").pack(fill="x")
         label = tk.Label(frame, text="—", bg=CARD, fg=FG,
-                         font=("Segoe UI", 11, "bold"), anchor="w")
+                         font=ui_font(11, "bold"), anchor="w")
         label.pack(fill="x", pady=(px(3), 0))
         return label
 
@@ -6426,12 +6425,15 @@ class DiaryGradesPanel(Panel):
             side="left", padx=(px(6), 0))
         flat_button(toolbar, "Импорт", self._import_file, kind="ghost").pack(
             side="left", padx=(px(6), 0))
+        self.btn_sort = flat_button(toolbar, "Сортировка: по среднему", self._on_sort,
+                                    kind="ghost")
+        self.btn_sort.pack(side="left", padx=(px(6), 0))
         flat_button(toolbar, "Папка", self._open_folder, kind="ghost").pack(side="right")
         self.search_var = tk.StringVar()
         ttk.Entry(toolbar, textvariable=self.search_var, width=12).pack(
             side="right", padx=(0, px(6)))
         tk.Label(toolbar, text="Поиск:", bg=BG, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(side="right", padx=(0, px(6)))
+                 font=ui_font(9)).pack(side="right", padx=(0, px(6)))
         self.search_var.trace_add("write", lambda *_: self._render_rows())
 
         table = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
@@ -6445,7 +6447,7 @@ class DiaryGradesPanel(Panel):
         self._configure_columns(head)
         for index, (name, _size, _weight) in enumerate(self.COLUMNS):
             tk.Label(head, text=name, bg=FIELD, fg=MUTED, anchor="w",
-                     font=("Segoe UI", 9, "bold")).grid(
+                     font=ui_font(9, "bold")).grid(
                 row=0, column=index, sticky="ew", padx=px(8))
 
         self.canvas = tk.Canvas(table, bg=CARD, bd=0, highlightthickness=0)
@@ -6468,14 +6470,14 @@ class DiaryGradesPanel(Panel):
         details = tk.Frame(self, bg=BG)
         details.grid(row=3, column=0, sticky="ew", pady=(px(10), 0))
         tk.Label(details, text="Разбор расчёта — клик по строке таблицы",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 8), anchor="w").pack(fill="x")
+                 bg=BG, fg=MUTED, font=ui_font(8), anchor="w").pack(fill="x")
         self.details = dark_text(details, height=5)
         self.details.pack(fill="x")
         self.details.configure(state="disabled")
 
         self.footer_var = tk.StringVar(value="—")
         tk.Label(self, textvariable=self.footer_var, bg=BG, fg=MUTED,
-                 font=("Segoe UI", 8), anchor="w").grid(row=4, column=0, sticky="ew")
+                 font=ui_font(8), anchor="w").grid(row=4, column=0, sticky="ew")
 
         log_frame, self.log_box = self.make_log(self, height=4, label="Журнал дневника")
         log_frame.grid(row=5, column=0, sticky="ew", pady=(px(8), 0))
@@ -6526,7 +6528,8 @@ class DiaryGradesPanel(Panel):
             self._log("Кэша нет: показаны демо-данные, это не реальные оценки.", "warn")
 
         try:
-            self.reports = self.gm.sort_reports(self.gm.build_reports(subjects))
+            self.reports = self.gm.sort_reports(
+                self.gm.build_reports(subjects), self._sort_mode)
         except (ValueError, TypeError) as exc:
             self.reports = []
             self._log(f"Ошибка расчёта: {exc}", "error")
@@ -6634,10 +6637,11 @@ class DiaryGradesPanel(Panel):
         now = time.monotonic()
         if not self._last_fetch:
             self._last_fetch = now
-            if not self._initial_fetch_done and self._cache_has_gaps():
-                self._initial_fetch_done = True
-                self._start_bg("Догружаем все предметы после входа…",
-                               _DIARY_FETCH_CODE, (), 240)
+            self._initial_fetch_done = True
+            # При каждом запуске хаба сразу подтягиваем свежие оценки,
+            # а не только когда в кэше остались пустые предметы.
+            self._start_bg("Автозагрузка оценок при запуске…",
+                           _DIARY_FETCH_CODE, (), 240)
             return
         if now - self._last_fetch < minutes * 60:
             return
@@ -6645,9 +6649,25 @@ class DiaryGradesPanel(Panel):
         self._start_bg("Автообновление всех предметов…", _DIARY_FETCH_CODE, (), 240)
 
     # -- таблица ----------------------------------------------------------- #
+    def _sort_label(self) -> str:
+        return ("Сортировка: по алфавиту" if self._sort_mode == "alpha"
+                else "Сортировка: по среднему")
+
+    def _on_sort(self) -> None:
+        """Переключает порядок строк: по среднему баллу ↔ по алфавиту."""
+        if self.gm is None:
+            return
+        self._sort_mode = "alpha" if self._sort_mode == "average" else "average"
+        self.btn_sort.configure(text=self._sort_label())
+        self.reports = self.gm.sort_reports(self.reports, self._sort_mode)
+        self._render_rows()
+        self._log("Порядок строк: " + ("по алфавиту" if self._sort_mode == "alpha"
+                                       else "от худшего среднего к лучшему"))
+
     def _on_wheel(self, event) -> None:
         try:
-            self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            self.canvas.yview_scroll(
+                (-1 if event.delta > 0 else 1) * _scroll_step(), "units")
         except (tk.TclError, AttributeError):
             pass
 
@@ -6666,9 +6686,10 @@ class DiaryGradesPanel(Panel):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         missing = sum(1 for r in self.reports if not r.count)
         tail = f"  ·  без оценок: {missing} (в периоде оценок нет)" if missing else ""
+        order = "по алфавиту" if self._sort_mode == "alpha" else "худшие сверху"
         self.footer_var.set(
             f"Показано {len(self.filtered)} из {len(self.reports)}  ·  порог 4.50  ·  "
-            f"худшие сверху  ·  {self.source_label}"
+            f"{order}  ·  {self.source_label}"
             + self.demo_note + tail)
         if self.filtered:
             self._select(0, self.filtered[0])
@@ -6680,8 +6701,8 @@ class DiaryGradesPanel(Panel):
     def _add_row(self, index: int, report) -> None:
         background = CARD if index % 2 == 0 else CARD_HOVER
         empty = not report.count and not getattr(report, "official_average", "")
-        badge_bg, badge_fg = (("#2a3040", MUTED) if empty
-                              else self.BADGES.get(report.badge, self.BADGES["red"]))
+        badge_bg, badge_fg = ((BADGE_NEUTRAL_BG, MUTED) if empty
+                              else badge_colors(report.badge))
         fives = "—" if report.on_five else f"{report.fives_needed} × «5»"
         if empty:
             avg_display = "—"
@@ -6708,14 +6729,14 @@ class DiaryGradesPanel(Panel):
         for column, value in enumerate(values):
             if column == 1:
                 label = tk.Label(self.rows_frame, text=value, bg=badge_bg, fg=badge_fg,
-                                 font=("Segoe UI", 9, "bold"), anchor="center",
+                                 font=ui_font(9, "bold"), anchor="center",
                                  padx=px(8), pady=px(3))
                 label.grid(row=index, column=column, sticky="w",
                            padx=px(8), pady=px(3))
             else:
                 label = tk.Label(self.rows_frame, text=value, bg=background,
                                  fg=FG if column == 0 else MUTED,
-                                 font=("Segoe UI", 9, "bold" if column == 0 else "normal"),
+                                 font=ui_font(9, "bold" if column == 0 else "normal"),
                                  anchor="w", pady=px(5))
                 label.grid(row=index, column=column, sticky="ew", padx=px(8))
             label.bind("<Button-1>",
@@ -6729,7 +6750,7 @@ class DiaryGradesPanel(Panel):
         for row_index, widgets in enumerate(self._row_widgets):
             background = CARD if row_index % 2 == 0 else CARD_HOVER
             if row_index == index:
-                background = "#1e2636"
+                background = ROW_SELECTED
             for column, label in enumerate(widgets):
                 if column != 1:       # цветной бейдж среднего балла не закрашиваем
                     label.configure(bg=background)
@@ -6848,7 +6869,8 @@ class DiaryGradesPanel(Panel):
         if self.gm is None:
             return
         result = self.demo.demo_result(self.cfg.current_period().label)
-        self.reports = self.gm.sort_reports(self.gm.build_reports(result.subjects))
+        self.reports = self.gm.sort_reports(
+            self.gm.build_reports(result.subjects), self._sort_mode)
         self.source_label = "ДЕМО-ДАННЫЕ"
         self.demo_note = "  ·  не реальные оценки"
         self.period_label = result.period
@@ -6919,26 +6941,26 @@ class AIScreenAgentPanel(Panel):
 
         c1 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
         c1.grid(row=0, column=0, sticky="nsew", padx=(0, px(6)))
-        tk.Label(c1, text="Статус агента", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        self.lbl_status = tk.Label(c1, text="○ Остановлен", bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"))
+        tk.Label(c1, text="Статус агента", bg=CARD, fg=MUTED, font=ui_font(9)).pack(anchor="w")
+        self.lbl_status = tk.Label(c1, text="○ Остановлен", bg=CARD, fg=FG, font=ui_font(12, "bold"))
         self.lbl_status.pack(anchor="w", pady=(px(4), 0))
-        self.lbl_info = tk.Label(c1, text="Плавающее окно поверх тестов", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_info = tk.Label(c1, text="Плавающее окно поверх тестов", bg=CARD, fg=MUTED, font=ui_font(8))
         self.lbl_info.pack(anchor="w")
 
         c2 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
         c2.grid(row=0, column=1, sticky="nsew", padx=px(4))
-        tk.Label(c2, text="Интеллект (Мозг)", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        self.lbl_model = tk.Label(c2, text="Gemini 2.5 Flash", bg=CARD, fg=FG, font=("Segoe UI", 12, "bold"))
+        tk.Label(c2, text="Интеллект (Мозг)", bg=CARD, fg=MUTED, font=ui_font(9)).pack(anchor="w")
+        self.lbl_model = tk.Label(c2, text="Gemini 2.5 Flash", bg=CARD, fg=FG, font=ui_font(12, "bold"))
         self.lbl_model.pack(anchor="w", pady=(px(4), 0))
-        self.lbl_key = tk.Label(c2, text="Ключ не настроен", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_key = tk.Label(c2, text="Ключ не настроен", bg=CARD, fg=MUTED, font=ui_font(8))
         self.lbl_key.pack(anchor="w")
 
         c3 = tk.Frame(cards, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
         c3.grid(row=0, column=2, sticky="nsew", padx=(px(6), 0))
-        tk.Label(c3, text="Область экрана (Глаза)", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
-        self.lbl_roi = tk.Label(c3, text="Не выбрана", bg=CARD, fg=MUTED, font=("Segoe UI", 12, "bold"))
+        tk.Label(c3, text="Область экрана (Глаза)", bg=CARD, fg=MUTED, font=ui_font(9)).pack(anchor="w")
+        self.lbl_roi = tk.Label(c3, text="Не выбрана", bg=CARD, fg=MUTED, font=ui_font(12, "bold"))
         self.lbl_roi.pack(anchor="w", pady=(px(4), 0))
-        self.lbl_roi_hint = tk.Label(c3, text="Координаты теста на экране", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+        self.lbl_roi_hint = tk.Label(c3, text="Координаты теста на экране", bg=CARD, fg=MUTED, font=ui_font(8))
         self.lbl_roi_hint.pack(anchor="w")
 
         ctrl = tk.Frame(self, bg=CARD, highlightbackground=BORDER, highlightthickness=1, padx=px(14), pady=px(10))
@@ -6986,7 +7008,7 @@ class AIScreenAgentPanel(Panel):
         self.key_entry.bind("<Button-3>", _on_right_click)
 
         hint = tk.Label(ctrl, text="Подсказка: запустите окно агента, выделите рамку с тестом в браузере и нажмите СТАРТ.",
-                        bg=CARD, fg=MUTED, font=("Segoe UI", 8))
+                        bg=CARD, fg=MUTED, font=ui_font(8))
         hint.pack(anchor="w", pady=(px(6), 0))
 
         log_frame, self.log_box = self.make_log(self, height=14, label="Лог событий AI Screen Agent")
@@ -7119,7 +7141,7 @@ class AIScreenAgentPanel(Panel):
                         p_name = "● Ключ настроен"
                     self.lbl_key.config(text=p_name, fg=OK)
                 else:
-                    self.lbl_key.config(text="○ Ключ не настроен", fg="#ff8a8a")
+                    self.lbl_key.config(text="○ Ключ не настроен", fg=tc("err"))
 
                 self.lbl_model.config(text=cfg.get("model", "gemini-2.5-flash"))
 
@@ -7159,6 +7181,7 @@ NAV = (
     ("shorts", "Shorts Autopilot", "клипы · DaVinci · YouTube"),
     ("ai_agent", "AI Screen Agent", "Computer Use · тесты"),
     ("shutdown", "Страж выключения", "когда агенты закончат — выключить ПК"),
+    ("settings", "Настройки", "скролл · темы · прочее"),
 )
 
 class ShutdownWatcherPanel(Panel):
@@ -7184,11 +7207,11 @@ class ShutdownWatcherPanel(Panel):
         self.btn_stop.pack(side="left", padx=(px(8), 0))
         flat_button(bar, "✕ Отменить выключение", self.cancel_shutdown, kind="ghost").pack(side="left", padx=(px(8), 0))
         self.lbl_timer = tk.Label(bar, bg=BG, fg=WARN,
-                                  font=("Segoe UI", 9, "bold"))
+                                  font=ui_font(9, "bold"))
         self.lbl_timer.pack(side="left", padx=(px(10), 0))
 
-        tk.Label(self, text="Отслеживаемые агенты (редактируй список в shutdown_watcher.py → DEFAULT_AGENTS)",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w")
+        tk.Label(self, text="Отслеживаемые агенты (добавь свои в config.json → watcher.agents: {name, mode: process|idle|marker, exe/marker, idle_min})",
+                 bg=BG, fg=MUTED, font=ui_font(8)).grid(row=1, column=0, sticky="w")
 
         # --- таблица агентов --- #
         self.tree = ttk.Treeview(self, columns=("mode", "target", "status", "note"),
@@ -7207,7 +7230,7 @@ class ShutdownWatcherPanel(Panel):
         log_frame.columnconfigure(0, weight=1)
         self.log = tk.Text(
             log_frame, bg=LOG_BG, fg=LOG_FG, insertbackground=FG,
-            font=("Consolas", 9), state="disabled", wrap="word",
+            font=mono_font(9), state="disabled", wrap="word",
         )
         self.log.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
@@ -7222,14 +7245,14 @@ class ShutdownWatcherPanel(Panel):
         }[status]
 
     def _watchers(self) -> list[wsh.Agent]:
-        return list(wsh.DEFAULT_AGENTS)
+        return wsh.load_agents()
 
     # --- управление --- #
     def start_watcher(self) -> None:
         self.stop_watcher()
         agents = self._watchers()
         if not agents:
-            self.log_lines(["Список агентов пуст — добавь DEFAULT_AGENTS в shutdown_watcher.py"])
+            self.log_lines(["Список агентов пуст — добавь их в config.json → watcher.agents"])
             return
         self.watcher = wsh.Watcher(agents)
         self.btn_stop.config(state="normal")
@@ -7346,6 +7369,74 @@ HEADERS = {
 }
 
 
+class SettingsPanel(Panel):
+    """Настройки программы: чувствительность скролла колёсиком мыши."""
+
+    def __init__(self, master: tk.Misc, hub) -> None:
+        super().__init__(master, hub)
+        self.var_scroll = tk.IntVar(value=_scroll_step())
+        self.var_scroll.trace_add("write", self._on_scroll_changed)
+        self._build()
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        title = tk.Label(
+            self,
+            text="Настройки прокрутки",
+            bg=BG, fg=FG, font=ui_font(16, "bold"), anchor="w",
+        )
+        title.grid(row=0, column=0, sticky="w", padx=(px(12), px(12)), pady=(px(16), px(6)))
+
+        help_line = tk.Label(
+            self,
+            text="Чувствительность скролла: сколько строк прокручивается одним щелчком"
+            " колёсика мыши. Влияет на все разделы с прокруткой (списки программ, "
+            "настройки, журнал, таб оценок).",
+            bg=BG, fg=MUTED, font=ui_font(9), anchor="w", wraplength=px(1000),
+        )
+        help_line.grid(row=1, column=0, sticky="nsew", padx=(px(12), px(12)))
+
+        # ползунок
+        bar = tk.Frame(self, bg=BG)
+        bar.grid(row=2, column=0, sticky="w", pady=(px(16), 0))
+        tk.Label(
+            bar, text="Чувствительность скролла:", bg=BG, fg=FG, font=ui_font(10),
+        ).pack(side="left", padx=(0, px(12)))
+        scale = ttk.Scale(
+            bar, from_=1, to=20, orient="horizontal",
+            variable=self.var_scroll, length=px(560),
+        )
+        scale.pack(side="left")
+        tk.Label(
+            bar, textvariable=self.var_scroll, bg=BG, fg=FG, font=ui_font(10, "bold"),
+            width=3, anchor="w",
+        ).pack(side="left", padx=(px(12), 0))
+        self.save_btn = flat_button(
+            bar, "Сохранить", self.save_settings, kind="primary",
+        )
+        self.save_btn.pack(side="left", padx=(px(16), 0))
+        self.status = tk.Label(bar, text="", bg=BG, fg=OK, font=ui_font(8))
+        self.status.pack(side="left", padx=(px(12), 0))
+
+    def _on_scroll_changed(self, *args: str) -> None:
+        """Обновляет подсказку значения в реальном времени."""
+        pass
+
+    def save_settings(self) -> None:
+        """Записывает выбранный шаг скролла в _scroll_settings.json."""
+        value = self.var_scroll.get()
+        if scroll_settings.save_settings(value):
+            self.status.configure(text=f"Сохранено: {value} строк за щелчок")
+        else:
+            self.status.configure(text="Ошибка сохранения настроек", fg=DANGER)
+
+    def on_show(self) -> None:
+        """Загружает сохранённый шаг скролла при открытии вкладки."""
+        self.var_scroll.set(_scroll_step())
+
+
 class NavItem(tk.Frame):
     def __init__(self, parent: tk.Misc, title: str, subtitle: str, command) -> None:
         super().__init__(parent, bg=SIDEBAR, cursor="hand2")
@@ -7358,13 +7449,13 @@ class NavItem(tk.Frame):
         self.body.pack(side="left", fill="both", expand=True, padx=(px(11), px(12)), pady=px(9))
 
         self.title_label = tk.Label(
-            self.body, text=title, bg=SIDEBAR, fg="#b9c1cd",
-            font=("Segoe UI", 10, "bold"), anchor="w", cursor="hand2",
+            self.body, text=title, bg=SIDEBAR, fg=SIDEBAR_TITLE,
+            font=ui_font(10, "bold"), anchor="w", cursor="hand2",
         )
         self.title_label.pack(fill="x")
         self.subtitle_label = tk.Label(
-            self.body, text=subtitle, bg=SIDEBAR, fg="#6c7482",
-            font=("Segoe UI", 8), anchor="w", cursor="hand2",
+            self.body, text=subtitle, bg=SIDEBAR, fg=SIDEBAR_SUBTITLE,
+            font=ui_font(8), anchor="w", cursor="hand2",
         )
         self.subtitle_label.pack(fill="x")
 
@@ -7374,17 +7465,17 @@ class NavItem(tk.Frame):
             widget.bind("<Leave>", lambda _event: self._hover(False))
 
     def _paint(self) -> None:
-        background = "#1b1f27" if self.active else SIDEBAR
+        background = SIDEBAR_ACTIVE if self.active else SIDEBAR
         for widget in (self, self.body):
             widget.configure(bg=background)
-        self.title_label.configure(bg=background, fg=FG if self.active else "#b9c1cd")
-        self.subtitle_label.configure(bg=background, fg=MUTED if self.active else "#6c7482")
+        self.title_label.configure(bg=background, fg=FG if self.active else SIDEBAR_TITLE)
+        self.subtitle_label.configure(bg=background, fg=MUTED if self.active else SIDEBAR_SUBTITLE)
         self.accent.configure(bg=ACCENT if self.active else background)
 
     def _hover(self, entering: bool) -> None:
         if self.active:
             return
-        background = "#161a21" if entering else SIDEBAR
+        background = SIDEBAR_HOVER if entering else SIDEBAR
         for widget in (self, self.body):
             widget.configure(bg=background)
         self.title_label.configure(bg=background)
@@ -7408,7 +7499,9 @@ class Hub(tk.Tk):
         self.minsize(min(px(1000), width), min(px(700), height))
         self.configure(bg=BG)
         apply_dark_theme(self)
-        self.option_add("*Font", ("Segoe UI", 9))
+        self.option_add("*Font", ui_font(9))
+        self._theme_resolved = _theme.mode()
+        self._theme_check_at = 0.0
 
         self.events: queue.Queue = queue.Queue()
         self.panels: dict[str, Panel] = {}
@@ -7427,6 +7520,7 @@ class Hub(tk.Tk):
             "shorts": lambda: ShortsAutopilotPanel(self.content, self),
             "ai_agent": lambda: AIScreenAgentPanel(self.content, self),
             "shutdown": lambda: ShutdownWatcherPanel(self.content, self),
+            "settings": lambda: SettingsPanel(self.content, self),
         }
 
         self._build()
@@ -7434,6 +7528,20 @@ class Hub(tk.Tk):
         self.after(70, self._poll)
         self.protocol("WM_DELETE_WINDOW", self.shutdown)
         enable_dark_titlebar(self)
+        _theme.on_change(self._apply_theme_mode)
+        # Обход по программам (ProxiFyre) выключен по умолчанию при каждом
+        # запуске тулз: служба переживает закрытие окна, и без этого при старте
+        # «сама уже работает маршрутизация». VPN (Happ) не трогаем — только
+        # останавливаем перенаправление выбранных программ. Фон: остановка
+        # службы не должна задерживать открытие окна.
+        threading.Thread(target=self._stop_apps_route_on_launch, daemon=True).start()
+
+    @staticmethod
+    def _stop_apps_route_on_launch() -> None:
+        try:
+            proxifyre_stop()
+        except Exception:  # noqa: BLE001 — старт не должен падать из-за службы
+            pass
 
     # -- разметка ---------------------------------------------------------- #
     def _build(self) -> None:
@@ -7443,10 +7551,10 @@ class Hub(tk.Tk):
 
         brand = tk.Frame(sidebar, bg=SIDEBAR)
         brand.pack(fill="x", padx=px(20), pady=(px(24), px(18)))
-        tk.Label(brand, text="МОИ", bg=SIDEBAR, fg="#5f6773",
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        tk.Label(brand, text="МОИ", bg=SIDEBAR, fg=BRAND_LABEL,
+                 font=ui_font(8, "bold")).pack(anchor="w")
         tk.Label(brand, text="Инструменты", bg=SIDEBAR, fg=FG,
-                 font=("Segoe UI", 15, "bold")).pack(anchor="w")
+                 font=ui_font(15, "bold")).pack(anchor="w")
 
         nav = tk.Frame(sidebar, bg=SIDEBAR)
         nav.pack(fill="x")
@@ -7463,7 +7571,7 @@ class Hub(tk.Tk):
             text="● права администратора" if admin else "● обычные права",
             bg=SIDEBAR,
             fg=OK if admin else MUTED,
-            font=("Segoe UI", 8),
+            font=ui_font(8),
             anchor="w",
         ).pack(fill="x")
 # admin button removed
@@ -7471,31 +7579,38 @@ class Hub(tk.Tk):
             bottom,
             text=f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
             bg=SIDEBAR,
-            fg="#5f6773",
-            font=("Segoe UI", 8),
+            fg=BRAND_LABEL,
+            font=ui_font(8),
             anchor="w",
         ).pack(fill="x", pady=(px(10), 0))
+        self.theme_btn = tk.Button(
+            bottom, text=self._theme_label(), command=self._cycle_theme,
+            bg=SIDEBAR, fg=MUTED, activebackground=SIDEBAR_ACTIVE,
+            activeforeground=FG, relief="flat", bd=0, anchor="w",
+            font=ui_font(8), cursor="hand2", pady=px(2),
+        )
+        self.theme_btn.pack(fill="x", pady=(px(10), 0))
 
         main = tk.Frame(self, bg=BG)
         main.pack(side="left", fill="both", expand=True)
 
-        status_bar = tk.Frame(main, bg="#0f1115", height=px(28))
+        status_bar = tk.Frame(main, bg=SIDEBAR, height=px(28))
         status_bar.pack(side="bottom", fill="x")
         status_bar.pack_propagate(False)
         self.status_var = tk.StringVar(value="Готово")
-        tk.Label(status_bar, textvariable=self.status_var, bg="#0f1115", fg=MUTED,
-                 font=("Segoe UI", 8), anchor="w").pack(side="left", padx=px(14))
-        tk.Label(status_bar, text="Ctrl+1…9 — переключение разделов", bg="#0f1115",
-                 fg="#5f6773", font=("Segoe UI", 8), anchor="e").pack(side="right", padx=px(14))
+        tk.Label(status_bar, textvariable=self.status_var, bg=SIDEBAR, fg=MUTED,
+                 font=ui_font(8), anchor="w").pack(side="left", padx=px(14))
+        tk.Label(status_bar, text="Ctrl+1…9 — переключение разделов", bg=SIDEBAR,
+                 fg=BRAND_LABEL, font=ui_font(8), anchor="e").pack(side="right", padx=px(14))
 
         head = tk.Frame(main, bg=BG)
         head.pack(fill="x", padx=px(26), pady=(px(22), px(12)))
         self.title_var = tk.StringVar()
         self.subtitle_var = tk.StringVar()
         tk.Label(head, textvariable=self.title_var, bg=BG, fg=FG,
-                 font=("Segoe UI", 18, "bold"), anchor="w").pack(fill="x")
+                 font=ui_font(18, "bold"), anchor="w").pack(fill="x")
         tk.Label(head, textvariable=self.subtitle_var, bg=BG, fg=MUTED,
-                 font=("Segoe UI", 9), anchor="w").pack(fill="x", pady=(px(4), 0))
+                 font=ui_font(9), anchor="w").pack(fill="x", pady=(px(4), 0))
 
         self.content = tk.Frame(main, bg=BG)
         self.content.pack(fill="both", expand=True, padx=px(26), pady=(0, px(14)))
@@ -7505,6 +7620,36 @@ class Hub(tk.Tk):
         for index, (key, _title, _subtitle) in enumerate(NAV, 1):
             key_char = str(index % 10)
             self.bind_all(f"<Control-Key-{key_char}>", lambda _event, k=key: self.show(k))
+
+    # -- тема -------------------------------------------------------------- #
+    def _theme_label(self) -> str:
+        return {
+            "auto": "◐ Тема: как в системе",
+            "light": "☀ Тема: светлая",
+            "dark": "☾ Тема: тёмная",
+        }[_theme.raw_mode()]
+
+    def _cycle_theme(self) -> None:
+        order = ("auto", "light", "dark")
+        current = _theme.raw_mode()
+        _theme.set_mode(order[(order.index(current) + 1) % len(order)])
+
+    def _apply_theme_mode(self, resolved: str) -> None:
+        """Живая перерисовка: токены → ttk-стили → виджеты → Canvas → DWM."""
+        if resolved == self._theme_resolved:
+            return
+        previous = self._theme_resolved
+        self._theme_resolved = resolved
+        _refresh_palette()
+        apply_dark_theme(self)
+        _apple_tk.recolor(self, previous, resolved)
+        _apple_tk.redraw(self)
+        enable_dark_titlebar(self)
+        if self.winfo_exists():
+            try:
+                self.theme_btn.configure(text=self._theme_label())
+            except (AttributeError, tk.TclError):
+                pass
 
     # -- разделы ----------------------------------------------------------- #
     def show(self, key: str) -> None:
@@ -7556,6 +7701,13 @@ class Hub(tk.Tk):
                     log_exception()
         except queue.Empty:
             pass
+        now = time.monotonic()
+        if now - self._theme_check_at > 2.0:
+            self._theme_check_at = now
+            if _theme.raw_mode() == "auto":
+                resolved = _theme.mode()
+                if resolved != self._theme_resolved:
+                    self._apply_theme_mode(resolved)
         self.after(70, self._poll)
 
     def set_status(self, text: str) -> None:
@@ -7566,7 +7718,7 @@ class Hub(tk.Tk):
         label = getattr(self, "_toast_label", None)
         if label is None:
             label = tk.Label(
-                self, bg=CARD, fg=FG, font=("Segoe UI", 10, "bold"),
+                self, bg=CARD, fg=FG, font=ui_font(10, "bold"),
                 padx=px(18), pady=px(10),
                 highlightthickness=1, highlightbackground=BORDER, bd=0,
             )
