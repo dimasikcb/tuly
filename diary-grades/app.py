@@ -35,6 +35,14 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+import theme as _theme
+from theme import apple_ctk as _apple_ctk
+from theme import apple_tk as _apple_tk
+
 import config
 import demo_data
 import diary_client
@@ -43,23 +51,43 @@ import parsers
 from models import DiaryError, FetchResult, ParseError, SessionExpired, SubjectGrades, SubjectReport
 
 # ──────────────────────────────── палитра ────────────────────────────────
-BG = "#0f1115"
-PANEL = "#171a21"
-CARD = "#1d222c"
-CARD_ALT = "#191d26"
-BORDER = "#2a3040"
-TEXT = "#e7eaf0"
-MUTED = "#8b93a5"
-ACCENT = "#3b82f6"
-ACCENT_HOVER = "#2563eb"
-OK = "#22c55e"
-WARN = "#f59e0b"
-BAD = "#ef4444"
+# HEX живёт только в theme/tokens.py. CTk понимает пару (light, dark) и сам
+# перекрашивает уже созданные виджеты при set_appearance_mode() — поэтому
+# живая смена темы не требует обхода дерева и пересборки окна.
+
+def tint(role: str) -> tuple[str, str]:
+    """Пара (light, dark) для kwargs CustomTkinter."""
+    return (_theme.c(role, "light"), _theme.c(role, "dark"))
+
+
+BG = tint("window")
+PANEL = tint("surface")
+CARD = tint("surface")
+CARD_ALT = tint("surface_raised")
+BORDER = tint("separator")
+TEXT = tint("label")
+MUTED = tint("label_secondary")
+ACCENT = tint("accent_fill")
+ACCENT_HOVER = tint("accent_fill_hover")
+# Статусные цвета здесь — ТЕКСТ на surface/surface_raised, поэтому берём
+# «чернила» бейджей: у них запас контраста >= 4.5:1 в обеих темах.
+OK = tint("badge_good_ink")
+WARN = tint("badge_warn_ink")
+BAD = tint("badge_bad_ink")
+EMPTY_BADGE = (tint("badge_neutral_bg"), tint("label_secondary"))
 BADGE = {
-    "red": ("#5b1b1b", "#ffb4b4"),
-    "yellow": ("#5a4211", "#ffe08a"),
-    "green": ("#14432c", "#a7f3c4"),
+    "red": (tint("badge_bad_bg"), tint("badge_bad_ink")),
+    "yellow": (tint("badge_warn_bg"), tint("badge_warn_ink")),
+    "green": (tint("badge_good_bg"), tint("badge_good_ink")),
 }
+CHIP_DEMO = (tint("badge_warn_bg"), tint("badge_warn_ink"))
+CHIP_CACHE = (tint("surface"), tint("label_secondary"))
+CHIP_IMPORT = (tint("badge_info_bg"), tint("badge_info_ink"))
+CHIP_DIARY = (tint("badge_good_bg"), tint("badge_good_ink"))
+# Готовые kwargs: без них CTk подставит on_accent и «съест» текст
+# светлых ghost-кнопок на белом фоне.
+GHOST = _apple_ctk.button_colors("ghost")
+PRIMARY = _apple_ctk.button_colors("primary")
 COLUMNS = (
     ("Предмет", 230, 0),
     ("Средний балл", 140, 0),
@@ -68,13 +96,12 @@ COLUMNS = (
     ("Запас прочности", 210, 1),
 )
 
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+# Тема применяется ДО создания виджетов: CustomTkinter кэширует цвета.
+_apple_ctk.configure()
 
 
 def _font(size: int, bold: bool = False) -> ctk.CTkFont:
-    return ctk.CTkFont(family="Segoe UI" if sys.platform == "win32" else "DejaVu Sans",
-                       size=size, weight="bold" if bold else "normal")
+    return _apple_ctk.font(size=size, bold=bold)
 
 
 class GradesTable(ctk.CTkScrollableFrame):
@@ -126,7 +153,7 @@ class GradesTable(ctk.CTkScrollableFrame):
                      text_color=TEXT, anchor="w").grid(row=0, column=0, sticky="w", padx=6)
 
         empty = not report.count and not report.official_average
-        bg, fg = ("#2a3040", MUTED) if empty else BADGE[report.badge]
+        bg, fg = EMPTY_BADGE if empty else BADGE[report.badge]
         ctk.CTkLabel(inner, text=" — " if empty else f" {report.average_str} ",
                      font=_font(13, True),
                      text_color=fg, fg_color=bg, corner_radius=7, width=66,
@@ -183,11 +210,16 @@ class GradesTable(ctk.CTkScrollableFrame):
 
 class App(ctk.CTk):
     def __init__(self, *, auto_login: bool = True, start_demo: bool = False):
+        _apple_ctk.configure()  # до создания виджетов: CTk кэширует цвета темы
         super().__init__()
         self.title(config.APP_NAME)
         self.geometry("1120x760")
         self.minsize(940, 640)
         self.configure(fg_color=BG)
+        self._theme_resolved = _theme.mode()
+        _apple_tk.titlebar(self, self._theme_resolved)
+        _theme.on_change(self._apply_theme_mode)
+        self.after(2000, self._theme_tick)
         self.grid_rowconfigure(3, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
@@ -198,6 +230,10 @@ class App(ctk.CTk):
         self._auto_login = auto_login and not start_demo
         self._start_demo = start_demo
         self.settings = config.load_settings()
+        self._sort_mode = "average"  # "average" | "alpha"
+
+        self._build_header()
+        self._sort_mode = "average"  # average | alpha
         # Скрытое автообновление: сразу после входа догружаем пустые предметы,
         # дальше — раз в auto_refresh_min минут, пока окно открыто.
         self._last_fetch_at = time.monotonic()
@@ -237,6 +273,10 @@ class App(ctk.CTk):
                                         fg_color=CARD, corner_radius=8,
                                         text_color=MUTED, padx=10, pady=4)
         self.source_chip.grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
+        self.theme_btn = ctk.CTkButton(
+            head, text=self._theme_label(), font=_font(12), height=30, width=118,
+            **GHOST, command=self._cycle_theme)
+        self.theme_btn.grid(row=0, column=2, rowspan=2, sticky="e", padx=(8, 0))
 
     def _build_toolbar(self) -> None:
         bar = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
@@ -244,30 +284,45 @@ class App(ctk.CTk):
         bar.grid_columnconfigure(7, weight=1)
         self.refresh_btn = ctk.CTkButton(
             bar, text="⟳  Обновить оценки", font=_font(14, True), height=40,
-            fg_color=ACCENT, hover_color=ACCENT_HOVER, command=self._on_refresh)
+            **PRIMARY, command=self._on_refresh)
         self.refresh_btn.grid(row=0, column=0, padx=(10, 6), pady=10)
         self.login_btn = ctk.CTkButton(
             bar, text="Войти заново", font=_font(12), height=36, width=130,
-            fg_color=CARD, hover_color=BORDER, command=lambda: self._start_login(False))
+            **GHOST, command=lambda: self._start_login(False))
         self.login_btn.grid(row=0, column=1, padx=4, pady=10)
         self.import_btn = ctk.CTkButton(
             bar, text="Импорт HTML/JSON", font=_font(12), height=36, width=150,
-            fg_color=CARD, hover_color=BORDER, command=self._on_import)
+            **GHOST, command=self._on_import)
         self.import_btn.grid(row=0, column=2, padx=4, pady=10)
         self.demo_btn = ctk.CTkButton(
             bar, text="Демо-данные", font=_font(12), height=36, width=115,
-            fg_color=CARD, hover_color=BORDER, command=self._on_demo)
+            **GHOST, command=self._on_demo)
         self.demo_btn.grid(row=0, column=3, padx=4, pady=10)
+        self.sort_btn = ctk.CTkButton(bar, text="Сортировка", font=_font(12), height=36, width=120,
+                      **GHOST,
+                      command=self._on_sort)
+        self.sort_btn.grid(row=0, column=4, padx=4, pady=10)
         ctk.CTkButton(bar, text="Настройки", font=_font(12), height=36, width=100,
-                      fg_color=CARD, hover_color=BORDER,
-                      command=self._on_settings).grid(row=0, column=4, padx=4, pady=10)
+                      **GHOST,
+                      command=self._on_settings).grid(row=0, column=5, padx=4, pady=10)
         ctk.CTkButton(bar, text="?", font=_font(14, True), height=36, width=38,
-                      fg_color=CARD, hover_color=BORDER,
-                      command=self._on_help).grid(row=0, column=5, padx=4, pady=10)
+                      **GHOST,
+                      command=self._on_help).grid(row=0, column=6, padx=4, pady=10)
         ctk.CTkButton(bar, text="Папка debug", font=_font(12), height=36, width=115,
-                      fg_color=CARD, hover_color=BORDER,
-                      command=self._on_open_debug).grid(row=0, column=6, padx=4, pady=10)
-        ctk.CTkLabel(bar, text="", fg_color="transparent").grid(row=0, column=7)
+                      **GHOST,
+                      command=self._on_open_debug).grid(row=0, column=7, padx=4, pady=10)
+        ctk.CTkLabel(bar, text="", fg_color="transparent").grid(row=0, column=8)
+
+    def _on_sort(self) -> None:
+        self._sort_mode = "alpha" if self._sort_mode == "average" else "average"
+        self.sort_btn.configure(text=self._sort_label_btn())
+        if self._reports:
+            self._reports = gm.sort_reports(self._reports, self._sort_mode)
+            self.table.show(self._reports)
+        self._set_status("Сортировка: " + self._sort_label().split("сортировка:")[1].strip())
+
+    def _sort_label_btn(self) -> str:
+        return "Сортировка: по алфавиту" if self._sort_mode == "alpha" else "Сортировка: по среднему"
 
     def _build_filter(self) -> None:
         line = ctk.CTkFrame(self, fg_color="transparent")
@@ -303,6 +358,29 @@ class App(ctk.CTk):
         self.footer = ctk.CTkLabel(self, text="", font=_font(11), text_color=MUTED,
                                    anchor="w")
         self.footer.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 10))
+
+    # ─────────────────────────────── тема ────────────────────────────────
+    @staticmethod
+    def _theme_label() -> str:
+        return {"auto": "Тема: авто", "light": "Тема: светлая",
+                "dark": "Тема: тёмная"}[_theme.raw_mode()]
+
+    def _cycle_theme(self) -> None:
+        order = ("auto", "light", "dark")
+        _theme.set_mode(order[(order.index(_theme.raw_mode()) + 1) % len(order)])
+
+    def _apply_theme_mode(self, resolved: str) -> None:
+        """Живая смена Light/Dark: пары (light, dark) CTk перекрашивает сам."""
+        self._theme_resolved = _apple_ctk.configure(resolved)
+        _apple_tk.titlebar(self, self._theme_resolved)
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.configure(text=self._theme_label())
+
+    def _theme_tick(self) -> None:
+        """Auto: раз в 2 с сверяемся с системной темой Windows."""
+        if _theme.raw_mode() == "auto" and _theme.mode() != self._theme_resolved:
+            self._apply_theme_mode(_theme.mode())
+        self.after(2000, self._theme_tick)
 
     # ────────────────────────────── утилиты ─────────────────────────────
     def _set_details(self, text: str) -> None:
@@ -450,6 +528,13 @@ class App(ctk.CTk):
             mode, need_login = config.startup_plan(
                 self._start_demo, cached is not None, has_session, self._auto_login)
             if mode == "cache":
+                # Есть сессия — сразу подтягиваем свежие данные, показываем кэш
+                # только если он не старше 1 минуты. Сессии нет — просто выводим кэш.
+                if has_session and cached and self._is_cache_stale(cached):
+                    self._enqueue("status", "Сессия найдена. Забираем свежие оценки…")
+                    self._set_busy(True)
+                    self._threaded(self._fetch_worker)
+                    return
                 self._enqueue("data", cached)
                 self._enqueue("status", "Загружены сохранённые оценки. Нажми «Обновить оценки».")
                 if not has_session:
@@ -506,21 +591,21 @@ class App(ctk.CTk):
 
     def _render(self, result: FetchResult) -> None:
         self._result = result
-        self._reports = gm.sort_reports(gm.build_reports(result.subjects))
+        self._reports = gm.sort_reports(gm.build_reports(result.subjects), self._sort_mode)
         self.period_label.configure(text=f"Период: {result.period or config.current_period().label}"
-                                         "  ·  порог пятёрки 4.50  ·  сортировка: от худшего к лучшему")
+                                         "  ·  порог пятёрки 4.50  ·  " + self._sort_label())
         if result.source == "demo":
             self.source_chip.configure(text="ДЕМО-ДАННЫЕ · не реальные оценки",
-                                       fg_color="#5a4211", text_color="#ffe08a")
+                                       fg_color=CHIP_DEMO[0], text_color=CHIP_DEMO[1])
         elif result.source == "cache":
-            self.source_chip.configure(text="ДАННЫЕ ИЗ КЭША", fg_color=CARD,
-                                       text_color=MUTED)
+            self.source_chip.configure(text="ДАННЫЕ ИЗ КЭША",
+                                       fg_color=CHIP_CACHE[0], text_color=CHIP_CACHE[1])
         elif result.source == "import":
-            self.source_chip.configure(text="ИМПОРТ ФАЙЛА", fg_color="#1e3a5f",
-                                       text_color="#bfdbfe")
+            self.source_chip.configure(text="ИМПОРТ ФАЙЛА",
+                                       fg_color=CHIP_IMPORT[0], text_color=CHIP_IMPORT[1])
         else:
-            self.source_chip.configure(text="ДАННЫЕ ИЗ ДНЕВНИКА", fg_color="#14432c",
-                                       text_color="#a7f3c4")
+            self.source_chip.configure(text="ДАННЫЕ ИЗ ДНЕВНИКА",
+                                       fg_color=CHIP_DIARY[0], text_color=CHIP_DIARY[1])
         self._apply_filter()
         now = datetime.now().strftime("%H:%M:%S")
         self.footer.configure(
@@ -528,6 +613,11 @@ class App(ctk.CTk):
                  f"Источник: {result.source}  ·  Файлы: data/, debug/  ·  "
                  "Клик по строке — разбор формулы"
         )
+
+    def _sort_label(self) -> str:
+        if self._sort_mode == "alpha":
+            return "сортировка: по алфавиту"
+        return "сортировка: от худшего к лучшему"
 
     def _apply_filter(self) -> None:
         needle = (self.search.get() if hasattr(self, "search") else "").strip().casefold()
@@ -540,7 +630,7 @@ class App(ctk.CTk):
             self._set_details("Ничего не найдено. Измени запрос в поле поиска.")
         self.footer.configure(
             text=f"Показано: {len(shown)} из {len(self._reports)} предметов  ·  "
-                 "Сортировка: от худшего среднего к лучшему  ·  "
+                 f"{self._sort_label()}  ·  "
                  "Клик по строке — разбор формулы"
         )
 
@@ -689,8 +779,8 @@ class App(ctk.CTk):
             win.destroy()
             self._set_status("Настройки сохранены.", "ok")
 
-        ctk.CTkButton(win, text="Сохранить", command=save, fg_color=ACCENT,
-                      hover_color=ACCENT_HOVER).pack(padx=20, pady=18, anchor="w")
+        ctk.CTkButton(win, text="Сохранить", command=save,
+                      **PRIMARY).pack(padx=20, pady=18, anchor="w")
 
     def _on_help(self) -> None:
         win = ctk.CTkToplevel(self)

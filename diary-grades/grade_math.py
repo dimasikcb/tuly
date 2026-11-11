@@ -181,14 +181,19 @@ def build_reports(subjects: Iterable[SubjectGrades]) -> list[SubjectReport]:
     return [build_report(s) for s in subjects]
 
 
-def sort_reports(reports: Iterable[SubjectReport]) -> list[SubjectReport]:
-    """Строго от худшего среднего к лучшему.
+def sort_reports(reports: Iterable[SubjectReport],
+                 by: str = "average") -> list[SubjectReport]:
+    """Сортировка отчётов.
 
-    Точное сравнение через Fraction (не float). При равном среднем худшим
-    считается предмет, которому нужно больше пятёрок; затем по алфавиту.
-    Предметы без оценок уходят в конец — их средний не определён, они не
-    должны вытеснять реальные предметы из верха «худшие сверху».
+    by == "average" — строго от худшего среднего к лучшему (точное сравнение
+    через Fraction). При равном среднем худшим считается предмет, которому
+    нужно больше пятёрок; затем по алфавиту.
+
+    by == "alpha" — по названию предмета (по алфавиту).
     """
+    if by == "alpha":
+        return sorted(reports, key=lambda r: r.name.casefold())
+
     def key(r: SubjectReport):
         if r.count:
             exact = Fraction(r.total, r.count)

@@ -48,6 +48,27 @@ import agent_window
 import agent_progress
 import agent_speed
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import theme as _theme
+from theme import apple_tk as _apple_tk
+
+
+def tc(role: str) -> str:
+    """Цвет по семантической роли из theme/tokens.py."""
+    return _theme.c(role)
+
+
+def ui_font(size: int, bold: bool = False) -> tuple:
+    return (_apple_tk.ui_family(), size, "bold" if bold else "normal")
+
+
+def mono_font(size: int, bold: bool = False) -> tuple:
+    return (_apple_tk.mono_family(), size, "bold" if bold else "normal")
+
+
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 # Детект «экран изменился после клика» — по АБСОЛЮТНОМУ числу различающихся
@@ -106,12 +127,8 @@ def resolve_click_scale(x, y):
     """
     x = min(max(float(x), 0.0), 1000.0)
     y = min(max(float(y), 0.0), 1000.0)
-    if float(x).is_integer() and float(y).is_integer():
-        return x / 1000.0, y / 1000.0
-    if x <= 1.0 and y <= 1.0:
+    if x <= 1.0 and y <= 1.0 and (not float(x).is_integer() or not float(y).is_integer()):
         return x, y
-    if x <= 100.0 and y <= 100.0:
-        return x / 100.0, y / 100.0
     return x / 1000.0, y / 1000.0
 
 
@@ -123,14 +140,14 @@ class ScreenSelector(tk.Toplevel):
         self.attributes("-fullscreen", True)
         self.attributes("-topmost", True)
         self.attributes("-alpha", 0.35)
-        self.configure(bg="#111111")
+        self.configure(bg=tc("overlay_backdrop"))
         self.config(cursor="cross")
 
         self.start_x = None
         self.start_y = None
         self.current_rect = None
 
-        self.canvas = tk.Canvas(self, cursor="cross", bg="#111111", highlightthickness=0)
+        self.canvas = tk.Canvas(self, cursor="cross", bg=tc("overlay_backdrop"), highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
         # Текст подсказки
@@ -138,13 +155,14 @@ class ScreenSelector(tk.Toplevel):
         self.hint = self.canvas.create_text(
             screen_w // 2, 40,
             text="Зажмите ЛКМ и выделите рамку с тестом. Нажмите Esc для отмены.",
-            fill="yellow", font=("Arial", 16, "bold")
+            fill=tc("overlay_timer"), font=ui_font(16, True)
         )
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.bind("<Escape>", lambda e: self.cancel())
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
 
     def on_press(self, event):
         self.start_x = event.x
@@ -153,7 +171,7 @@ class ScreenSelector(tk.Toplevel):
             self.canvas.delete(self.current_rect)
         self.current_rect = self.canvas.create_rectangle(
             self.start_x, self.start_y, self.start_x, self.start_y,
-            outline="#00ff66", width=3, fill="#00ff66"
+            outline=tc("roi"), width=3, fill=tc("roi")
         )
 
     def on_drag(self, event):
@@ -184,8 +202,22 @@ class AIScreenAgentApp:
     def __init__(self, root):
         self.root = root
         self.root.title("AI Screen Bridge — Автокликер тестов")
-        self.root.geometry("620x760")
-        self.root.minsize(560, 680)
+        # Шрифты Tk заданы в пунктах (tk scaling = DPI/72), а geometry — в
+        # физических пикселях. При масштабе Windows 150–200% окно 620x760
+        # становится «маленьким» относительно 13pt → ряды обрезаются. Тот же
+        # приём, что и в tools.pyw: SCALE = winfo_fpixels('1i') / 96, px(v).
+        self._scale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
+        def px(value: float) -> int:
+            return int(round(value * self._scale))
+        width = min(px(620), self.root.winfo_screenwidth() - px(40))
+        height = min(px(760), self.root.winfo_screenheight() - px(90))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(min(px(560), width), min(px(680), height))
+        self._theme_resolved = _theme.mode()
+        self.root.configure(bg=tc("window"))
+        _apple_tk.titlebar(self.root, self._theme_resolved)
+        _theme.on_change(self._apply_theme_mode)
+        self.root.after(2000, self._theme_tick)
 
         # Переменные состояния
         self.roi = None  # (x, y, w, h)
@@ -234,6 +266,10 @@ class AIScreenAgentApp:
         # OBS и шаринга экрана, а модель больше не принимает его за часть теста.
         # Статус операции (✅/⚠️) модуль сам пишет в журнал через self.log;
         # HWND при этом привязывается даже при неудаче — детект самоклика работает.
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
         agent_window.exclude_from_capture(self.root, self.log)
 
         # Восстановление сохраненного ROI
@@ -310,8 +346,7 @@ class AIScreenAgentApp:
 
     def setup_ui(self):
         # Настройка стилей
-        style = ttk.Style()
-        style.theme_use("clam")
+        _apple_tk.apply_theme(self.root)
 
         main_frame = ttk.Frame(self.root, padding=12)
         main_frame.pack(fill="both", expand=True)
@@ -343,6 +378,9 @@ class AIScreenAgentApp:
 
         def _on_key_rmenu(event):
             m = tk.Menu(self.api_key_entry, tearoff=0)
+            m.configure(bg=tc("surface"), fg=tc("label"),
+                        activebackground=tc("accent_fill"),
+                        activeforeground=tc("on_accent"), relief="flat", bd=0)
             m.add_command(label="Вставить из буфера", command=self.paste_api_key)
             m.add_command(label="Копировать", command=lambda: (self.root.clipboard_clear(), self.root.clipboard_append(self.api_key_var.get())))
             m.add_command(label="Очистить", command=lambda: self.api_key_var.set(""))
@@ -376,16 +414,20 @@ class AIScreenAgentApp:
         self.select_btn.pack(side="left", padx=(0, 10))
 
         self.roi_label_var = tk.StringVar(value="Область не выбрана")
-        self.roi_label = ttk.Label(roi_top_frame, textvariable=self.roi_label_var, font=("Consolas", 10, "bold"), foreground="#0066cc")
+        self.roi_label = ttk.Label(roi_top_frame, textvariable=self.roi_label_var,
+                                  font=mono_font(10, True), foreground=tc("tag_dir"))
         self.roi_label.pack(side="left", fill="x", expand=True)
 
         # Превью кадра
         self.preview_frame = ttk.Frame(roi_group)
         self.preview_frame.pack(fill="x", pady=(8, 0))
-        self.preview_canvas = tk.Canvas(self.preview_frame, height=130, bg="#222222", highlightthickness=1, highlightbackground="#888")
+        self.preview_canvas = tk.Canvas(self.preview_frame, height=130,
+                                       bg=tc("inset"), highlightthickness=1,
+                                       highlightbackground=tc("separator_strong"))
         self.preview_canvas.pack(fill="x")
         self.preview_text = self.preview_canvas.create_text(
-            280, 65, text="Здесь появится снимок выделенной области", fill="#aaaaaa", font=("Arial", 10)
+            280, 65, text="Здесь появится снимок выделенной области",
+            fill=tc("label_tertiary"), font=ui_font(10)
         )
 
         # 3. Секция Руки (Управление)
@@ -395,25 +437,33 @@ class AIScreenAgentApp:
         ctrl_btns_frame = ttk.Frame(ctrl_group)
         ctrl_btns_frame.pack(fill="x")
 
-        self.start_btn = tk.Button(
-            ctrl_btns_frame, text="▶ СТАРТ (Авто-прохождение)", bg="#28a745", fg="white",
-            font=("Arial", 11, "bold"), padx=12, pady=6, command=self.toggle_start
+        self.start_btn = _apple_tk.flat_button(
+            ctrl_btns_frame, "▶ СТАРТ (Авто-прохождение)",
+            self.toggle_start, kind="primary"
         )
         self.start_btn.pack(side="left", padx=(0, 10))
 
-        self.step_btn = tk.Button(
-            ctrl_btns_frame, text="⚡ Шаг (1 клик)", bg="#007bff", fg="white",
-            font=("Arial", 10, "bold"), padx=10, pady=6, command=self.do_single_step
+        self.step_btn = _apple_tk.flat_button(
+            ctrl_btns_frame, "⚡ Шаг (1 клик)",
+            self.do_single_step, kind="ghost"
         )
         self.step_btn.pack(side="left", padx=(0, 15))
 
+        # Флаги — отдельным рядом: при 150–200% масштабе Windows четыре
+        # элемента в одной строке не помещались и обрезали «Плавный клик».
+        ctrl_flags_frame = ttk.Frame(ctrl_group)
+        ctrl_flags_frame.pack(fill="x", pady=(8, 0))
+
         self.always_on_top_var = tk.BooleanVar(value=self.config.get("always_on_top", True))
-        top_chk = ttk.Checkbutton(ctrl_btns_frame, text="Поверх всех окон", variable=self.always_on_top_var, command=self.apply_always_on_top)
-        top_chk.pack(side="left", padx=(0, 8))
+        top_chk = _apple_tk.check(ctrl_flags_frame, "Поверх всех окон",
+                                  self.always_on_top_var,
+                                  command=self.apply_always_on_top)
+        top_chk.pack(side="left", padx=(0, 16))
         self.apply_always_on_top()
 
         self.smooth_mouse_var = tk.BooleanVar(value=self.config.get("smooth_mouse", True))
-        smooth_chk = ttk.Checkbutton(ctrl_btns_frame, text="Плавный клик", variable=self.smooth_mouse_var)
+        smooth_chk = _apple_tk.check(ctrl_flags_frame, "Плавный клик",
+                                     self.smooth_mouse_var)
         smooth_chk.pack(side="left")
 
         # Доп. инструкция (опционально)
@@ -428,12 +478,19 @@ class AIScreenAgentApp:
         log_group = ttk.LabelFrame(main_frame, text="  4. Мысли ИИ и Журнал действий  ", padding=8)
         log_group.pack(fill="both", expand=True)
 
-        self.log_text = tk.Text(log_group, wrap="word", font=("Consolas", 9), bg="#1e1e1e", fg="#e0e0e0", insertbackground="white")
+        self.log_text = _apple_tk.log_view(log_group, wrap="word", font=mono_font(10))
         log_scroll = ttk.Scrollbar(log_group, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
+
+        # Переключатель темы — внизу, вне плотных рядов управления.
+        theme_bar = ttk.Frame(main_frame)
+        theme_bar.pack(fill="x", pady=(8, 0))
+        self.theme_btn = ttk.Button(theme_bar, text=self._theme_label(),
+                                    command=self._cycle_theme)
+        self.theme_btn.pack(side="right")
 
         # Привязка клавиши Esc для экстренной остановки
         self.root.bind("<Escape>", lambda e: self.stop_if_running())
@@ -444,6 +501,65 @@ class AIScreenAgentApp:
         self.log("2. Нажмите 'Выделить область мышкой' и обведите окно с тестом.")
         self.log("3. Нажмите 'СТАРТ' — ИИ будет анализировать экран и нажимать ответы.")
         self.log("⚠️ Аварийная остановка: дерните мышь в угол экрана или нажмите СТОП / Esc.")
+
+    # ─────────────────────────────── тема ────────────────────────────────
+    @staticmethod
+    def _theme_label() -> str:
+        return {"auto": "Тема: авто", "light": "Тема: светлая",
+                "dark": "Тема: тёмная"}[_theme.raw_mode()]
+
+    def _cycle_theme(self) -> None:
+        order = ("auto", "light", "dark")
+        _theme.set_mode(order[(order.index(_theme.raw_mode()) + 1) % len(order)])
+
+    def _apply_theme_mode(self, resolved: str) -> None:
+        """Живая смена Light/Dark: ttk-стили → tk-виджеты → кастомные цвета → DWM."""
+        if resolved == self._theme_resolved:
+            return
+        previous = self._theme_resolved
+        self._theme_resolved = resolved
+        _apple_tk.apply_theme(self.root, resolved)
+        _apple_tk.recolor(self.root, previous, resolved)
+        _apple_tk.redraw(self.root)
+        _apple_tk.titlebar(self.root, resolved)
+        self.root.configure(bg=tc("window"))
+        self._recolor_custom()
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.configure(text=self._theme_label())
+
+    def _recolor_custom(self) -> None:
+        """Цвета, чей роль generic recolor() не может вывести однозначно."""
+        if not hasattr(self, "preview_canvas"):
+            return
+        self.roi_label.configure(foreground=tc("tag_dir"))
+        self.preview_canvas.configure(bg=tc("inset"),
+                                      highlightbackground=tc("separator_strong"))
+        try:
+            self.preview_canvas.itemconfigure(self.preview_text,
+                                              fill=tc("label_tertiary"))
+        except tk.TclError:  # после показа снимка canvas очищен — текст уже не нужен
+            pass
+        self.log_text.configure(bg=tc("inset"), fg=tc("log_info"),
+                                insertbackground=tc("label"))
+        self._set_start_button(self.is_running)
+
+    def _set_start_button(self, running: bool) -> None:
+        """СТАРТ = единственное главное действие; СТОП = безопасный danger."""
+        if running:
+            self.start_btn.config(text="⏹ СТОП", bg=tc("err_bg"),
+                                  fg=tc("badge_bad_ink"),
+                                  activebackground=tc("err_hover_bg"))
+        else:
+            self.start_btn.config(text="▶ СТАРТ (Авто)", bg=tc("accent_fill"),
+                                  fg=tc("on_accent"),
+                                  activebackground=tc("accent_fill_hover"))
+
+    def _theme_tick(self) -> None:
+        if not self.root.winfo_exists():
+            return
+        if _theme.raw_mode() == "auto" and _theme.mode() != self._theme_resolved:
+            self._apply_theme_mode(_theme.mode())
+        self.root.after(2000, self._theme_tick)
 
     def toggle_show_key(self):
         if self.show_key_var.get():
@@ -585,9 +701,9 @@ class AIScreenAgentApp:
                 if restore:
                     self.root.after(0, self.root.deiconify)
 
-    def capture_and_update_preview(self, click_pt=None, drag_pt=None):
+    def capture_and_update_preview(self, click_pt=None, drag_pt=None, base_img=None):
         """Обновляет холст превью: точка клика или линия перетаскивания (drag)."""
-        img = self.capture_roi_image()
+        img = base_img.copy() if base_img is not None else self.capture_roi_image()
         if not img:
             return
 
@@ -601,9 +717,11 @@ class AIScreenAgentApp:
             r = max(5, int(min(img.width, img.height) * 0.02))
             if drag_pt:
                 dx, dy = drag_pt
-                draw.line((cx, cy, dx, dy), fill="#ff0000", width=4)
-                draw.ellipse((dx - r, dy - r, dx + r, dy + r), fill="#ff0000", outline="#ffffff", width=2)
-            draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill="#ff0000", outline="#ffffff", width=2)
+                draw.line((cx, cy, dx, dy), fill=tc("marker_fill"), width=4)
+                draw.ellipse((dx - r, dy - r, dx + r, dy + r),
+                             fill=tc("marker_fill"), outline=tc("marker_outline"), width=2)
+            draw.ellipse((cx - r, cy - r, cx + r, cy + r),
+                         fill=tc("marker_fill"), outline=tc("marker_outline"), width=2)
 
         # Масштабируем превью под холст
         img_thumb = img.copy()
@@ -628,14 +746,14 @@ class AIScreenAgentApp:
 
         # Автоопределение провайдера
         is_google_native = api_key.startswith("AIzaSy") or api_key.startswith("AIza")
-        is_openai_compat = api_key.startswith("sk-") or bool(base_url)
+        is_openai_compat = api_key.startswith("sk-") or (bool(base_url) and not is_google_native)
 
-        if not base_url:
+        if not base_url and not is_google_native:
             if api_key.startswith("sk-apx"):
                 base_url = "https://api.apinex.bond/v1"
             elif api_key.startswith("sk-or"):
                 base_url = "https://openrouter.ai/api/v1"
-            elif not is_google_native:
+            else:
                 base_url = "https://api.apinex.bond/v1"
 
         system_instruction = (
@@ -900,17 +1018,19 @@ class AIScreenAgentApp:
                     return False
 
             # Превью: линия между точками
-            self.root.after(0, lambda: self.capture_and_update_preview(local_from, local_to))
+            self.root.after(0, lambda lf=local_from, lt=local_to, im=img: self.capture_and_update_preview(lf, lt, base_img=im))
 
             self.log(f"👉 Перетаскивание: ({screen_x1}, {screen_y1}) -> ({screen_x2}, {screen_y2})")
             pyautogui.moveTo(screen_x1, screen_y1)
             time.sleep(0.08)
             pyautogui.mouseDown()
-            if self._ui_snapshot["smooth_mouse"]:
-                pyautogui.moveTo(screen_x2, screen_y2, duration=0.35, tween=pyautogui.easeInOutQuad)
-            else:
-                pyautogui.moveTo(screen_x2, screen_y2, duration=0.15)
-            pyautogui.mouseUp()
+            try:
+                if self._ui_snapshot["smooth_mouse"]:
+                    pyautogui.moveTo(screen_x2, screen_y2, duration=0.35, tween=pyautogui.easeInOutQuad)
+                else:
+                    pyautogui.moveTo(screen_x2, screen_y2, duration=0.15)
+            finally:
+                pyautogui.mouseUp()
 
             # Общая пост-обработка (сравнение кадров, история, зависание) — по конечной точке
             local_click_x, local_click_y = local_to
@@ -950,7 +1070,7 @@ class AIScreenAgentApp:
                 return False
 
             # Обновляем превью с точкой клика
-            self.root.after(0, lambda: self.capture_and_update_preview((local_click_x, local_click_y)))
+            self.root.after(0, lambda pt=(local_click_x, local_click_y), im=img: self.capture_and_update_preview(pt, base_img=im))
 
             self.log(f"👉 Клик в точку: ({screen_x}, {screen_y})")
 
@@ -986,7 +1106,8 @@ class AIScreenAgentApp:
         # Детект зависания: та же точка + неменяющийся экран N шагов подряд.
         # 'repeat' — только предупреждение (кнопка «Далее» на одном месте —
         # легитимный случай); авто-режим останавливаем исключительно на 'stalled'.
-        status = self._stagnation.register((screen_x, screen_y), screen_changed)
+        stagnation_pt = (screen_x1, screen_y1, screen_x2, screen_y2) if drag is not None else (screen_x, screen_y)
+        status = self._stagnation.register(stagnation_pt, screen_changed)
         if status == agent_progress.STATUS_STALLED:
             self.log(
                 f"🛑 Зависание: {self._stagnation.same_target_count} шага подряд в точку "
@@ -1041,7 +1162,7 @@ class AIScreenAgentApp:
         self._stagnation.reset()       # детект зависания начинает с чистого листа
         self._action_history.clear()   # история кликов для промпта — тоже
         self._worker_generation += 1   # воркеры предыдущего поколения выйдут сами
-        self.start_btn.config(text="⏹ СТОП", bg="#dc3545")
+        self._set_start_button(True)
         self.select_btn.config(state="disabled")
         self.step_btn.config(state="disabled")
         self.log("▶ Авто-режим запущен. Для остановки нажмите СТОП или дерните мышь в угол.")
@@ -1053,7 +1174,7 @@ class AIScreenAgentApp:
     def stop(self):
         self.stop_requested = True
         self.is_running = False
-        self.start_btn.config(text="▶ СТАРТ (Авто)", bg="#28a745")
+        self._set_start_button(False)
         self.select_btn.config(state="normal")
         self.step_btn.config(state="normal")
         self.log("⏹ Авто-режим остановлен.")
@@ -1064,27 +1185,32 @@ class AIScreenAgentApp:
 
     def _loop_worker(self, generation):
         step_count = 0
-        while not self.should_abort(generation):
-            step_count += 1
-            self.log(f"--- Шаг {step_count} ---")
-            res = self.execute_one_cycle(generation)
+        try:
+            while not self.should_abort(generation):
+                step_count += 1
+                self.log(f"--- Шаг {step_count} ---")
+                res = self.execute_one_cycle(generation)
 
-            if res == "done" or self.should_abort(generation):
-                break
-            if not res:
-                self.log("⚠️ Шаг не удался, повторная попытка через паузу...")
-
-            # Ожидание задержки
-            delay = max(0.5, float(self._ui_snapshot["delay"]))
-            for _ in range(int(delay * 10)):
-                if self.stop_requested:
+                if res == "done" or self.should_abort(generation):
                     break
-                time.sleep(0.1)
+                if not res:
+                    self.log("⚠️ Шаг не удался, повторная попытка через паузу...")
 
-        # Кнопки сбрасывает только актуальный воркер: устаревший (после быстрого
-        # СТОП+СТАРТ) не должен глушить уже новый запущенный режим
-        if generation == self._worker_generation:
-            self.root.after(0, self.stop)
+                # Ожидание задержки
+                delay = max(0.5, float(self._ui_snapshot["delay"]))
+                for _ in range(int(delay * 10)):
+                    if self.stop_requested:
+                        break
+                    time.sleep(0.1)
+        except pyautogui.FailSafeException:
+            self.log("🛑 Сработал PyAutoGUI FailSafe (курсор в углу экрана)!")
+        except Exception as exc:
+            self.log(f"🛑 Критическая ошибка в цикле: {exc}")
+        finally:
+            # Кнопки сбрасывает только актуальный воркер: устаревший (после быстрого
+            # СТОП+СТАРТ) не должен глушить уже новый запущенный режим
+            if generation == self._worker_generation:
+                self.root.after(0, self.stop)
 
 
 def main():

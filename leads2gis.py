@@ -172,6 +172,17 @@ HIGH_VALUE = (
     "отель", "туризм", "турагент", "цвет", "аптек", "детск", "образова",
     "курсы", "школ", "фотостуди", "свадеб", "груминг", "ветеринар",
 )
+
+# Популярные ниши для вкладки «Лиды»: (подпись в UI, поисковый запрос 2GIS)
+NICHES: tuple[tuple[str, str], ...] = (
+    ("Барбершоп", "барбершоп"), ("Стоматология", "стоматология"),
+    ("Автосервис", "автосервис"), ("Ремонт квартир", "ремонт квартир"),
+    ("Салон красоты", "салон красоты"), ("Юрист", "юрист"),
+    ("Фотостудия", "фотостудия"), ("Ветеринар", "ветеринар"),
+    ("Груминг", "груминг"), ("Фитнес", "фитнес"), ("Кафе/Ресторан", "кафе"),
+    ("Доставка еды", "доставка еды"),
+)
+
 CHAIN_HINTS = ("сеть", "франшиза", "филиал", "холдинг", "гипермаркет", "тц ", "торговый центр")
 
 
@@ -402,7 +413,7 @@ def parse_firm(html: str, city: str, firm_id: str, query: str = "") -> dict:
         if kind == "whatsapp":
             continue  # WhatsApp не используем
         if kind == "email":
-            email = value.replace("mailto:", "").strip()
+            email = value.replace("mailto:", "").split("?")[0].split("#")[0].strip()
             if email and "@" in email and email not in emails:
                 emails.append(email)
             continue
@@ -483,6 +494,19 @@ class TwoGisClient:
         self.delay = delay
         self._session = self._build_session(proxies)
 
+    def close(self) -> None:
+        if hasattr(self, "_session") and self._session:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     def _build_session(self, proxies: dict | None) -> requests.Session:
         session = requests.Session()
         session.headers.update(
@@ -507,7 +531,7 @@ class TwoGisClient:
         headers = {"Referer": referer} if referer else {}
         resp = self._session.get(url, timeout=self.timeout, headers=headers)
         resp.raise_for_status()
-        if any(hint in resp.url or hint in resp.text[:4000] for hint in CAPTCHA_HINT):
+        if any(hint in resp.url or hint in resp.text[:60000] for hint in CAPTCHA_HINT):
             raise BlockedError(f"2GIS вернул captcha: {url}")
         return resp.text
 
@@ -627,6 +651,24 @@ class BrowserClient(TwoGisClient):
         finally:
             page.close()
 
+    def close(self) -> None:
+        try:
+            if hasattr(self, "_ctx") and self._ctx:
+                self._ctx.close()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_browser") and self._browser:
+                self._browser.close()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_pw") and self._pw:
+                self._pw.stop()
+        except Exception:
+            pass
+        super().close()
+
 
 # --- фильтры и скоринг ------------------------------------------------------
 
@@ -743,6 +785,24 @@ def drop_boilerplate_domains(leads: list[dict], ratio: float = 0.35, minimum: in
         lead["website"] = lead["websites"][0] if lead["websites"] else ""
         lead["has_website"] = bool(lead["websites"]) or lead.get("site_link", False)
     return len(boiler)
+
+
+def dedup_by_id(leads: list[dict]) -> list[dict]:
+    """Убирает повторы лидов по `id`, сохраняя порядок и первое вхождение.
+
+    Лиды без `id` (или с пустым) считаются уникальными и сохраняются все.
+    Входной список не трогает — возвращает новый.
+    """
+    seen: set[str] = set()
+    result: list[dict] = []
+    for lead in leads:
+        lead_id = str(lead.get("id") or "")
+        if lead_id:
+            if lead_id in seen:
+                continue
+            seen.add(lead_id)
+        result.append(lead)
+    return result
 
 
 # --- запись -----------------------------------------------------------------

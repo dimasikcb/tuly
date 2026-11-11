@@ -40,6 +40,7 @@ ffmpeg*/
 # лиды 2GIS
 leads.csv
 leads.jsonl
+leads_prompts/
 out/
 *.migrated
 archive/

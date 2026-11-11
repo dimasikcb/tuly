@@ -214,9 +214,11 @@ class BypassPanelTest(unittest.TestCase):
         self.assertIn("остальной", detail)
         self.assertEqual(color, app.OK)
 
-    def test_apps_section_hidden_for_global_scope(self) -> None:
+    def test_apps_section_always_visible(self) -> None:
+        # Список программ нужен и карточке «Обход по программам», которая
+        # живёт независимо от VPN, поэтому он больше не прячется при scope=all.
         self.panel._set_scope("all")
-        self.assertEqual(self.panel.apps_card.winfo_manager(), "")
+        self.assertEqual(self.panel.apps_card.winfo_manager(), "grid")
 
 
 if __name__ == "__main__":

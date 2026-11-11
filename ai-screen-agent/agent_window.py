@@ -119,6 +119,10 @@ def _resolve_hwnd(tk_root):
     if not IS_WINDOWS or _user32 is None:
         return None
     try:
+        tk_root.update_idletasks()
+    except Exception:
+        pass
+    try:
         inner = int(tk_root.winfo_id())
     except Exception:
         return None

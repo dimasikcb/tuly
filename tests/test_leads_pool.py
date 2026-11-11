@@ -749,6 +749,9 @@ def test_pool_layers_have_no_upward_imports() -> None:
 
 
 if __name__ == "__main__":
+    import sys
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for name, func in list(globals().items()):
         if name.startswith("test_") and callable(func):
             func()

@@ -134,15 +134,15 @@ class StagnationTracker:
 
     @staticmethod
     def _is_same_point(prev, cur, tolerance):
-        """Та же точка: смещение по КАЖДОЙ оси не больше tolerance (px)."""
+        """Та же точка/действие: смещение по КАЖДОЙ оси не больше tolerance (px)."""
         if prev is None or cur is None:
             return False
+        if len(prev) != len(cur):
+            return False
         try:
-            dx = abs(float(cur[0]) - float(prev[0]))
-            dy = abs(float(cur[1]) - float(prev[1]))
+            return all(abs(float(c) - float(p)) <= tolerance for c, p in zip(cur, prev))
         except (TypeError, ValueError, IndexError):
             return False
-        return dx <= tolerance and dy <= tolerance
 
     def register(self, point, screen_changed):
         if screen_changed:

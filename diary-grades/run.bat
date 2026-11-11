@@ -26,6 +26,11 @@ if not exist ".venv\.diary-ready" (
   echo Environment ready.
 )
 
+if not exist ".venv\Scripts\pythonw.exe" (
+  echo ERROR: .venv not ready — run the setup first.
+  pause
+  exit /b 1
+)
 start "" ".venv\Scripts\pythonw.exe" "app.pyw" %*
 exit /b 0
 

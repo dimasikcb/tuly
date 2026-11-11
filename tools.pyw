@@ -5,7 +5,7 @@
 В одном окне:
   * AutoClicker          — клики по точкам, областям и картинкам;
   * Пустые файлы и папки — поиск и удаление пустых файлов и папок;
-  * DNS                  — Quad9 / Xbox / DHCP + DNS-over-HTTPS;
+  * DNS                  — Quad9 / Xbox / Дефолтное (DoH для первых двух);
   * Дневник МО           — оценки, «5» до 4.50 и запас прочности (diary-grades/).
 
 Запуск: двойной клик по tools.pyw (или pythonw tools.pyw).
@@ -1938,9 +1938,9 @@ class DnsPanel(Panel):
 
         for row, items in (
             (buttons_one, (
-                ("Quad9 + DoH", lambda: self._apply(QUAD9_DNS, QUAD9_DOH, "Quad9")),
-                ("Xbox + DoH", lambda: self._apply(XBOX_DNS, XBOX_DOH, "Xbox")),
-                ("DHCP", self._dhcp),
+                ("Quad9", lambda: self._apply(QUAD9_DNS, QUAD9_DOH, "Quad9")),
+                ("Xbox", lambda: self._apply(XBOX_DNS, XBOX_DOH, "Xbox")),
+                ("Дефолтное", self._dhcp),
             )),
             (buttons_two, (
                 ("Quad9 + очистить туннель", self._quad9_and_tunnel),
@@ -3825,8 +3825,8 @@ class ScrollList(tk.Frame):
         self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self.inner.bind("<Configure>", self._on_inner)
         self.canvas.bind("<Configure>", self._on_canvas)
-        self.canvas.bind("<Enter>", lambda _e: self._wheel(True))
-        self.canvas.bind("<Leave>", lambda _e: self._wheel(False))
+        self.canvas.bind("<MouseWheel>", self._scroll)
+        self.inner.bind("<MouseWheel>", self._scroll)
 
     def _on_inner(self, _event=None) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -3834,25 +3834,15 @@ class ScrollList(tk.Frame):
     def _on_canvas(self, event) -> None:
         self.canvas.itemconfigure(self._window, width=event.width)
 
-    def _wheel(self, active: bool) -> None:
-        if active:
-            self.canvas.bind_all("<MouseWheel>", self._scroll)
-        else:
-            try:
-                x, y = self.canvas.winfo_pointerxy()
-                rx, ry = self.canvas.winfo_rootx(), self.canvas.winfo_rooty()
-                rw, rh = self.canvas.winfo_width(), self.canvas.winfo_height()
-                if rx <= x <= rx + rw and ry <= y <= ry + rh:
-                    return
-            except Exception:
-                pass
-            self.canvas.unbind_all("<MouseWheel>")
+    def _wheel(self, _active: bool) -> None:
+        pass
 
-    def _scroll(self, event) -> None:
+    def _scroll(self, event) -> str:
         try:
             self.canvas.yview_scroll(int(-event.delta / 120) * _scroll_step(), "units")
         except tk.TclError:
             pass
+        return "break"
 
     def clear(self) -> None:
         for child in self.inner.winfo_children():
@@ -3868,9 +3858,9 @@ class BypassPanel(Panel):
     def __init__(self, master: tk.Misc, hub) -> None:
         super().__init__(master, hub)
         cfg = bypass_cfg()
-        self.mode = cfg["mode"]
-        self.scope = cfg["scope"]
-        self.selected_apps: set[str] = {name.lower() for name in cfg["apps"]}
+        self.mode = cfg.get("mode", "happ")
+        self.scope = cfg.get("scope", "all")
+        self.selected_apps: set[str] = {name.lower() for name in cfg.get("apps", [])}
         self.catalog: list[AppEntry] = []
         self.rows: dict[str, AppRow] = {}
         self.state: dict = {}
@@ -4784,16 +4774,17 @@ class BypassPanel(Panel):
 
         tk.Label(dialog, text="Файл Happ.exe (клиент Happ):", bg=CARD, fg=MUTED,
                  font=ui_font(9)).pack(anchor="w", padx=px(16), pady=(px(14), px(4)))
-        path_var = tk.StringVar(value=cfg["happ_path"])
+        path_var = tk.StringVar(value=cfg.get("happ_path", ""))
         entry = tk.Entry(dialog, textvariable=path_var, bg=FIELD, fg=FG,
                          insertbackground=FG, relief="flat", width=52)
         entry.pack(anchor="w", padx=px(16))
 
         def browse() -> None:
+            happ_p = cfg.get("happ_path", "")
             chosen = filedialog.askopenfilename(
                 title="Где лежит Happ.exe",
-                initialdir=str(Path(cfg["happ_path"]).parent)
-                if Path(cfg["happ_path"]).exists() else "C:/",
+                initialdir=str(Path(happ_p).parent)
+                if happ_p and Path(happ_p).exists() else "C:/",
                 filetypes=[("Happ.exe", "*.exe"), ("Все файлы", "*.*")],
                 parent=dialog,
             )
@@ -4931,9 +4922,14 @@ def _city_list(city: str) -> list[str]:
             return ["moscow"]
     return [c.strip() for c in city.split(",") if c.strip()]
 
-def leads_collect(city: str, query: str, cards: int, only_no_site: bool,
-                  min_reviews: int | None, on_progress, on_log, stop) -> dict:
-    """Обходит выдачу и карточки, горячих кладёт в пул. Возвращает счётчики."""
+def leads_collect(city: str, queries: list[str], cards: int, only_no_site: bool,
+                  min_reviews: int | None, on_progress, on_log, stop,
+                  limit: int | None = None) -> dict:
+    """Обходит выдачу и карточки по каждой нише, горячих кладёт в пул.
+
+    `queries` — список поисковых запросов (ниш): обходятся по очереди,
+    карточки дедуплицируются по id, итоговая выдача ограничивается `limit`.
+    """
     if not LEADS_OK:
         raise RuntimeError(LEADS_ERROR or "нет requests/selectolax")
     if not MAIL_OK:
@@ -4948,51 +4944,74 @@ def leads_collect(city: str, query: str, cards: int, only_no_site: bool,
     except (TypeError, ValueError):
         want = leads_engine.CARDS_PER_PAGE * 5
 
+    uniq: dict[str, str] = {}
+    for q in queries:
+        q = str(q or "").strip()
+        if q:
+            uniq.setdefault(q.lower(), q)
+    queries = list(uniq.values())
+    if not queries:
+        return {"checked": 0, "found": 0, "hot": 0, "pooled": 0,
+                "total": len(leads_mail.pool_load(POOL_FILE)), "rows": []}
+
     cities = _city_list(city)
     if not cities:
         cities = [city.strip() or "moscow"]
-    want_share = max(1, want // len(cities))
+    want_share = max(1, want // (len(cities) * len(queries)))
 
     all_cards: list[dict] = []
     seen: set[str] = set()
-    for ci, cur_city in enumerate(cities, 1):
+    for qi, q in enumerate(queries, 1):
         if stop.is_set():
             break
-        pages = leads_engine.pages_for(want_share)
-        city_cards: list[dict] = []
-        for page in range(1, pages + 1):
-            if stop.is_set() or len(city_cards) >= want_share:
+        on_log(f"ниша «{q}»: обход {len(cities)} город(ов)")
+        for ci, cur_city in enumerate(cities, 1):
+            if stop.is_set():
                 break
-            try:
-                found, _last_page = client.search_page(cur_city, query, page)
-            except Exception as exc:
-                on_log(f"{cur_city}: ошибка поиска ({exc})")
-                break
-            fresh = [c for c in found if c["id"] not in seen]
-            for c in fresh:
-                seen.add(c["id"])
-            city_cards.extend(fresh)
-            on_progress(f"город {ci}/{len(cities)} {cur_city} стр.{page}/{pages} · {len(city_cards)}/{want_share}")
-            if not fresh:
-                break
-        city_cards = city_cards[:want_share]
-        all_cards.extend(city_cards)
-        on_log(f"{cur_city} / {query}: карточек {len(city_cards)}")
+            pages = leads_engine.pages_for(want_share)
+            city_cards: list[dict] = []
+            for page in range(1, pages + 1):
+                if stop.is_set() or len(city_cards) >= want_share:
+                    break
+                try:
+                    found, _last_page = client.search_page(cur_city, q, page)
+                except Exception as exc:
+                    on_log(f"{cur_city}: ошибка поиска ({exc})")
+                    break
+                fresh = [c for c in found if c["id"] not in seen]
+                for c in fresh:
+                    seen.add(c["id"])
+                    c["query"] = q  # ниша, нашедшая карточку, — на саму карточку
+                city_cards.extend(fresh)
+                on_progress(f"ниша {qi}/{len(queries)} «{q}» · город {ci}/{len(cities)} "
+                            f"{cur_city} стр.{page}/{pages} · {len(city_cards)}/{want_share}")
+                if not fresh:
+                    break
+            city_cards = city_cards[:want_share]
+            all_cards.extend(city_cards)
+            on_log(f"{cur_city} / {q}: карточек {len(city_cards)}")
 
     if not all_cards:
         return {"checked": 0, "found": 0, "hot": 0, "pooled": 0,
                 "total": len(leads_mail.pool_load(POOL_FILE)), "rows": []}
 
     def one(card_info: tuple) -> dict | None:
-        cur_city, firm_id = card_info
+        cur_city, firm_id, q = card_info
         try:
             html = _leads_client().firm_html(cur_city, firm_id)
         except Exception:  # noqa: BLE001 - битая карточка не рушит прогон
             return None
-        return leads_engine.parse_firm(html, cur_city, firm_id, query)
+        lead = leads_engine.parse_firm(html, cur_city, firm_id, q)
+        if lead is not None:
+            # Запрос фиксируется на карточке, а не берётся из переменной цикла —
+            # иначе потоки ThreadPoolExecutor получили бы последнюю нишу.
+            lead["topic"] = q
+        return lead
 
-    # parse_search уже кладёт city в каждую карточку — восстанавливать не нужно
-    card_infos = [(c.get("city") or cities[0], c["id"]) for c in all_cards]
+    # parse_search уже кладёт city в каждую карточку — восстанавливать не нужно.
+    # Третий элемент — ниша: одна фирма может попасться в нескольких запросах.
+    card_infos = [(c.get("city") or cities[0], c["id"], c.get("query") or queries[0])
+                  for c in all_cards]
 
     parsed: list[dict] = []
     total = len(card_infos)
@@ -5006,11 +5025,14 @@ def leads_collect(city: str, query: str, cards: int, only_no_site: bool,
                 parsed.append(lead)
             on_progress(f"карточки {index}/{total} · собрано {len(parsed)}")
 
+    # Страховка от повторов между нишами: seen уже фильтрует карточки по id,
+    # но дедуплицируем и разобранные лиды (порядок сохраняется).
+    parsed = leads_engine.dedup_by_id(parsed)
+
     ratings = client.ratings(lead["id"] for lead in parsed)
     for lead in parsed:
         if ratings.get(lead["id"]) is not None:
             lead["rating"] = ratings[lead["id"]]
-        lead["topic"] = query
         lead["score"], lead["reason"] = leads_engine.score(lead)
 
     dropped = leads_engine.drop_boilerplate_domains(parsed)
@@ -5027,6 +5049,9 @@ def leads_collect(city: str, query: str, cards: int, only_no_site: bool,
         key=lambda lead: lead["score"],
         reverse=True,
     )
+    if limit:
+        # Итоговый лимит: лучшие N по скору, ДО добавления в пул горячих.
+        selected = selected[:max(1, int(limit))]
 
     pooled = 0
     if MAIL_OK:
@@ -5064,16 +5089,18 @@ class LeadsPanel(Panel):
         body.columnconfigure(3, weight=1)
 
         self.city_var = tk.StringVar(value="moscow")
-        self.query_var = tk.StringVar(value="барбершоп")
+        self.query_var = tk.StringVar(value="")  # своя ниша — по умолчанию пусто
         self.cards_var = tk.StringVar(value="60")
         self.reviews_var = tk.StringVar(value="")
         self.no_site_var = tk.BooleanVar(value=True)
+        self.limit_var = tk.StringVar(value="20")
 
         def caption(row: int, column: int, text: str) -> None:
             tk.Label(body, text=text, bg=CARD, fg=MUTED, anchor="w",
                      font=ui_font(9)).grid(
                 row=row, column=column, sticky="w", padx=(0, px(8)), pady=px(5))
 
+        # Ряд 0: город | мин. отзывов
         caption(0, 0, "Город")
         _city_opts = ["russia — вся Россия"] + [
             c for c in (leads_mail.RU_CITIES if MAIL_OK and hasattr(leads_mail, "RU_CITIES") else [])
@@ -5082,22 +5109,49 @@ class LeadsPanel(Panel):
             body, textvariable=self.city_var, values=_city_opts, width=20
         )
         _city_cb.grid(row=0, column=1, sticky="ew", pady=px(5))
-        caption(0, 2, "Что искать")
-        ttk.Entry(body, textvariable=self.query_var).grid(
-            row=0, column=3, sticky="ew", padx=(px(16), 0), pady=px(5))
+        caption(0, 2, "Мин. отзывов")
+        ttk.Entry(body, textvariable=self.reviews_var, width=8).grid(
+            row=0, column=3, sticky="w", padx=(px(16), 0), pady=px(5))
 
+        # Ряд 1: карточек всего (делятся между городами и нишами) | лимит лидов в итоговой выборке
         caption(1, 0, "Карточек")
         ttk.Spinbox(body, from_=12, to=600, increment=12, width=6,
                     textvariable=self.cards_var).grid(
             row=1, column=1, sticky="w", pady=px(5))
-        caption(1, 2, "Мин. отзывов")
-        ttk.Entry(body, textvariable=self.reviews_var, width=8).grid(
+        caption(1, 2, "Лимит лидов")
+        ttk.Combobox(body, textvariable=self.limit_var,
+                     values=("10", "20", "50", "100"), width=6,
+                     state="readonly").grid(
             row=1, column=3, sticky="w", padx=(px(16), 0), pady=px(5))
+
+        # Ряд 2: популярные ниши — сетка чекбоксов 4 × 3, первая отмечена
+        niches_box = tk.Frame(body, bg=CARD)
+        niches_box.grid(row=2, column=0, columnspan=4, sticky="w", pady=(px(4), 0))
+        tk.Label(niches_box, text="Ниши", bg=CARD, fg=MUTED, anchor="w",
+                 font=ui_font(9)).pack(anchor="w")
+        niches = tk.Frame(niches_box, bg=CARD)
+        niches.pack(anchor="w")
+        self.niche_vars: list[tuple[str, tk.BooleanVar]] = []
+        for i, (label, niche_query) in enumerate(getattr(leads_engine, "NICHES", ())):
+            var = tk.BooleanVar(value=(i == 0))
+            self.niche_vars.append((niche_query, var))
+            dark_check(niches, label, var, bg=CARD).grid(
+                row=i // 4, column=i % 4, sticky="w",
+                padx=(0, px(12)), pady=px(2))
+
+        # Ряд 3: своя ниша — добавится к выбранным чекбоксам
+        caption(3, 0, "Своя ниша")
+        ttk.Entry(body, textvariable=self.query_var).grid(
+            row=3, column=1, columnspan=2, sticky="ew", pady=px(5))
+        tk.Label(body, text="добавится к выбранным нишам", bg=CARD, fg=MUTED,
+                 font=ui_font(8)).grid(
+            row=3, column=3, sticky="w", padx=(px(8), 0), pady=px(5))
+
         tk.Label(body, text="12 фирм на страницу выдачи 2ГИС", bg=CARD, fg=MUTED,
-                 font=ui_font(8)).grid(row=2, column=0, columnspan=4, sticky="w")
+                 font=ui_font(8)).grid(row=4, column=0, columnspan=4, sticky="w")
 
         options = tk.Frame(body, bg=CARD)
-        options.grid(row=3, column=0, columnspan=4, sticky="w", pady=(px(8), 0))
+        options.grid(row=5, column=0, columnspan=4, sticky="w", pady=(px(8), 0))
         dark_check(options, "только без сайта", self.no_site_var, bg=CARD).pack(side="left")
 
         actions = ttk.Frame(self)
@@ -5160,7 +5214,19 @@ class LeadsPanel(Panel):
                 parent=self,
             )
             return
-        MailWindow(self.hub, POOL_FILE)
+        if getattr(self, "_mail_win", None) is not None and self._mail_win.winfo_exists():
+            self._mail_win.lift()
+            self._mail_win.focus_force()
+            return
+        self._mail_win = MailWindow(self.hub, POOL_FILE)
+
+    def _selected_queries(self) -> list[str]:
+        """Запросы отмеченных ниш + своя ниша (без дублей, порядок сохранён)."""
+        queries = [q for q, var in self.niche_vars if var.get()]
+        own = self.query_var.get().strip()
+        if own and own.lower() not in {q.lower() for q in queries}:
+            queries.append(own)
+        return queries
 
     def start(self) -> None:
         if self.busy:
@@ -5177,15 +5243,20 @@ class LeadsPanel(Panel):
         city = self.city_var.get().strip()
         if city.lower().startswith("russia"):  # «russia — вся Россия» → «russia»
             city = "russia".lower()
-        query = self.query_var.get().strip()
-        if not city or not query:
-            messagebox.showwarning("Лиды 2GIS", "Нужны город и поисковый запрос.", parent=self)
+        queries = self._selected_queries()
+        if not city or not queries:
+            messagebox.showwarning(
+                "Лиды 2GIS", "Выберите город и хотя бы одну нишу.", parent=self)
             return
 
         try:
             cards = max(12, min(600, int(self.cards_var.get())))
         except ValueError:
             cards = 60
+        try:
+            limit = int(self.limit_var.get())
+        except ValueError:
+            limit = 20
         try:
             min_reviews = int(self.reviews_var.get()) if self.reviews_var.get().strip() else None
         except ValueError:
@@ -5198,14 +5269,18 @@ class LeadsPanel(Panel):
         self.status_var.set("Собираю…")
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
-        self.append_log(self.log_box, f"старт: {city} / {query}, карточек {cards}")
+        self.append_log(
+            self.log_box,
+            f"старт: {city} / ниши: {', '.join(queries)}, карточек {cards}, лимит {limit}",
+        )
 
         def work() -> dict:
             return leads_collect(
-                city, query, cards, only_no_site, min_reviews,
+                city, queries, cards, only_no_site, min_reviews,
                 lambda text: self.hub.post(lambda text=text: self.status_var.set(text)),
                 lambda text: self.hub.post(lambda text=text: self.append_log(self.log_box, text)),
                 self.stop_event,
+                limit=limit,
             )
 
         self.hub.run_bg(work, self._done, self._fail)
@@ -5250,7 +5325,10 @@ class LeadsPanel(Panel):
         """Заполняет пустой topic у записей пула текущим поисковым запросом."""
         query = self.query_var.get().strip()
         if not query:
-            self.status_var.set("Введите «Что искать» перед заполнением темы")
+            # Своя ниша пуста — берём первую отмеченную из списка ниш
+            query = next((q for q, var in self.niche_vars if var.get()), "")
+        if not query:
+            self.status_var.set("Выберите нишу или введите свою")
             return
         if not MAIL_OK:
             return
@@ -5504,8 +5582,8 @@ class MailWindow(tk.Toplevel):
             canvas.yview_scroll(int(-event.delta / 120) * _scroll_step(), "units")
             return "break"
 
-        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        canvas.bind("<MouseWheel>", _wheel)
+        cfg.bind("<MouseWheel>", _wheel)
 
         left = ttk.Frame(cfg)
         left.grid(row=0, column=0, sticky="nsew", padx=(px(6), px(18)), pady=px(8))
@@ -5677,6 +5755,8 @@ class MailWindow(tk.Toplevel):
             return 5.0
 
     def _refresh_tree(self) -> None:
+        if not self.winfo_exists():
+            return
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._links: dict[str, str] = {}
@@ -5743,13 +5823,15 @@ class MailWindow(tk.Toplevel):
             return leads_mail.generate_texts(
                 self.leads, self.settings, self.state,
                 lambda text, tag=None: self._post_log(text, tag),
-                lambda text: self.hub.post(lambda: self.status_var.set(text)),
+                lambda text: self.hub.post(lambda t=text: self.status_var.set(t) if self.winfo_exists() else None),
                 self.stop_event,
             )
 
         self.hub.run_bg(work, self._generated, self._failed)
 
     def _generated(self, count) -> None:
+        if not self.winfo_exists():
+            return
         self.status_var.set(f"Готово: текстов {count}")
         self._refresh_tree()
         self._log(f"тексты готовы: {count}", "ok")
@@ -5863,16 +5945,37 @@ class MailWindow(tk.Toplevel):
         if not phone:
             self._log("сначала введи номер телефона (TG номер телефона)", "warn")
             return
-        try:
-            leads_mail.tg_login(
+
+        def ask_on_main(title, prompt, secret=False):
+            res = [None]
+            ev = threading.Event()
+
+            def dlg():
+                try:
+                    res[0] = simpledialog.askstring(
+                        title, prompt, parent=self, show="*" if secret else None)
+                finally:
+                    ev.set()
+
+            self.hub.post(dlg)
+            ev.wait()
+            return res[0]
+
+        def work():
+            return leads_mail.tg_login(
                 self.settings, phone,
-                ask=lambda title, prompt, secret=False: simpledialog.askstring(
-                    title, prompt, parent=self, show="*" if secret else None),
-                on_log=self._log,
+                ask=ask_on_main,
+                on_log=lambda t, tag=None: self._post_log(t, tag),
             )
+
+        def on_done(_res):
             self._log("TG: аккаунт привязан, сессия сохранена", "ok")
-        except Exception as exc:  # noqa: BLE001
+
+        def on_err(exc):
             self._log(f"TG: {exc}", "error")
+
+        self._log("TG: подключение к серверу Telegram…", "info")
+        self.hub.run_bg(work, on_done, on_err)
 
     def _logout_tg(self) -> None:
         self.settings = self._collect()
@@ -5979,9 +6082,24 @@ class ShortsAutopilotPanel(Panel):
         self._poll_job = self.after(3000, self._on_poll)
 
     def _on_poll(self) -> None:
+        if not self.winfo_exists():
+            return
+        if getattr(self.hub, "current", None) == "shorts":
+            self.refresh_status()
+            self.update_log()
+        self._schedule_poll()
+
+    def on_show(self) -> None:
         self.refresh_status()
         self.update_log()
-        self._schedule_poll()
+
+    def shutdown(self) -> None:
+        if self._poll_job:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
 
     def refresh_status(self) -> None:
         pid = self._find_pid()
@@ -5997,18 +6115,34 @@ class ShortsAutopilotPanel(Panel):
             self.btn_start.configure(state="normal")
             self.btn_stop.configure(state="disabled")
 
-        web_ok = self._check_webui()
-        if web_ok:
-            self.lbl_web_status.configure(text="● Онлайн", fg=OK)
-            self.btn_web.configure(state="normal")
-        else:
-            self.lbl_web_status.configure(text="○ Офлайн", fg=MUTED)
+        if getattr(self, "_refreshing_bg", False):
+            return
+        self._refreshing_bg = True
 
-        davinci_ok = self._check_process("Resolve.exe")
-        if davinci_ok:
-            self.lbl_davinci_status.configure(text="● Запущен", fg=OK)
-        else:
-            self.lbl_davinci_status.configure(text="○ Закрыт", fg=MUTED)
+        def bg_checks() -> tuple[bool, bool]:
+            web = self._check_webui()
+            davinci = self._check_process("Resolve.exe")
+            return web, davinci
+
+        def on_done(res: tuple[bool, bool]) -> None:
+            self._refreshing_bg = False
+            if not self.winfo_exists():
+                return
+            web_ok, davinci_ok = res
+            if web_ok:
+                self.lbl_web_status.configure(text="● Онлайн", fg=OK)
+                self.btn_web.configure(state="normal")
+            else:
+                self.lbl_web_status.configure(text="○ Офлайн", fg=MUTED)
+            if davinci_ok:
+                self.lbl_davinci_status.configure(text="● Запущен", fg=OK)
+            else:
+                self.lbl_davinci_status.configure(text="○ Закрыт", fg=MUTED)
+
+        def on_err(_exc) -> None:
+            self._refreshing_bg = False
+
+        self.hub.run_bg(bg_checks, on_done, on_err)
 
     def _find_pid(self) -> int | None:
         pid_file = self.shorts_dir / "state" / ".single_instance.pid"
@@ -6515,12 +6649,14 @@ class DiaryGradesPanel(Panel):
             except (TypeError, ValueError):
                 continue
 
+        cur_p = self.cfg.current_period() if self.cfg else None
+        cur_p_label = cur_p.label if cur_p else "—"
         if subjects:
             self.source_label = "КЭШ" if (payload or {}).get("source") != "demo" else "КЭШ · ДЕМО"
-            self.period_label = (payload or {}).get("period") or self.cfg.current_period().label
+            self.period_label = (payload or {}).get("period") or cur_p_label
             self.demo_note = ""
         else:
-            result = self.demo.demo_result(self.cfg.current_period().label)
+            result = self.demo.demo_result(cur_p_label)
             subjects = list(result.subjects)
             self.source_label = "ДЕМО-ДАННЫЕ"
             self.demo_note = "  ·  не реальные оценки"
@@ -7030,10 +7166,7 @@ class AIScreenAgentPanel(Panel):
         if self._is_running():
             self.hub.toast("Окно агента уже запущено", kind="warn")
             return
-        pythonw = APP_DIR.parent / "AppData" / "Local" / "Programs" / "Python" / "Python313" / "pythonw.exe"
-        if not pythonw.exists():
-            pythonw = Path(sys.executable).parent / "pythonw.exe"
-        py_exe = str(pythonw if pythonw.exists() else sys.executable)
+        py_exe = pythonw_executable()
 
         try:
             env = os.environ.copy()
@@ -7112,8 +7245,11 @@ class AIScreenAgentPanel(Panel):
         if self.config_file.exists():
             try:
                 cfg = json.loads(self.config_file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+                if not isinstance(cfg, dict):
+                    cfg = {}
+            except Exception as exc:
+                self.hub.toast(f"Ошибка чтения config.json: {exc}", kind="error")
+                return
         cfg["api_key"] = new_key
         try:
             self.config_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -7160,11 +7296,22 @@ class AIScreenAgentPanel(Panel):
             self.lbl_status.config(text="○ Остановлен", fg=FG)
 
     def _schedule_poll(self) -> None:
-        self.refresh()
+        if not self.winfo_exists():
+            return
+        if getattr(self.hub, "current", None) == "ai_agent":
+            self.refresh()
         self._poll_job = self.after(3000, self._schedule_poll)
 
     def on_show(self) -> None:
         self.refresh()
+
+    def shutdown(self) -> None:
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
 
 
 
@@ -7173,7 +7320,7 @@ class AIScreenAgentPanel(Panel):
 NAV = (
     ("autoclicker", "AutoClicker", "клики по экрану"),
         ("clean", "Пустые файлы", "0 байт и пустые папки"),
-    ("dns", "DNS", "Quad9 · Xbox · DoH"),
+    ("dns", "DNS", "Quad9 · Xbox · Дефолтное"),
     ("github", "GitHub", "бэкап проектов"),
     ("bypass", "Bypass", "обход DPI: глобально и по приложениям"),
     ("leads", "Лиды 2GIS", "контакты без сайта"),
@@ -7262,11 +7409,20 @@ class ShutdownWatcherPanel(Panel):
         self.log_lines(["Страж запущен:", *[f"  • {a.name} ({a.mode}: {a.exe or a.marker})" for a in agents]])
 
     def stop_watcher(self) -> None:
+        if self._poll_job:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
         if self.watcher:
             self.watcher.stop()
         self.watcher = None
         self.btn_stop.config(state="disabled")
         self.lbl_timer.config(text="")
+
+    def shutdown(self) -> None:
+        self.stop_watcher()
 
     def cancel_shutdown(self) -> None:
         if self.watcher and self.watcher.armed:
@@ -7285,6 +7441,12 @@ class ShutdownWatcherPanel(Panel):
         self.log.config(state="disabled")
 
     def _schedule_poll(self) -> None:
+        if self._poll_job:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
         if self.watcher:
             self._poll_job = self.after(2500, self._poll)
 
@@ -7336,7 +7498,7 @@ HEADERS = {
     ),
     "dns": (
         "DNS",
-        "Профили Quad9 и Xbox, DHCP и DNS-over-HTTPS. Нужны права администратора.",
+        "Профили Quad9, Xbox и «Дефолтное» (автоматический DNS от DHCP). DoH для Quad9 и Xbox. Нужны права администратора.",
     ),
     "github": (
         "GitHub",
@@ -7365,6 +7527,10 @@ HEADERS = {
     "shutdown": (
         "Страж выключения",
         "Следит за ИИ-агентами (WorkBuddy, OpenCode, Antigravity) и выключает ПК, когда все завершат работу.",
+    ),
+    "settings": (
+        "Настройки",
+        "Параметры программы: чувствительность прокрутки колёсиком мыши.",
     ),
 }
 
@@ -7666,13 +7832,14 @@ class Hub(tk.Tk):
             if hook is not None:
                 try:
                     hook()
-                except Exception:  # noqa: BLE001 - показ вкладки не должен падать
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    log_exception()
+                    self.toast(f"Сбой обновления вкладки: {exc}", kind="error")
         panel.tkraise()
         self.current = key
         for item_key, item in self.nav_items.items():
             item.set_active(item_key == key)
-        title, subtitle = HEADERS[key]
+        title, subtitle = HEADERS.get(key, (key.title(), ""))
         self.title_var.set(title)
         self.subtitle_var.set(subtitle)
 
@@ -7770,12 +7937,12 @@ class Hub(tk.Tk):
         if self._closing:
             return
         self._closing = True
-        panel = self.panels.get("autoclicker")
-        if panel is not None:
-            try:
-                panel.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
+        for p in list(self.panels.values()):
+            if hasattr(p, "shutdown"):
+                try:
+                    p.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
         self.destroy()
 
 

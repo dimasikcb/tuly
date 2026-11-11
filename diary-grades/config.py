@@ -38,7 +38,7 @@ DEFAULTS: dict = {
     "login_timeout_s": 300,        # ожидание ручного входа через ЕСИА
     "nav_timeout_s": 35,
     "subject_scan_timeout_s": 30,    # обход предметов, у которых нет оценок
-    "auto_refresh_min": 30,          # скрытое автообновление, 0 = выключить
+    "auto_refresh_min": 5,           # скрытое автообновление, 0 = выключить
     "demo_on_empty": True,         # показывать демо, если нет ни сессии, ни кэша
     "save_debug": True,            # дамп HTML/JSON при неудачном парсинге
 }

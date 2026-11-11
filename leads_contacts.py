@@ -29,12 +29,12 @@ def phone_to_e164(phone: str) -> str:
     digits = re.sub(r"\D", "", raw)
     if not digits:
         return ""
+    if raw.startswith("+"):
+        return "+" + digits
     if len(digits) == 11 and digits[0] in "78":
         return "+7" + digits[1:]
     if len(digits) == 10:
         return "+7" + digits
-    if raw.startswith("+"):
-        return "+" + digits
     return "+" + digits
 
 
@@ -72,7 +72,7 @@ def to_link(channel: str, value) -> str:
     low = value.lower()
     if channel == "telegram":
         if is_phone_like(value):
-            return "https://t.me/+" + re.sub(r"\D", "", value)  # диплинк по номеру
+            return "https://t.me/" + phone_to_e164(value)  # диплинк по номеру: https://t.me/+79001234567
         clean = value
         for prefix in ("telegram.me/", "t.me/"):
             if low.startswith(prefix):
@@ -84,7 +84,7 @@ def to_link(channel: str, value) -> str:
         return "https://max.ru/" + clean.lstrip("@").strip("/")
     if channel == "vk":
         clean = value
-        for prefix in ("vk.com/", "vk.ru/"):
+        for prefix in ("vk.com/", "vk.ru/", "vk.me/"):
             if low.startswith(prefix):
                 clean = value[len(prefix):]
                 break
@@ -114,7 +114,7 @@ def from_link(channel: str, value) -> str:
             return value_clean[idx:].lstrip("@").strip("/")
         return value_clean.lstrip("@").strip("/")
     if channel == "vk":
-        for prefix in ("vk.com/", "vk.ru/"):
+        for prefix in ("vk.com/", "vk.ru/", "vk.me/"):
             if prefix in low:
                 idx = low.index(prefix) + len(prefix)
                 return value_clean[idx:].lstrip("@").strip("/")

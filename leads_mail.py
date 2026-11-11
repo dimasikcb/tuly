@@ -93,6 +93,7 @@ from leads_pool import (  # noqa: F401 - реэкспорт: GUI и тесты �
 PRIORITY = ("max", "telegram", "vk", "email")
 DAY = 86400.0
 STATUSES = ("replied", "stopped", "read", "seen", "closed", "failed")
+TERMINAL_STATUSES = ("replied", "stopped", "closed", "failed")
 
 # Один lock на весь Telegram: сессия SQLite и один аккаунт.
 TG_LOCK = threading.Lock()
@@ -107,10 +108,11 @@ _CLIENTS_LOCK = threading.Lock()
 # --------------------------------------------------------------------------- #
 
 DEFAULT_SETTINGS = {
+    # ai_url — любой OpenAI-совместимый провайдер (по умолчанию OpenRouter).
     "ai_url": "https://openrouter.ai/api/v1",
     "ai_model": "meta-llama/llama-3.1-8b-instruct:free",
     "ai_key": "",
-    "style": "Коротко, по делу. Без приветствий и шаблонных фраз. Конкретная выгода, один вопрос в конце.",
+    "style": "Вежливо, на «вы», без официоза. 4-6 предложений: интерес к бизнесу, готовый пример сайта, ссылка, открытый вопрос в конце. Цены «в лоб» не называть.",
     "idea": "",
     "api_id": "",
     "api_hash": "",
@@ -130,6 +132,8 @@ DEFAULT_SETTINGS = {
     "pool_days": "5",
     "pacing": "60",
     "dry_run": False,
+    "github_base_url": "https://username.github.io/demo/",
+    "site_prompt_template": "",  # пусто = встроенный шаблон промпта
 }
 
 
@@ -178,6 +182,7 @@ class MailState:
 
     def __init__(self, path) -> None:
         self.path = Path(path)
+        self.lock = threading.RLock()
         self.data: dict = {}
         if not self.path.exists():
             return
@@ -206,24 +211,34 @@ class MailState:
                 self.data = {}
 
     def get(self, lead_id) -> dict:
-        return self.data.setdefault(str(lead_id), {})
+        with self.lock:
+            return self.data.setdefault(str(lead_id), {})
 
     def save(self) -> None:
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-            text = json.dumps(self.data, ensure_ascii=False, indent=1)
-            tmp.write_text(text, encoding="utf-8")
-            for attempt in range(5):
-                try:
-                    tmp.replace(self.path)
-                    return
-                except OSError:
-                    if attempt < 4:
-                        time.sleep(0.1)
-            self.path.write_text(text, encoding="utf-8")
-        except OSError:
-            pass
+        with self.lock:
+            tmp = self.path.with_name(
+                f"{self.path.name}.{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.tmp"
+            )
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                text = json.dumps(dict(self.data), ensure_ascii=False, indent=1)
+                tmp.write_text(text, encoding="utf-8")
+                for attempt in range(5):
+                    try:
+                        tmp.replace(self.path)
+                        return
+                    except OSError:
+                        if attempt < 4:
+                            time.sleep(0.1)
+                self.path.write_text(text, encoding="utf-8")
+            except OSError:
+                pass
+            finally:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
 
     def reset_failed(self) -> int:
         count = 0
@@ -237,14 +252,183 @@ class MailState:
         return count
 
 
-def fallback_text(row: dict, idea: str) -> str:
-    """Текст без ИИ — чтобы предпросмотр работал до настройки ключа."""
-    name = (row.get("name") or "вашей компании").strip()
-    idea = (idea or "").strip() or "сделаю простой сайт под ваши услуги"
+# --------------------------------------------------------------------------- #
+#  Промпт для сайта (GitHub Pages без сервера)
+# --------------------------------------------------------------------------- #
+
+_TRANSLIT: dict = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def _translit(text: str) -> str:
+    """Кириллица в латинский slug: прочее → «-», схлопать, ≤60 символов."""
+    chars = []
+    for ch in str(text or "").lower():
+        if ch in _TRANSLIT:
+            chars.append(_TRANSLIT[ch])
+        elif "a" <= ch <= "z" or "0" <= ch <= "9":
+            chars.append(ch)
+        else:
+            chars.append("-")
+    slug = re.sub(r"-+", "-", "".join(chars))
+    return slug[:60].strip("-")
+
+
+def site_prompt_file(row: dict, out_dir=None) -> Path:
+    """Путь файла промпта лида: leads_prompts/<имя_транслитом_или_id>.txt."""
+    folder = (Path(out_dir) if out_dir is not None
+              else Path(__file__).resolve().parent / "leads_prompts")
+    stem = _translit(row.get("name") or "")
+    if not stem:
+        # row_id может вернуть pool_key с "|" — в именах файлов Windows его быть не должно
+        raw = re.sub(r"[^a-z0-9]", "-", str(row_id(row) or "").lower())
+        stem = re.sub(r"-+", "-", raw)[:60].strip("-")
+    if not stem:
+        stem = "lead"
+    return folder / f"{stem}.txt"
+
+
+def _lead_messengers(row: dict) -> str:
+    """Контакты лида строкой: «Telegram: ..., MAX: ..., VK: ..., Email: ...»."""
+    parts = []
+    for key, title in (("telegram", "Telegram"), ("max", "MAX"),
+                       ("vk", "VK"), ("email", "Email")):
+        value = str(row.get(key) or "").strip()
+        if value:
+            parts.append(f"{title}: {value}")
+    if not parts:
+        raw = row.get("messengers")
+        if isinstance(raw, str):
+            items = raw.split(";")
+        elif isinstance(raw, (list, tuple)):
+            items = list(raw)
+        else:
+            items = []
+        for item in items:
+            value = str(item or "").strip()
+            if not value:
+                continue
+            if ":" in value:
+                platform, _, handle = value.partition(":")
+                value = f"{platform.strip().capitalize()}: {handle.strip()}"
+            parts.append(value)
+    return ", ".join(parts) if parts else "не найдены"
+
+
+class _PromptFields(dict):
+    """Поля шаблона промпта: неизвестный плейсхолдер → пустая строка."""
+
+    def __missing__(self, key: str) -> str:  # noqa: D105
+        return ""
+
+
+def _default_site_prompt(row: dict, settings: dict) -> str:
+    """Встроенный шаблон промпта для внешнего ИИ-агента, строящего сайт."""
+    name = str(row.get("name") or "").strip() or "—"
+    niche = str(row.get("rubric") or row.get("topic") or "").strip() or "—"
+    city = str(row.get("city") or "").strip() or "—"
+    address = str(row.get("address") or "").strip() or "—"
+    phone = str(row.get("phone") or "").strip() or "—"
+    rating = str(row.get("rating") or "").strip() or "нет данных"
+    reviews = str(row.get("reviews") or "").strip() or "нет данных"
+    base_url = str(settings.get("github_base_url") or "").strip() or "https://username.github.io/demo/"
     return (
-        f"{name}: {idea}. "
-        "У вас пока нет сайта, а клиенты ищут в интернете — могу показать, как это выглядит. "
-        "Ответьте, если интересно."
+        "Ты — опытный веб-разработчик. Создай одностраничный сайт-визитку "
+        "для небольшого бизнеса и подготовь его к публикации на GitHub Pages.\n"
+        "\n"
+        "Технические требования:\n"
+        "- Чистый HTML/CSS/JS: БЕЗ сервера, БЕЗ бэкенда, БЕЗ сборок и фреймворков.\n"
+        "- Все файлы в одной папке: index.html, style.css, script.js.\n"
+        "- Адаптивная вёрстка: сайт аккуратно смотрится и на телефоне, и на компьютере.\n"
+        "- Аккуратный современный дизайн, весь текст сайта на русском языке.\n"
+        "\n"
+        "Данные бизнеса:\n"
+        f"- Название: {name}\n"
+        f"- Ниша: {niche}\n"
+        f"- Город: {city}\n"
+        f"- Адрес: {address}\n"
+        f"- Телефон: {phone}\n"
+        f"- Мессенджеры: {_lead_messengers(row)}\n"
+        f"- Рейтинг: {rating}\n"
+        f"- Отзывы: {reviews}\n"
+        "\n"
+        f"Целевая ссылка: {base_url} — сайт будет опубликован по этому адресу, "
+        "поэтому относительные пути к файлам и якорям должны работать именно там.\n"
+        "\n"
+        "Порядок работы (обязательно):\n"
+        "Сначала проанализируй данные бизнеса, задай мне 2-4 конкретных уточняющих "
+        "вопроса по недостающим деталям и жди моих ответов перед написанием кода."
+    )
+
+
+def generate_site_prompt(row: dict, settings: dict, out_dir=None, save: bool = True) -> str:
+    """Промпт для внешнего ИИ-агента: сайт-визитка лида на GitHub Pages.
+
+    Шаблон берётся из settings["site_prompt_template"] (плейсхолдеры {name}
+    {rubric} {city} {address} {phone} {messengers} {rating} {reviews}
+    {github_base_url}); при пустом или битом шаблоне — встроенный текст.
+    С save=True пишет файл leads_prompts/<slug>.txt, ошибки диска глушит.
+    """
+    settings = settings or {}
+    text = ""
+    template = str(settings.get("site_prompt_template") or "")
+    if template.strip():
+        fields = _PromptFields({
+            "name": str(row.get("name") or ""),
+            "rubric": str(row.get("rubric") or row.get("topic") or ""),
+            "city": str(row.get("city") or ""),
+            "address": str(row.get("address") or ""),
+            "phone": str(row.get("phone") or ""),
+            "messengers": _lead_messengers(row),
+            "rating": str(row.get("rating") or ""),
+            "reviews": str(row.get("reviews") or ""),
+            "github_base_url": str(settings.get("github_base_url") or ""),
+        })
+        try:
+            text = template.format_map(fields)
+        except Exception:  # noqa: BLE001 - битый шаблон (одиночная "{" и т.п.) не смертелен
+            text = ""
+    if not text:
+        text = _default_site_prompt(row, settings)
+    if save:
+        try:
+            path = site_prompt_file(row, out_dir)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError:
+            pass  # проблемы диска не мешают вернуть текст промпта
+    return text
+
+
+def fallback_text(row: dict, idea: str, settings: dict | None = None) -> str:
+    """Текст без ИИ — чтобы предпросмотр работал до настройки ключа.
+
+    Вежливо на «вы», 4-6 предложений: увидели бизнес без сайта → готовый
+    пример на GitHub Pages → ссылка посмотреть → открытый вопрос в конце.
+    """
+    settings = settings or {}
+    name = (row.get("name") or "вашу компанию").strip()
+    idea = (idea or "").strip() or "могу сделать простой сайт под ваши услуги"
+    idea = idea[:1].upper() + idea[1:]
+    if not idea.endswith((".", "!", "?")):
+        idea += "."
+    url = str(settings.get("github_base_url") or "").strip()
+    if url:
+        link = f"Посмотреть пример можно по ссылке: {url}"
+    else:
+        link = "Если заинтересует — пришлю ссылку на пример."
+    return (
+        f"Здравствуйте! Я наткнулся на {name} и заметил, что у вас пока нет сайта, "
+        "а клиенты всё чаще ищут услуги в интернете. "
+        f"{idea} "
+        "Я уже подготовил для вас рабочий пример сайта и опубликовал его на GitHub Pages. "
+        f"{link} "
+        "Подскажите, что из услуг или деталей вы хотели бы видеть на сайте в первую очередь?"
     )
 
 
@@ -257,12 +441,13 @@ def ai_generate(settings: dict, row: dict, idea: str) -> str:
     key = settings.get("ai_key") or ""
     model = settings.get("ai_model") or ""
     if not base or not model:
-        return fallback_text(row, idea)
+        return fallback_text(row, idea, settings)
 
     system = (
-        "Ты пишешь короткое деловое сообщение потенциальному клиенту. "
-        "Строго без приветствий, без «здравствуйте», без воды и шаблонов. "
-        "2-4 предложения: конкретная выгода и один вопрос в конце. Пиши на русском."
+        "Напиши вежливое сообщение потенциальному клиенту на «вы», 4-6 предложений, "
+        "без официоза. Структура: увидели его бизнес без сайта → подготовили рабочий "
+        "пример сайта на GitHub Pages → предложили перейти посмотреть по ссылке → "
+        "открытый вопрос в конце. Цены «в лоб» не называть. Пиши на русском."
     )
     style = (settings.get("style") or "").strip()
     if style:
@@ -270,17 +455,18 @@ def ai_generate(settings: dict, row: dict, idea: str) -> str:
 
     user = (
         f"Организация: {row.get('name', '')}\n"
-        f"Ниша: {row.get('rubric', '')}\n"
+        f"Ниша: {row.get('rubric') or row.get('topic') or ''}\n"
         f"Город: {row.get('city', '')}\n"
         f"Адрес: {row.get('address', '')}\n"
         f"Телефон: {row.get('phone', '')}\n"
+        f"Ссылка на пример сайта: {settings.get('github_base_url') or ''}\n"
         f"Идея предложения: {idea}"
     )
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": 0.7,
-        "max_tokens": 400,
+        "max_tokens": 600,
     }
     req = urllib.request.Request(
         base + "/chat/completions",
@@ -545,7 +731,7 @@ class VKClient:
         if not res:
             raise RuntimeError(f"VK: не найден {screen}")
         oid = int(res["object_id"])
-        return -oid if res.get("type") == "group" else oid
+        return -oid if res.get("type") in ("group", "page", "event") else oid
 
     def send(self, screen: str, text: str) -> dict:
         import vk_api.exceptions
@@ -662,12 +848,12 @@ def generate_texts(leads: list[dict], settings: dict, state: MailState,
             break
         lead_id = row_id(row)
         st = state.get(lead_id)
-        if st.get("status") in STATUSES:
+        if st.get("status") in TERMINAL_STATUSES:
             continue
         try:
             text = ai_generate(settings, row, idea)
         except Exception as exc:  # noqa: BLE001 - один лид не рушит прогон
-            text = fallback_text(row, idea)
+            text = fallback_text(row, idea, settings)
             on_log(f"ИИ: {row.get('name', '')} — {exc}; взят шаблон", "warn")
         st["text"] = text
         state.save()
@@ -695,7 +881,7 @@ class Mailer:
             lead_id = row_id(row)
             st = self.state.get(lead_id)
             status = st.get("status") or ""
-            if status in STATUSES:
+            if status in TERMINAL_STATUSES:
                 continue
 
             avail = channels_of(row)
@@ -720,7 +906,7 @@ class Mailer:
                 self.state.save()
                 continue
 
-            if status == "awaiting":
+            if status in ("awaiting", "seen", "read"):
                 sent_at = _parse_dt(st.get("sent_at"))
                 if sent_at is None or now - sent_at < followup:
                     continue
@@ -969,7 +1155,7 @@ class Poller:
             _, ids = conn.search(None, "UNSEEN")
             id_list = ids[0].split() if ids and ids[0] else []
             for num in id_list[-30:]:
-                _, parts = conn.fetch(num, "(RFC822)")
+                _, parts = conn.fetch(num, "(BODY.PEEK[])")
                 if not parts or not parts[0]:
                     continue
                 msg = message_from_bytes(parts[0][1])

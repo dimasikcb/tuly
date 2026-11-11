@@ -357,6 +357,9 @@ def _iface_connected(out: str) -> bool:
     return "connected" in low or "подключен" in low
 
 
+HAPP_TUN_IFACES = ("Happ Tunnel", "happ-xray", "happ-tun")
+
+
 def happ_tun_active() -> bool:
     """Перехватывает ли TUN-адаптер Happ системный трафик.
 
@@ -367,11 +370,11 @@ def happ_tun_active() -> bool:
     try:
         rc, out, _ = run_tool(["route", "print", "0.0.0.0"], timeout=3)
         if rc == 0 and ("172.19.0.1" in out or "172.18.0.1" in out
-                        or "happ-xray" in out or "happ-tun" in out):
+                        or "happ" in out.lower()):
             return True
     except Exception:  # noqa: BLE001
         pass
-    for iface in ("happ-xray", "happ-tun"):
+    for iface in HAPP_TUN_IFACES:
         try:
             rc, out, _ = run_tool(
                 ["netsh", "interface", "show", "interface", iface], timeout=3)
@@ -389,7 +392,7 @@ def happ_tun_disable(wait: float = 4.0) -> bool:
     пробует полный сброс маршрута через этот интерфейс.
     """
     any_disabled = False
-    for iface in ("happ-xray", "happ-tun"):
+    for iface in HAPP_TUN_IFACES:
         try:
             rc, _, _ = run_tool(["netsh", "interface", "set", "interface", iface, "disable"],
                                 timeout=5)
@@ -403,7 +406,7 @@ def happ_tun_disable(wait: float = 4.0) -> bool:
     deadline = time.time() + wait
     while time.time() < deadline:
         done = True
-        for iface in ("happ-xray", "happ-tun"):
+        for iface in HAPP_TUN_IFACES:
             try:
                 rc, out, _ = run_tool(["netsh", "interface", "show", "interface", iface],
                                       timeout=3)
@@ -415,7 +418,7 @@ def happ_tun_disable(wait: float = 4.0) -> bool:
             return True
         time.sleep(0.25)
     # Если интерфейс не отключился — удаляем его маршрут из таблицы.
-    for iface in ("happ-xray", "happ-tun"):
+    for iface in HAPP_TUN_IFACES:
         try:
             run_tool(["netsh", "interface", "delete", "route", "interface=" + iface,
                       "purge"], timeout=5)
@@ -426,7 +429,7 @@ def happ_tun_disable(wait: float = 4.0) -> bool:
 
 def happ_tun_enable() -> bool:
     """Включает TUN-адаптер Happ для режима «весь трафик»."""
-    for iface in ("happ-xray", "happ-tun"):
+    for iface in HAPP_TUN_IFACES:
         try:
             run_tool(["netsh", "interface", "set", "interface", iface, "enable"], timeout=5)
         except Exception:  # noqa: BLE001
@@ -1947,6 +1950,44 @@ def bypass_apply(scope: str | None = None, mode: str | None = None) -> dict:
     return {"ok": True, "detail": "\n".join(filter(None, notes))}
 
 
+def bypass_apps_route_enable() -> dict:
+    """Включает ТОЛЬКО обход по программам (ProxiFyre), не трогая VPN.
+
+    Отдельная точка включения (разграничение «VPN ↔ обход по программам»):
+    Happ поднимается как локальный SOCKS без TUN и без системного прокси,
+    выбранные программы перенаправляются в него службой ProxiFyre. VPN
+    («весь трафик») при этом не включается и не выключается.
+    """
+    cfg = bypass_cfg()
+    notes: list[str] = []
+    if happ_ensure_apps_mode():
+        notes.append("Happ: режим SOCKS без TUN и системного прокси")
+    if not happ_connected():
+        start = bypass_happ_start()
+        if isinstance(start, dict) and start.get("detail"):
+            notes.append(str(start["detail"]))
+    port = happ_socks_port()
+    if not _wait_port(port):
+        raise RuntimeError(
+            f"Локальный SOCKS Happ не отвечает на 127.0.0.1:{port} — "
+            "обход по программам не заработает. Проверьте, что Happ подключён."
+        )
+    start = proxifyre_start(cfg["apps"], port)
+    if isinstance(start, dict) and start.get("detail"):
+        notes.append(str(start["detail"]))
+    set_windows_system_proxy(False)
+    bypass_cfg_save(scope="apps")
+    return {"ok": True, "detail": "\n".join(filter(None, notes)) or
+            "Обход по программам включён"}
+
+
+def bypass_apps_route_disable() -> dict:
+    """Выключает ТОЛЬКО обход по программам — VPN (Happ) не трогает."""
+    result = proxifyre_stop()
+    detail = str(result.get("detail") or "") if isinstance(result, dict) else ""
+    return {"ok": True, "detail": detail or "Обход по программам выключен"}
+
+
 def bypass_check_ip(timeout: float = 3.0) -> dict:
     """Определяет текущий внешний IP-адрес для быстрой проверки работы обхода.
 
@@ -1970,8 +2011,13 @@ def bypass_check_ip(timeout: float = 3.0) -> dict:
                     ip = data.get("ip") or data.get("ip_addr")
                 else:
                     ip = text
-                if ip and len(str(ip).split(".")) == 4:
-                    results.append(str(ip).strip())
+                if ip:
+                    try:
+                        import ipaddress
+                        ip_obj = ipaddress.ip_address(str(ip).strip())
+                        results.append(str(ip_obj))
+                    except (ValueError, TypeError):
+                        pass
         except Exception:
             continue
     ip = results[0] if results else ""
@@ -2038,8 +2084,13 @@ def bypass_check_direct_ip(timeout: float = 3.0) -> dict:
                     ip = data.get("ip") or data.get("ip_addr")
                 else:
                     ip = text
-                if ip and len(str(ip).split(".")) == 4:
-                    results.append(str(ip).strip())
+                if ip:
+                    try:
+                        import ipaddress
+                        ip_obj = ipaddress.ip_address(str(ip).strip())
+                        results.append(str(ip_obj))
+                    except (ValueError, TypeError):
+                        pass
         except Exception:
             pass
     if not results:

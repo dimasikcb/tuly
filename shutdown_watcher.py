@@ -33,6 +33,27 @@ SNAPSHOT_ALL = 0x00000002 | 0x00000001
 PROCESS_QUERY_LIMITED = 0x00001000
 SYNCHRONIZE = 0x00100000
 
+# Агенты, за которыми страж следит по умолчанию.
+# Расширяется без правки кода: config.json → watcher.agents
+# (список словарей {name, mode, exe, marker, idle_min, hold_min}).
+DEFAULT_AGENTS: list[Agent] | None = None  # заполняется ниже, после класса
+
+
+def load_agents(config: dict | None = None) -> list[Agent]:
+    """Список агентов: config.json → watcher.agents, иначе DEFAULT_AGENTS."""
+    if config is None:
+        config = load_config()
+    raw = (config.get("watcher") or {}).get("agents")
+    if not raw:
+        return [Agent(**a) for a in DEFAULT_AGENTS]
+    agents = []
+    for item in raw:
+        if isinstance(item, str):          # короткая форма: просто имя exe
+            item = {"name": item, "mode": "process", "exe": item}
+        known = {k: v for k, v in item.items() if k in Agent.__init__.__code__.co_varnames}
+        agents.append(Agent(**known))
+    return agents
+
 
 class Status(str, Enum):
     NOT_SEEN = "not_seen"   # не обнаружен ни разу за страж — ещё не стартовал
@@ -64,6 +85,17 @@ class Agent:
         self.marker = marker if marker is not None else getattr(self.__class__, "marker", "")
         self.idle_min = float(idle_min) if idle_min is not None else getattr(self.__class__, "idle_min", 15.0)
         self.hold_min = float(hold_min) if hold_min is not None else getattr(self.__class__, "hold_min", 2.0)
+
+
+# AI-агенты пользователя: IDE-агенты живут в своих процессах (режим idle —
+# ждём простоя), консольные могут завершиться сами (режим process).
+DEFAULT_AGENTS: list[dict] = [
+    {"name": "WorkBuddy AI", "mode": "process", "exe": "workbuddyai.exe"},
+    {"name": "Antigravity",  "mode": "idle",    "exe": "antigravity.exe", "idle_min": 10.0},
+    {"name": "ZCode",        "mode": "idle",    "exe": "zcode.exe",       "idle_min": 10.0},
+    {"name": "OpenCode",     "mode": "process", "exe": "opencode.exe"},
+    {"name": "Cursor",       "mode": "idle",    "exe": "cursor.exe",      "idle_min": 10.0},
+]
 
 
 @dataclass
@@ -245,9 +277,12 @@ class Watcher:
         interval: float = 5.0,
         notifier: TelegramNotifier | None = None,
         chat_tracker: WorkBuddyChatTracker | None = None,
+        grace_min: float = 5.0,
     ) -> None:
         self.agents: list[Agent] = list(agents) if agents else []
         self.interval = max(2.0, interval)
+        self.grace_min = float(grace_min)
+        self._started = time.monotonic()
         self.notifier = notifier
         self.chat_tracker = chat_tracker
         self._stop = threading.Event()
@@ -291,8 +326,11 @@ class Watcher:
         if exe not in {p["exe"] for p in self._procs}:
             self._idle_since.pop(agent.name, None)
             if not self._seen.get(agent.name):
-                return AgentResult(agent.name, Status.NOT_SEEN,
-                                   f"{exe} не видно", False)
+                # grace-период: даём агенту время стартовать; после — не блокируем
+                if time.monotonic() - self._started < self.grace_min * 60.0:
+                    return AgentResult(agent.name, Status.NOT_SEEN,
+                                       f"{exe} не видно", False)
+                return self._done(agent, "не запускался — пропущен")
             return self._done(agent, "процесс завершился")
         if agent.mode == "process":
             self._seen[agent.name] = True
@@ -354,6 +392,7 @@ class Watcher:
         self._notified_agents.clear()
         self.armed = False
         self.armed_until = 0.0
+        self._started = time.monotonic()
         self._stop.clear()
         self._snap()
         self._log(f"страж запущен, наблюдаем {len(self.agents)} агента(ов)")
@@ -526,8 +565,10 @@ def main() -> None:
             print("Ошибка при отправке в Telegram. Проверьте токен, chat_id и подключение к интернету.")
             sys.exit(1)
 
-    targets = args.exe if args.exe else ["workbuddyai.exe"]
-    agents = [Agent(name=t, mode="process", exe=t, hold_min=args.hold) for t in targets]
+    if args.exe:
+        agents = [Agent(name=t, mode="process", exe=t, hold_min=args.hold) for t in args.exe]
+    else:
+        agents = load_agents(cfg)
 
     chat_tracker = None
     if not args.no_chats and watcher_cfg.get("track_workbuddy_chats", True):
@@ -541,7 +582,7 @@ def main() -> None:
     )
 
     print(f"=== Страж выключения ПК запущен ===")
-    print(f"Отслеживаемые процессы: {', '.join(targets)}")
+    print(f"Отслеживаемые агенты: {', '.join(a.name for a in agents)}")
     if chat_tracker and chat_tracker.is_available():
         print(f"Мониторинг сессий WorkBuddy: ВКЛЮЧЁН ({chat_tracker.db_path})")
     if notifier.enabled:
