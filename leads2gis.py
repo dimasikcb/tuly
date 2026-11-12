@@ -33,7 +33,7 @@ from urllib.parse import quote, unquote, urlparse
 from leads_contacts import messenger_links as _contact_links
 # Парсер (слой 3) импортирует вниз только leads_contacts и leads_pool;
 # НИКОГДА не импортирует leads_mail и tools — это инверсия слоёв.
-from leads_pool import RU_CITIES, pool_add, pool_load
+from leads_pool import POOL_FILE, RU_CITIES, pool_add, pool_load
 
 
 def _load_deps(install: bool = False) -> bool:
@@ -1162,6 +1162,23 @@ def collect_leads(city: str, queries: list[str], cards: int, only_no_site: bool,
         "total": len(pool_load(pool_file)),
         "top": selected[:5], "rows": selected[:300],
     }
+
+
+def leads_collect(city: str, queries: list[str], cards: int, only_no_site: bool,
+                  min_reviews: int | None, on_progress, on_log, stop,
+                  limit: int | None = None) -> dict:
+    """Тонкий совместимый слой: сам сбор живёт в collect_leads (этот модуль).
+
+    Перенесена из tools.pyw — хозяин сбора теперь здесь. GUI (start()) и
+    тесты зовут функцию с прежними аргументами; движок получает путь к пулу
+    горячих POOL_FILE из leads_pool (модуль-хозяин путей лидов).
+    """
+    if not _ensure_deps():
+        raise RuntimeError("нет requests/selectolax")
+    return collect_leads(
+        city, queries, cards, only_no_site, min_reviews,
+        on_progress, on_log, stop, limit=limit, pool_file=POOL_FILE,
+    )
 
 
 # --- CLI --------------------------------------------------------------------

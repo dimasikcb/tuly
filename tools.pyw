@@ -81,6 +81,8 @@ from winbase import (
     is_admin,
     log_exception,
     ps_run,
+    pythonw_executable,
+    relaunch_as_admin,
     run_tool,
     tool_env,
 )
@@ -92,10 +94,10 @@ from leads_pool import INSPECTOR_FIELDS, inspector_fields
 from scroll_settings import steps_per_wheel as _scroll_step
 
 # --------------------------------------------------------------------------- #
-#  Единая тема: HEX-цвета живут ТОЛЬКО в theme/tokens.py (см. README.md, раздел «Дизайн-система theme/»).
-#  Здесь тонкая прослойка: старые имена констант сохранены, чтобы не
-#  переписывать сотни упоминаний по всему хабу. Смена темы вызывает
-#  _refresh_palette() и apple_tk.recolor() — см. Hub._apply_theme_mode().
+#  Единая тема: HEX-цвета живут ТОЛЬКО в theme/tokens.py. Прослойка токенов,
+#  базовая Panel, тёмные диалоги и UI-обёртки переехали в uibase.py — здесь
+#  только реэкспорт. Смена темы обновляет токены через реестр потребителей
+#  uibase (см. register_palette_consumer) и apple_tk.recolor().
 # --------------------------------------------------------------------------- #
 _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
@@ -104,80 +106,111 @@ if _HERE not in sys.path:
 import theme as _theme
 from theme import apple_tk as _apple_tk
 
-SCALE = 1.0
-
-_LEGACY_NAMES = (
-    "BG", "SIDEBAR", "CARD", "CARD_HOVER", "FIELD", "BORDER", "FG", "MUTED",
-    "ACCENT", "ACCENT_HOVER", "DANGER", "DANGER_HOVER", "OK", "WARN",
-    "LOG_BG", "LOG_FG", "COPIED_BG",
+from uibase import (
+    ACCENT,
+    ACCENT_HOVER,
+    AVATAR_COLORS,
+    BADGE_BAD_BG,
+    BADGE_BAD_INK,
+    BADGE_GOOD_BG,
+    BADGE_GOOD_INK,
+    BADGE_NEUTRAL_BG,
+    BADGE_WARN_BG,
+    BADGE_WARN_INK,
+    BG,
+    BORDER,
+    BRAND_LABEL,
+    CARD,
+    CARD_HOVER,
+    COPIED_BG,
+    DANGER,
+    DANGER_HOVER,
+    DarkMessageBox,
+    FG,
+    FIELD,
+    KNOB,
+    LOG_BG,
+    LOG_FG,
+    MUTED,
+    OK,
+    ON_AVATAR,
+    OVERLAY_BACKDROP,
+    OVERLAY_TIMER,
+    Panel,
+    ROW_SELECTED,
+    SIDEBAR,
+    SIDEBAR_ACTIVE,
+    SIDEBAR_HOVER,
+    SIDEBAR_SUBTITLE,
+    SIDEBAR_TITLE,
+    TAG_DIR,
+    TAG_FILE,
+    TRACK_DISABLED,
+    TRACK_OFF,
+    WARN,
+    _EXTRA_ROLES,
+    _LEGACY_NAMES,
+    _iter_widgets,
+    _refresh_palette,
+    apply_dark_theme,
+    badge_colors,
+    dark_check,
+    dark_text,
+    enable_dark_titlebar,
+    enable_input_paste,
+    flat_button,
+    fmt_size,
+    messagebox,
+    mono_font,
+    px,
+    register_palette_consumer,
+    set_scale,
+    tc,
+    ui_font,
 )
-_EXTRA_ROLES = (
-    "SIDEBAR_ACTIVE", "SIDEBAR_HOVER", "SIDEBAR_TITLE", "SIDEBAR_SUBTITLE",
-    "BRAND_LABEL", "TRACK_OFF", "TRACK_DISABLED", "KNOB", "ON_AVATAR",
-    "ROW_SELECTED", "BADGE_NEUTRAL_BG", "BADGE_BAD_BG", "BADGE_BAD_INK",
-    "BADGE_WARN_BG", "BADGE_WARN_INK", "BADGE_GOOD_BG", "BADGE_GOOD_INK",
-    "OVERLAY_TIMER", "TAG_FILE", "TAG_DIR", "OVERLAY_BACKDROP",
+
+# Токены приходят реэкспортом; регистрируем глобалы этого модуля потребителем
+# палитры, чтобы живая смена темы обновляла и их (панели читают голые имена).
+register_palette_consumer(globals())
+
+# --------------------------------------------------------------------------- #
+#  Движки панелей: логика без tkinter (инварианты слоёв — tests/test_arch.py).
+# --------------------------------------------------------------------------- #
+from cleanup_core import (  # noqa: E402
+    DeleteResult,
+    Plan,
+    check_blocked,
+    delete_plan,
+    risk_warning,
+    scan_empty,
 )
-
-
-def tc(role: str) -> str:
-    """Цвет по семантической роли из theme/tokens.py."""
-    return _theme.c(role)
-
-
-def ui_font(size: int = 9, weight: str = "normal") -> tuple:
-    """Системный UI-шрифт (SF Pro → Segoe UI Variable → Segoe UI на Windows)."""
-    return (_apple_tk.ui_family(), size, weight)
-
-
-def mono_font(size: int = 9, weight: str = "normal") -> tuple:
-    return (_apple_tk.mono_family(), size, weight)
-
-
-def _refresh_palette() -> None:
-    """Пересчитать все константы под текущую тему (в т.ч. при живой смене темы)."""
-    values = {name: _theme.alias(name) for name in _LEGACY_NAMES}
-    for name in _EXTRA_ROLES:
-        values[name] = tc(name.lower())
-    values["AVATAR_COLORS"] = _theme.AVATARS
-    globals().update(values)
-
-
-_refresh_palette()
-# Модульный слушатель идёт первым: к моменту перерисовки виджетов константы
-# уже соответствуют новой теме. Слушатель Hub регистрируется позже.
-_theme.on_change(lambda _resolved: _refresh_palette())
-
-
-def badge_colors(key: str) -> tuple[str, str]:
-    """Цвет бейджа среднего балла: (фон, текст) в текущей теме."""
-    bg_role, fg_role = {
-        "red": ("badge_bad_bg", "badge_bad_ink"),
-        "yellow": ("badge_warn_bg", "badge_warn_ink"),
-        "green": ("badge_good_bg", "badge_good_ink"),
-    }.get(key, ("badge_bad_bg", "badge_bad_ink"))
-    return tc(bg_role), tc(fg_role)
-
-
-def px(value: float) -> int:
-    """Пиксели, независимые от масштаба Windows (96 DPI = 1.0)."""
-    return int(round(value * SCALE))
-
-
-def _dpi_aware() -> None:
-    """Чтобы координаты мыши и скриншота совпадали при масштабе Windows != 100 %."""
-    if sys.platform != "win32":
-        return
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-
-
-_dpi_aware()
+from dns_core import (  # noqa: E402
+    DnsState,
+    QUAD9_DNS,
+    dns_apply,
+    dns_clear_tunnel,
+    dns_dhcp,
+    dns_restore_tunnel,
+    dns_state,
+    dns_test,
+)
+from github_core import (  # noqa: E402
+    GITHUB_DEFAULT_ROOT,
+    gh_authed,
+    gh_login,
+    gh_save_token,
+    gh_token_from_hosts,
+    github_repos,
+    local_scan_roots,
+    mask_token,
+    match_local_repos,
+    push_folder_to_github,
+    sanitize_repo_name,
+    scan_local_repos,
+    send_to_recycle_bin,
+    token_looks_valid,
+    update_local_repo,
+)
 
 # --------------------------------------------------------------------------- #
 #  Зависимости автокликера (cv2 / numpy / pyautogui / PIL / keyboard).
@@ -215,534 +248,6 @@ def load_autoclicker_deps() -> None:
         HAS_KEYBOARD = True
     except Exception:  # noqa: BLE001
         HAS_KEYBOARD = False
-
-
-# --------------------------------------------------------------------------- #
-#  Тема и мелкие помощники — тонкие обёртки над theme.apple_tk
-# --------------------------------------------------------------------------- #
-def apply_dark_theme(root: tk.Misc) -> None:
-    _apple_tk.apply_theme(root, scale=SCALE)
-
-
-def enable_dark_titlebar(window: tk.Misc) -> None:
-    _apple_tk.titlebar(window)
-
-
-def flat_button(parent: tk.Misc, text: str, command, *, kind: str = "primary", **kwargs) -> tk.Button:
-    return _apple_tk.flat_button(parent, text, command, kind=kind, scale=SCALE, **kwargs)
-
-
-def dark_check(parent: tk.Misc, text: str, variable: tk.BooleanVar, *,
-               bg: str | None = None, command=None) -> tk.Checkbutton:
-    return _apple_tk.check(parent, text, variable, bg=bg or BG, command=command)
-
-
-def dark_text(parent: tk.Misc, *, height: int = 10, wrap: str = "word", **kwargs) -> tk.Text:
-    return _apple_tk.log_view(parent, height=height, wrap=wrap, **kwargs)
-
-def _iter_widgets(root: tk.Misc):
-    for child in root.winfo_children():
-        yield child
-        yield from _iter_widgets(child)
-
-
-def enable_input_paste(root: tk.Misc) -> None:
-    """Ctrl+V / C / X / A в любом поле и в любой раскладке.
-
-    Tk ловит Ctrl+V по keysym «v», а при русской раскладке keysym — «м»,
-    поэтому штатная вставка молча не срабатывала. Ловим только комбинации
-    с Ctrl (обычный набор клавиш не перехватываем) и сверяем физический код
-    клавиши — раскладка не важна.
-    """
-    if getattr(root, "_paste_hooked", False):
-        return
-    root._paste_hooked = True
-
-    VK_PASTE, VK_COPY, VK_CUT, VK_ALL = 86, 67, 88, 65
-    PASTE_KS, COPY_KS = {"v", "м"}, {"c", "с"}
-    CUT_KS, ALL_KS = {"x", "ч"}, {"a", "а", "ф"}
-
-    def on_ctrl(event):
-        w = event.widget
-        if not isinstance(w, (tk.Entry, tk.Text, ttk.Entry)):
-            return None
-        if event.state & 0x8:  # Alt зажат — не наше
-            return None
-        vk = getattr(event, "keycode", 0) or 0
-        ks = (event.keysym or "").lower()
-        if vk == VK_PASTE or ks in PASTE_KS:
-            w.event_generate("<<Paste>>")
-            return "break"
-        if vk == VK_COPY or ks in COPY_KS:
-            w.event_generate("<<Copy>>")
-            return "break"
-        if vk == VK_CUT or ks in CUT_KS:
-            w.event_generate("<<Cut>>")
-            return "break"
-        if vk == VK_ALL or ks in ALL_KS:
-            if isinstance(w, tk.Text):
-                w.tag_add("sel", "1.0", "end-1c")
-            else:
-                w.selection_range(0, "end")
-            return "break"
-        return None
-
-    def on_menu(event):
-        w = event.widget
-        if not isinstance(w, (tk.Entry, tk.Text, ttk.Entry)):
-            return None
-        menu = tk.Menu(w, tearoff=0, bg=CARD, fg=FG,
-                       activebackground=tc("accent_fill"),
-                       activeforeground=tc("on_accent"), bd=0)
-        menu.add_command(label="Вставить", command=lambda: w.event_generate("<<Paste>>"))
-        menu.add_command(label="Копировать", command=lambda: w.event_generate("<<Copy>>"))
-        menu.add_command(label="Вырезать", command=lambda: w.event_generate("<<Cut>>"))
-        menu.add_separator()
-        if isinstance(w, tk.Text):
-            menu.add_command(label="Выделить всё",
-                             command=lambda: w.tag_add("sel", "1.0", "end-1c"))
-        else:
-            menu.add_command(label="Выделить всё",
-                             command=lambda: w.selection_range(0, "end"))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-        return "break"
-
-    for widget in _iter_widgets(root):
-        if not isinstance(widget, (tk.Entry, tk.Text, ttk.Entry)):
-            continue
-        if getattr(widget, "_paste_hooked", False):
-            continue
-        widget._paste_hooked = True
-        widget.bind("<Control-KeyPress>", on_ctrl, add="+")
-        widget.bind("<Button-3>", on_menu, add="+")
-
-        def on_click(event, w=widget):
-            # клик по полю всегда ставит фокус — даже если окно было неактивно
-            w.focus_set()
-            return None
-
-        widget.bind("<Button-1>", on_click, add="+")
-
-
-def fmt_size(size: float | None) -> str:
-    if size is None:
-        return "—"
-    for unit, divider in (("ГБ", 1 << 30), ("МБ", 1 << 20), ("КБ", 1 << 10)):
-        if size >= divider:
-            return f"{size / divider:.1f} {unit}".replace(".", ",")
-    return f"{int(size)} Б"
-
-
-def pythonw_executable() -> str:
-    exe = Path(sys.executable)
-    if exe.name.lower() == "python.exe":
-        candidate = exe.with_name("pythonw.exe")
-        if candidate.exists():
-            return str(candidate)
-    return str(exe)
-
-
-def relaunch_as_admin(tab: str) -> bool:
-    """Перезапускает приложение с правами администратора на нужной вкладке."""
-    if getattr(sys, "frozen", False):
-        executable = str(APP_FILE)
-        params = f"--tab {tab}"
-    else:
-        executable = pythonw_executable()
-        params = '"{}" --tab {}'.format(APP_FILE, tab)
-    try:
-        result = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", executable, params, str(APP_DIR), 1
-        )
-    except Exception:  # noqa: BLE001
-        return False
-    return int(result) > 32
-
-
-class DarkMessageBox:
-    """Тёмные модальные диалоги вместо стандартных светлых messagebox."""
-
-    def _dialog(self, title: str, message: str, *, ask: bool = False, parent=None) -> bool:
-        parent = parent or tk._default_root
-        if parent is None:
-            return False
-        win = tk.Toplevel(parent)
-        win.withdraw()
-        win.title(title)
-        win.configure(bg=CARD)
-        win.transient(parent)
-        win.resizable(False, False)
-
-        body = tk.Frame(win, bg=CARD, padx=px(22), pady=px(18))
-        body.pack(fill="both", expand=True)
-        tk.Label(
-            body, text=title, bg=CARD, fg=FG, font=ui_font(12, "bold"), anchor="w"
-        ).pack(fill="x")
-        tk.Label(
-            body,
-            text=message,
-            bg=CARD,
-            fg=MUTED,
-            justify="left",
-            anchor="w",
-            wraplength=px(470),
-            font=ui_font(9),
-        ).pack(fill="x", pady=(px(10), 0))
-
-        result = {"value": False}
-        buttons = tk.Frame(body, bg=CARD)
-        buttons.pack(fill="x", pady=(px(18), 0))
-
-        def close(value: bool) -> None:
-            result["value"] = value
-            win.destroy()
-
-        flat_button(buttons, "Да" if ask else "ОК", lambda: close(True)).pack(side="right")
-        if ask:
-            flat_button(buttons, "Отмена", lambda: close(False), kind="ghost").pack(
-                side="right", padx=(0, px(8))
-            )
-
-        win.bind("<Return>", lambda _event: close(True))
-        win.bind("<Escape>", lambda _event: close(False))
-        win.protocol("WM_DELETE_WINDOW", lambda: close(False))
-        win.update_idletasks()
-        width, height = win.winfo_reqwidth(), win.winfo_reqheight()
-        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
-        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 3)
-        win.geometry(f"+{x}+{y}")
-        enable_dark_titlebar(win)
-        win.deiconify()
-        win.grab_set()
-        win.focus_force()
-        win.wait_window()
-        return result["value"]
-
-    def showinfo(self, title: str, message: str, **kwargs) -> bool:
-        return self._dialog(title, message, parent=kwargs.get("parent"))
-
-    def showwarning(self, title: str, message: str, **kwargs) -> bool:
-        return self._dialog(title, message, parent=kwargs.get("parent"))
-
-    def showerror(self, title: str, message: str, **kwargs) -> bool:
-        return self._dialog(title, message, parent=kwargs.get("parent"))
-
-    def askyesno(self, title: str, message: str, **kwargs) -> bool:
-        return self._dialog(title, message, ask=True, parent=kwargs.get("parent"))
-
-    def askstring(self, title: str, message: str, initial: str = "", parent=None) -> str | None:
-        parent = parent or tk._default_root
-        if parent is None:
-            return None
-        win = tk.Toplevel(parent)
-        win.withdraw()
-        win.title(title)
-        win.configure(bg=CARD)
-        win.transient(parent)
-        win.resizable(False, False)
-
-        body = tk.Frame(win, bg=CARD, padx=px(22), pady=px(18))
-        body.pack(fill="both", expand=True)
-        tk.Label(body, text=title, bg=CARD, fg=FG,
-                 font=ui_font(12, "bold"), anchor="w").pack(fill="x")
-        tk.Label(body, text=message, bg=CARD, fg=MUTED, justify="left", anchor="w",
-                 wraplength=px(430), font=ui_font(9)).pack(fill="x", pady=(px(10), 0))
-
-        value = tk.StringVar(value=initial)
-        entry = ttk.Entry(body, textvariable=value)
-        entry.pack(fill="x", pady=(px(10), 0), ipady=px(2))
-
-        result = {"value": None}
-
-        def close(ok: bool) -> None:
-            if ok:
-                text = value.get().strip()
-                result["value"] = text or None
-            win.destroy()
-
-        buttons = tk.Frame(body, bg=CARD)
-        buttons.pack(fill="x", pady=(px(18), 0))
-        flat_button(buttons, "ОК", lambda: close(True)).pack(side="right")
-        flat_button(buttons, "Отмена", lambda: close(False), kind="ghost").pack(
-            side="right", padx=(0, px(8))
-        )
-
-        win.bind("<Return>", lambda _event: close(True))
-        win.bind("<Escape>", lambda _event: close(False))
-        win.protocol("WM_DELETE_WINDOW", lambda: close(False))
-        win.update_idletasks()
-        width, height = win.winfo_reqwidth(), win.winfo_reqheight()
-        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
-        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 3)
-        win.geometry(f"+{x}+{y}")
-        enable_dark_titlebar(win)
-        win.deiconify()
-        win.grab_set()
-        win.focus_force()
-        entry.focus_set()
-        entry.select_range(0, "end")
-        win.wait_window()
-        return result["value"]
-
-
-messagebox = DarkMessageBox()
-
-# --------------------------------------------------------------------------- #
-#  DNS: движок
-# --------------------------------------------------------------------------- #
-
-
-_PS_ADAPTER = """
-$a = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
-if (-not $a) {
-    $a = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Tunnel|Loopback' } | Select-Object -First 1
-}
-if (-not $a) { throw 'Не найден активный сетевой адаптер' }
-"""
-
-_PS_TUNNEL = """
-$t = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'happ-xray' -or $_.InterfaceDescription -like '*Happ*' } | Select-Object -First 1
-if (-not $t) { throw 'Туннель happ-xray не найден' }
-"""
-
-_PS_APPLY = _PS_ADAPTER + """
-Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @(__SERVERS__)
-foreach ($s in @(__SERVERS__)) {
-    $ok = $false
-    if (Get-Command Set-DnsClientDohServerAddress -ErrorAction SilentlyContinue) {
-        try {
-            Set-DnsClientDohServerAddress -ServerAddress $s -DohTemplate '__TEMPLATE__' -AutoUpgrade $true -AllowFallbackToUdp $true -ErrorAction Stop
-            $ok = $true
-        } catch { }
-    }
-    if (-not $ok) {
-        netsh dns add encryption server=$s dohtemplate=__TEMPLATE__ autoupgrade=yes udpfallback=yes | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            netsh dns set encryption server=$s dohtemplate=__TEMPLATE__ autoupgrade=yes udpfallback=yes | Out-Null
-        }
-    }
-}
-Clear-DnsClientCache
-Write-Output ('Адаптер [' + $a.Name + '] · DNS: ' + ((Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4).ServerAddresses -join ', '))
-"""
-
-_PS_STATE = _PS_ADAPTER + """
-$dns = (Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses -join ', '
-$t = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'happ-xray' -or $_.InterfaceDescription -like '*Happ*' } | Select-Object -First 1
-$tn = ''
-$td = ''
-if ($t) {
-    $tn = $t.Name
-    $td = (Get-DnsClientServerAddress -InterfaceIndex $t.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses -join ', '
-}
-[pscustomobject]@{ name = $a.Name; index = $a.ifIndex; dns = $dns; tunnel = $tn; tunnel_dns = $td } | ConvertTo-Json -Compress
-"""
-
-QUAD9_DNS = ["9.9.9.9", "149.112.112.112"]
-QUAD9_DOH = "https://dns.quad9.net/dns-query"
-XBOX_DNS = ["111.88.96.50", "111.88.96.51"]
-XBOX_DOH = "https://xbox-dns.ru/dns-query"
-TUNNEL_DNS = "172.19.0.2"
-DNS_TEST_NAME = "www.workbuddy.ai"
-
-
-@dataclass
-class DnsState:
-    name: str = ""
-    index: int = 0
-    dns: str = ""
-    tunnel: str = ""
-    tunnel_dns: str = ""
-
-
-def dns_state() -> DnsState:
-    out = ps_run(_PS_STATE)
-    start, end = out.find("{"), out.rfind("}")
-    if start < 0 or end < start:
-        raise RuntimeError(out or "PowerShell не вернул состояние DNS")
-    data = json.loads(out[start:end + 1])
-    return DnsState(
-        name=str(data.get("name") or ""),
-        index=int(data.get("index") or 0),
-        dns=str(data.get("dns") or ""),
-        tunnel=str(data.get("tunnel") or ""),
-        tunnel_dns=str(data.get("tunnel_dns") or ""),
-    )
-
-
-def dns_apply(servers: list[str], template: str) -> str:
-    joined = ",".join(f"'{s}'" for s in servers)
-    script = _PS_APPLY.replace("__SERVERS__", joined).replace("__TEMPLATE__", template)
-    return ps_run(script)
-
-
-def dns_dhcp() -> str:
-    return ps_run(_PS_ADAPTER + """
-Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses
-Clear-DnsClientCache
-Write-Output ('DNS сброшен на DHCP для [' + $a.Name + ']')
-""")
-
-
-def dns_clear_tunnel() -> str:
-    return ps_run(_PS_TUNNEL + """
-Set-DnsClientServerAddress -InterfaceIndex $t.ifIndex -ResetServerAddresses
-Clear-DnsClientCache
-Write-Output ('DNS туннеля [' + $t.Name + '] очищен')
-""")
-
-
-def dns_restore_tunnel() -> str:
-    return ps_run(_PS_TUNNEL + """
-Set-DnsClientServerAddress -InterfaceIndex $t.ifIndex -ServerAddresses @('__DNS__')
-Write-Output ('DNS туннеля [' + $t.Name + '] = __DNS__')
-""".replace("__DNS__", TUNNEL_DNS))
-
-
-def dns_test() -> str:
-    return ps_run("""
-try {
-    $r = Resolve-DnsName -Name '__NAME__' -ErrorAction Stop
-    $rows = @($r | Where-Object { $_.Type -eq 'A' -or $_.Type -eq 'CNAME' } | ForEach-Object {
-        if ($_.Type -eq 'A') { '  A      ' + $_.Name + ' -> ' + $_.IPAddress }
-        else { '  CNAME  ' + $_.Name + ' -> ' + $_.NameHost }
-    })
-    if ($rows.Count -eq 0) { Write-Output '  записей A и CNAME нет' } else { Write-Output ($rows -join \"`n\") }
-} catch {
-    Write-Output ('  ошибка разрешения: ' + $_.Exception.Message)
-}
-""".replace("__NAME__", DNS_TEST_NAME))
-
-# --------------------------------------------------------------------------- #
-#  Пустые файлы и папки: движок
-# --------------------------------------------------------------------------- #
-REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-HIDDEN_ATTR = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0x2)
-
-
-@dataclass
-class Plan:
-    root: str
-    files: list[str] = field(default_factory=list)
-    dirs: list[str] = field(default_factory=list)
-    errors: list[tuple[str, str]] = field(default_factory=list)
-
-    @property
-    def total(self) -> int:
-        return len(self.files) + len(self.dirs)
-
-    @property
-    def is_empty(self) -> bool:
-        return self.total == 0
-
-
-@dataclass
-class DeleteResult:
-    removed_files: int = 0
-    removed_dirs: int = 0
-    errors: list[tuple[str, str]] = field(default_factory=list)
-
-
-def _is_hidden(path: str, st: os.stat_result) -> bool:
-    if os.path.basename(path).startswith("."):
-        return True
-    return bool(getattr(st, "st_file_attributes", 0) & HIDDEN_ATTR)
-
-
-def _is_reparse(st: os.stat_result) -> bool:
-    return bool(getattr(st, "st_file_attributes", 0) & REPARSE_POINT)
-
-
-def _scan_dir(path: str, plan: Plan, files: bool, dirs: bool, hidden: bool) -> bool:
-    """True — папка опустеет после удаления найденного."""
-    try:
-        with os.scandir(path) as iterator:
-            entries = list(iterator)
-    except OSError as exc:
-        plan.errors.append((path, str(exc)))
-        return False
-
-    files_here: list[str] = []
-    dirs_here: list[str] = []
-    empty_after = True
-
-    for entry in entries:
-        try:
-            st = entry.stat(follow_symlinks=False)
-        except OSError as exc:
-            plan.errors.append((entry.path, str(exc)))
-            empty_after = False
-            continue
-        if entry.is_symlink() or _is_reparse(st):
-            empty_after = False
-        elif entry.is_dir(follow_symlinks=False):
-            if dirs and _scan_dir(entry.path, plan, files, dirs, hidden):
-                dirs_here.append(entry.path)
-            else:
-                empty_after = False
-        elif entry.is_file(follow_symlinks=False):
-            if files and st.st_size == 0 and (hidden or not _is_hidden(entry.path, st)):
-                files_here.append(entry.path)
-            else:
-                empty_after = False
-        else:
-            empty_after = False
-
-    plan.files.extend(files_here)
-    plan.dirs.extend(dirs_here)
-
-    if not dirs:
-        return False
-    if not entries:
-        return True
-    return empty_after and bool(files_here or dirs_here)
-
-
-def scan_empty(root: str, *, files: bool = True, dirs: bool = True, hidden: bool = False) -> Plan:
-    plan = Plan(root=root)
-    _scan_dir(root, plan, files, dirs, hidden)
-    return plan
-
-
-def delete_plan(plan: Plan) -> DeleteResult:
-    result = DeleteResult()
-    for path in plan.files:
-        try:
-            os.remove(path)
-            result.removed_files += 1
-        except OSError as exc:
-            result.errors.append((path, str(exc)))
-    for path in plan.dirs:
-        try:
-            os.rmdir(path)
-            result.removed_dirs += 1
-        except OSError as exc:
-            result.errors.append((path, str(exc)))
-    return result
-
-
-def check_blocked(path: str) -> str | None:
-    full = os.path.abspath(path)
-    if os.path.dirname(full) == full:
-        return "Это корень диска. Выберите папку внутри него."
-    normalized = os.path.normcase(full)
-    for variable in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
-        system_path = os.environ.get(variable)
-        if system_path and os.path.normcase(os.path.abspath(system_path)) == normalized:
-            return "Это системная папка Windows. Выберите другую."
-    return None
-
-
-def risk_warning(path: str) -> str | None:
-    full = os.path.normcase(os.path.abspath(path))
-    for variable in ("USERPROFILE", "Desktop", "Documents", "Downloads"):
-        known = os.environ.get(variable)
-        if known and os.path.normcase(os.path.abspath(known)) == full:
-            return "Это ваша личная папка. Проверьте список перед удалением."
-    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -918,162 +423,6 @@ class OverlaySelector:
             self.win.destroy()
         finally:
             self.on_cancel()
-
-# --------------------------------------------------------------------------- #
-#  Базовый класс панели
-# --------------------------------------------------------------------------- #
-class Panel(ttk.Frame):
-    def __init__(self, master: tk.Misc, hub) -> None:
-        super().__init__(master)
-        self.hub = hub
-
-    def make_log(self, parent: tk.Misc, *, height: int = 10, wrap: str = "word",
-                 label: str = "Лог"):
-        frame = ttk.Frame(parent)
-        head = ttk.Frame(frame)
-        head.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, px(4)))
-        ttk.Label(head, text="Лог — выдели мышью, Ctrl+C или «Копировать всё»",
-                  style="Muted.TLabel").pack(side="left")
-        text = dark_text(frame, height=height, wrap=wrap)
-        text.tag_configure("error", foreground=tc("log_err"))
-        text.tag_configure("ok", foreground=OK)
-        copy_btn = flat_button(head, "Копировать всё", lambda: None, kind="ghost")
-        copy_btn.pack(side="right")
-        copy_btn.configure(command=lambda: self.copy_log(text, copy_btn, label=label))
-        flat_button(head, "Очистить", lambda: text.delete("1.0", "end"),
-                    kind="ghost").pack(side="right", padx=(0, px(6)))
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
-        text.configure(yscrollcommand=scroll.set)
-        text.grid(row=1, column=0, sticky="nsew")
-        scroll.grid(row=1, column=1, sticky="ns")
-        frame.rowconfigure(1, weight=1)
-        frame.columnconfigure(0, weight=1)
-        self.attach_copy(text, label=label, readonly=True)
-        return frame, text
-
-    def attach_copy(self, text: tk.Text, *, label: str = "текст",
-                    readonly: bool = False, clear: bool = True) -> None:
-        """Делает любой текстовый блок копируемым: Ctrl+C, Ctrl+A, правый клик.
-
-        Копирование/выделение ловим универсально — по **физическому коду
-        клавиши** (``event.keycode``: VK_C=67, VK_A=65, VK_INSERT=45), который
-        не зависит от раскладки. Иначе при русской раскладке Ctrl+C даёт keysym
-        «с», а не «c», и привязки ``<Control-c>``/``<<Copy>>`` молча не
-        срабатывают — копия не происходит. Дополнительно страхуемся проверкой
-        keysym (c/с, a/а/ф), чтобы сработать в любой раскладке.
-        """
-
-        # Навигационные клавиши, разрешённые даже в режиме «только чтение».
-        NAV_KEYS = {
-            "Left", "Right", "Up", "Down", "Home", "End",
-            "Prior", "Next", "Shift_L", "Shift_R",
-            "Control_L", "Control_R", "Tab", "Insert",
-        }
-        # Буквы-«действия» во всех раскладках.
-        COPY_KEYS = {"c", "с"}                 # лат. C и кир. С
-        SELECT_KEYS = {"a", "а", "ф"}          # лат. A, кир. А и кир. Ф (Ctrl+A на RU)
-
-        def copy_selection(_event=None):
-            try:
-                chunk = text.get("sel.first", "sel.last")
-            except tk.TclError:
-                chunk = text.get("1.0", "end-1c")
-            if not chunk:
-                return "break"
-            self.copy_text(chunk, label=label, widget=text)
-            return "break"
-
-        def select_all(_event=None):
-            text.tag_add("sel", "1.0", "end-1c")
-            return "break"
-
-        def on_key(event):
-            ctrl = bool(event.state & 0x4) and not bool(event.state & 0x8)
-            if ctrl:
-                vk = getattr(event, "keycode", 0) or 0
-                ks = (event.keysym or "").lower()
-                if vk == 67 or ks in COPY_KEYS:                # C — копировать
-                    return copy_selection()
-                if vk == 65 or ks in SELECT_KEYS:             # A — выделить всё
-                    return select_all()
-                if vk == 45 or ks == "insert":                # Insert — копировать
-                    return copy_selection()
-                # прочие Ctrl-комбинации в «только чтение» глушим
-                return "break" if readonly else None
-            # без Ctrl
-            if readonly and event.keysym not in NAV_KEYS:
-                return "break"
-            return None
-
-        text.bind("<Key>", on_key)
-        text.bind("<<Copy>>", copy_selection)          # запасной путь (Ctrl+Insert и т.п.)
-        text.bind("<<SelectAll>>", select_all)
-        text.bind("<Control-a>", select_all)
-        text.bind("<Control-A>", select_all)
-
-        menu = tk.Menu(text, tearoff=0)
-        menu.add_command(label="Копировать выделенное", command=copy_selection)
-        menu.add_command(
-            label="Копировать всё",
-            command=lambda: self.copy_text(text.get("1.0", "end-1c"), label=label),
-        )
-        if clear:
-            menu.add_separator()
-            menu.add_command(label="Очистить", command=lambda: text.delete("1.0", "end"))
-        text.bind("<Button-3>", lambda event: menu.tk_popup(event.x_root, event.y_root))
-
-    def copy_log(self, text: tk.Text, button: tk.Button, *, label: str = "Лог") -> None:
-        try:
-            chunk = text.get("sel.first", "sel.last")
-        except tk.TclError:
-            chunk = text.get("1.0", "end-1c")
-        self.copy_text(chunk, label=label, widget=text)
-        original = button.cget("text")
-        button.configure(text="✅ Скопировано")
-        self.after(1800, lambda: button.configure(text=original))
-
-    def copy_text(self, chunk: str, *, label: str = "лог", widget=None) -> None:
-        """Кладёт текст в буфер обмена и явно показывает результат.
-
-        При копировании текстовый блок кратко вспыхивает зелёным — видно,
-        что именно скопировалось.
-        """
-        if not chunk.strip():
-            self.hub.set_status("Копировать нечего — пусто")
-            self.hub.toast("Копировать нечего — блок пуст", kind="warn")
-            return
-        self.clipboard_clear()
-        self.clipboard_append(chunk)
-        self.update()          # без update() Windows не фиксирует буфер сразу
-        lines = chunk.count("\n") + (0 if chunk.endswith("\n") else 1)
-        self.hub.set_status(f"📋 скопировано: {lines} строк, {len(chunk)} символов")
-        self.hub.toast(f"📋 {label}: скопировано {lines} стр., {len(chunk)} симв.")
-        if widget is not None:
-            self.flash_copied(widget)
-
-    def flash_copied(self, widget) -> None:
-        """Кратковременная зелёная вспышка + рамка — явное подтверждение копии."""
-        try:
-            widget.configure(bg=COPIED_BG, highlightbackground=OK, highlightcolor=OK)
-        except (tk.TclError, AttributeError):
-            return
-        self.after(500, lambda: self._unflash(widget))
-
-    @staticmethod
-    def _unflash(widget) -> None:
-        try:
-            widget.configure(bg=LOG_BG, highlightbackground=BORDER, highlightcolor=BORDER)
-        except (tk.TclError, AttributeError):
-            pass
-
-    @staticmethod
-    def append_log(text: tk.Text, line: str, tag: str | None = None) -> None:
-        text.insert("end", f"{time.strftime('%H:%M:%S')}  {line}\n", (tag,) if tag else ())
-        lines = int(text.index("end-1c").split(".")[0])
-        if lines > 500:
-            text.delete("1.0", f"{lines - 500}.0")
-        text.see("end")
-
 
 # --------------------------------------------------------------------------- #
 #  AutoClicker
@@ -2054,612 +1403,6 @@ class DnsPanel(Panel):
         state = "normal" if enabled else "disabled"
         for button in self.action_buttons:
             button.configure(state=state)
-
-# --------------------------------------------------------------------------- #
-#  GitHub: движок (gh + git) и Bypass: HTTP-клиент
-# --------------------------------------------------------------------------- #
-GITHUB_DEFAULT_ROOT = str(Path.home())
-
-GITHUB_IGNORE_BLOCK = """\
-# --- добавлено «Мои инструменты» ---
-.workbuddy-ai/
-.github/
-.env
-*.env
-node_modules/
-venv/
-.venv/
-__pycache__/
-*.pyc
-*.bin
-*.onnx
-*.pt
-*.ckpt
-*.pth
-models/
-**/models--*/
-*.log
-.DS_Store
-output/
-*.wav
-*.mp4
-*.mov
-*.avi
-*.mkv
-*.exe
-*.dll
-*.so
-*.dylib
-ffmpeg*/
-"""
-def send_to_recycle_bin(path: str) -> None:
-    """Удаляет папку/файл в Корзину Windows (FOF_ALLOWUNDO), а не навсегда.
-
-    Если shell32 недоступен, падает с OSError — вызывающий обработает.
-    """
-    if sys.platform != "win32":
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
-        return
-
-    class SHFILEOPSTRUCT(ctypes.Structure):
-        _fields_ = [
-            ("hwnd", ctypes.c_void_p),
-            ("wFunc", ctypes.c_uint),
-            ("pFrom", ctypes.c_wchar_p),
-            ("pTo", ctypes.c_wchar_p),
-            ("fFlags", ctypes.c_uint),
-            ("fAnyOperationsAborted", ctypes.c_int),
-            ("hNameMappings", ctypes.c_void_p),
-            ("lpszProgressTitle", ctypes.c_wchar_p),
-        ]
-
-    FO_DELETE = 3
-    FOF_ALLOWUNDO = 0x40
-    FOF_NOCONFIRMATION = 0x10
-    FOF_SILENT = 0x4
-    FOF_NOERRORUI = 0x400
-
-    buffer = ctypes.create_unicode_buffer(os.path.normpath(path) + "\0\0")
-    op = SHFILEOPSTRUCT()
-    op.hwnd = 0
-    op.wFunc = FO_DELETE
-    op.pFrom = ctypes.cast(buffer, ctypes.c_wchar_p)
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
-    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
-    if result != 0:
-        raise OSError(f"Не удалось отправить в Корзину (код {result})")
-
-
-def gh_authed() -> bool:
-    gh = find_tool("gh")
-    if not gh:
-        return False
-    return run_tool([gh, "auth", "status"], timeout=30)[0] == 0
-
-
-def gh_login() -> str:
-    gh = find_tool("gh")
-    if not gh:
-        return ""
-    rc, out, _ = run_tool([gh, "api", "user", "-q", ".login"], timeout=30)
-    return out if rc == 0 else ""
-
-
-def gh_token() -> str:
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
-    if token:
-        return token
-    gh = find_tool("gh")
-    if not gh:
-        return ""
-    rc, out, _ = run_tool([gh, "auth", "token"], timeout=30)
-    return out if rc == 0 else ""
-
-
-GH_TOKEN_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "github_pat_")
-
-
-def gh_hosts_paths() -> list[Path]:
-    """Где GitHub CLI хранит токен: %APPDATA% и ~/.config/gh."""
-    paths: list[Path] = []
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        paths.append(Path(appdata) / "GitHub CLI" / "hosts.yml")
-    paths.append(Path.home() / ".config" / "gh" / "hosts.yml")
-    unique: list[Path] = []
-    for path in paths:
-        if path not in unique:
-            unique.append(path)
-    return unique
-
-
-def token_looks_valid(token: str) -> bool:
-    token = token.strip()
-    return len(token) >= 20 and token.startswith(GH_TOKEN_PREFIXES)
-
-
-def mask_token(token: str) -> str:
-    token = (token or "").strip()
-    if not token:
-        return "не найден"
-    if len(token) <= 12:
-        return token[:4] + "…"
-    return f"{token[:6]}…{token[-4:]}"
-
-
-def gh_token_from_hosts() -> str:
-    for path in gh_hosts_paths():
-        try:
-            with path.open("r", encoding="utf-8", newline="") as handle:
-                text = handle.read()
-        except OSError:
-            continue
-        for line in text.splitlines():
-            key, _, value = line.strip().partition(":")
-            if key == "oauth_token" and value.strip():
-                return value.strip()
-    return gh_token()
-
-
-def gh_save_token(new_token: str) -> list[str]:
-    """Меняет oauth_token в hosts.yml, сохраняя резервную копию .bak."""
-    new_token = new_token.strip()
-    if not token_looks_valid(new_token):
-        raise ValueError(
-            "Не похоже на токен GitHub.\n"
-            "Нужен classic PAT, начинающийся с ghp_ (или github_pat_)."
-        )
-    updated: list[str] = []
-    pattern = re.compile(r"^(\s*)oauth_token:\s*.*$", re.MULTILINE)
-    for path in gh_hosts_paths():
-        if not path.exists():
-            continue
-        try:
-            with path.open("r", encoding="utf-8", newline="") as handle:
-                text = handle.read()
-        except OSError as exc:
-            raise RuntimeError(f"Не удалось прочитать {path}:\n{exc}")
-        if not pattern.search(text):
-            continue
-        new_text = pattern.sub(
-            lambda match: f"{match.group(1)}oauth_token: {new_token}", text, count=1
-        )
-        backup = path.with_name(path.name + ".bak")
-        try:
-            shutil.copy2(path, backup)
-            with path.open("w", encoding="utf-8", newline="") as handle:
-                handle.write(new_text)
-        except OSError as exc:
-            raise RuntimeError(f"Не удалось записать {path}:\n{exc}")
-        updated.append(str(path))
-    if not updated:
-        raise RuntimeError(
-            "Не найден hosts.yml GitHub CLI.\n"
-            "Сначала выполните в терминале: gh auth login --web --git-protocol https"
-        )
-    return updated
-
-
-def github_repos() -> list[dict]:
-    gh = find_tool("gh")
-    if not gh:
-        raise RuntimeError("GitHub CLI (gh) не найден. Установите с cli.github.com.")
-    rc, out, err = run_tool(
-        [gh, "repo", "list", "--limit", "300", "--json", "name,nameWithOwner,url,isPrivate"],
-        timeout=120,
-    )
-    if rc != 0:
-        raise RuntimeError(err or out or "не удалось получить список репозиториев")
-    try:
-        data = json.loads(out)
-    except ValueError:
-        raise RuntimeError("gh вернул неожиданный ответ")
-    repos = []
-    for item in data:
-        name = str(item.get("name") or "")
-        full = str(item.get("nameWithOwner") or "")
-        if not name or not full:
-            continue
-        repos.append({
-            "name": name,
-            "full": full,
-            "url": str(item.get("url") or ""),
-            "private": bool(item.get("isPrivate")),
-        })
-    repos.sort(key=lambda item: item["name"].lower())
-    return repos
-
-
-def repo_name_from_url(url: str) -> str:
-    if not url:
-        return ""
-    text = url.split("?")[0].rstrip("/")
-    if text.endswith(".git"):
-        text = text[:-4]
-    if "@" in text and ":" in text:
-        text = text.split(":", 1)[1]
-    elif "://" in text:
-        rest = text.split("://", 1)[1]
-        text = rest.split("/", 1)[1] if "/" in rest else ""
-    return text.split("/")[-1]
-
-
-def git_remote_url(folder: str) -> str:
-    git = find_tool("git")
-    if not git:
-        return ""
-    rc, out, _ = run_tool([git, "config", "--get", "remote.origin.url"], cwd=folder, timeout=30)
-    return out if rc == 0 else ""
-
-
-LOCAL_SCAN_SKIP = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv", ".workbuddy-ai",
-    "AppData", "Windows", "Program Files", "Program Files (x86)", "$Recycle.Bin",
-    "System Volume Information", "site-packages", "dist-info", ".cache",
-}
-
-
-def local_scan_roots(primary: str = "") -> list[str]:
-    """Где искать локальные репозитории: выбранная папка + обычные места Windows."""
-    roots: list[str] = []
-    seen: set[str] = set()
-
-    def add(path) -> None:
-        if not path:
-            return
-        try:
-            folder = Path(path)
-            if not folder.is_dir():
-                return
-            text = os.path.normpath(str(folder))
-        except (OSError, ValueError):
-            return
-        key = text.lower()
-        if key in seen:
-            return
-        seen.add(key)
-        roots.append(text)
-
-    home = Path.home()
-    add(primary)
-    add(APP_DIR.parent)
-    add(home / "Documents")
-    add(home / "Desktop")
-    add(home / "Downloads")
-    add(home)
-    return roots
-
-
-def scan_local_repos(roots, max_depth: int = 4) -> list[dict]:
-    """Список локальных git-папок: path, name, remote (имя репозитория из origin)."""
-    if isinstance(roots, str):
-        roots = [roots]
-    found: list[dict] = []
-    seen: set[str] = set()
-    stack: list[tuple[Path, int]] = [(Path(root), 0) for root in roots]
-    while stack:
-        folder, depth = stack.pop()
-        key = os.path.normcase(str(folder))
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            has_git = (folder / ".git").exists()
-        except OSError:
-            has_git = False
-        if has_git:
-            try:
-                status = local_repo_status(str(folder))
-            except Exception:  # noqa: BLE001  — падение git не должно рушить скан
-                status = None
-            found.append({
-                "path": str(folder),
-                "name": folder.name,
-                "remote": repo_name_from_url(git_remote_url(str(folder))),
-                "status": status,
-            })
-        if depth >= max_depth:
-            continue
-        try:
-            entries = list(os.scandir(folder))
-        except OSError:
-            continue
-        for entry in entries:
-            try:
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                if entry.name in LOCAL_SCAN_SKIP or entry.name.startswith("."):
-                    continue
-                stack.append((Path(entry.path), depth + 1))
-            except OSError:
-                continue
-    return found
-
-
-def local_repo_status(folder: str) -> dict | None:
-    """Статус git-папки: грязные файлы, ahead/behind, привязана ли ветка."""
-    git = find_tool("git")
-    if not git:
-        return None
-    rc, out, _err = run_tool([git, "status", "--porcelain", "-b"], cwd=folder, timeout=120)
-    if rc != 0:
-        return None
-    lines = out.splitlines()
-    if not lines:
-        return {"dirty": False, "ahead": 0, "behind": 0, "upstream": False, "branch": ""}
-    head = lines[0]
-    dirty = any(ln.strip() for ln in lines[1:])
-    ahead = behind = 0
-    upstream = "..." in head
-    m = re.search(r"ahead (\d+)", head)
-    if m:
-        ahead = int(m.group(1))
-    m = re.search(r"behind (\d+)", head)
-    if m:
-        behind = int(m.group(1))
-    branch = ""
-    if head.startswith("## "):
-        branch = head[3:].split("...")[0].strip()
-    return {"dirty": dirty, "ahead": ahead, "behind": behind, "upstream": upstream,
-            "branch": branch}
-
-
-_TRANSLIT = {
-    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
-    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
-    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
-    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
-    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
-    "і": "i", "ї": "yi", "є": "ye", "ґ": "g",
-}
-
-
-def sanitize_repo_name(name: str) -> str:
-    # GitHub не принимает не-ASCII имена — кириллицу переводим в латиницу
-    transliterated = "".join(_TRANSLIT.get(ch.lower(), ch) for ch in name)
-    allowed = "-_. "
-    cleaned = "".join(ch for ch in transliterated if ch.isalnum() or ch in allowed)
-    cleaned = "-".join(part for part in cleaned.split() if part)
-    while "--" in cleaned:
-        cleaned = cleaned.replace("--", "-")
-    return cleaned.strip("-._") or "repo"
-
-
-def match_key(text: str) -> str:
-    """Ключ сравнения имён: «тулы» и «tuly» дают одно и то же."""
-    text = "".join(_TRANSLIT.get(ch.lower(), ch) for ch in (text or ""))
-    return "".join(ch for ch in text if ch.isalnum())
-
-
-def match_local_repos(repos: list[dict], local_items: list[dict]) -> tuple[dict[str, str], list[dict]]:
-    """Сопоставляет репозитории GitHub с папками на ПК.
-
-    Сначала по origin-ссылке (надёжно), затем по имени папки с учётом
-    транслитерации: репозиторий tuly ↔ папка «тулы».
-    """
-    matches: dict[str, str] = {}
-    used: set[str] = set()
-    for repo in repos:
-        key = match_key(repo.get("name", ""))
-        if not key:
-            continue
-        for item in local_items:
-            if item["path"] in used:
-                continue
-            if item.get("remote") and match_key(item["remote"]) == key:
-                matches[repo["full"]] = item["path"]
-                used.add(item["path"])
-                break
-    for repo in repos:
-        if repo["full"] in matches:
-            continue
-        key = match_key(repo.get("name", ""))
-        if not key:
-            continue
-        for item in local_items:
-            if item["path"] in used:
-                continue
-            if match_key(item["name"]) == key:
-                matches[repo["full"]] = item["path"]
-                used.add(item["path"])
-                break
-    rest = [item for item in local_items if item["path"] not in used]
-    return matches, rest
-
-
-def ensure_gitignore(folder: str, log) -> None:
-    path = Path(folder) / ".gitignore"
-    try:
-        existing = path.read_text("utf-8", errors="ignore") if path.exists() else ""
-    except OSError:
-        existing = ""
-    needed = []
-    for line in GITHUB_IGNORE_BLOCK.splitlines():
-        text = line.strip()
-        if text and not text.startswith("#") and text not in existing:
-            needed.append(line)
-    if needed:
-        try:
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write("\n" + "\n".join(needed) + "\n")
-            log(f".gitignore дополнен ({len(needed)} правил)")
-        except OSError as exc:
-            log(f"не удалось обновить .gitignore: {exc}")
-
-
-def ensure_git_identity(log) -> bool:
-    git = find_tool("git")
-    gh = find_tool("gh")
-    if not git:
-        log("git не найден")
-        return False
-    rc, name, _ = run_tool([git, "config", "--global", "--get", "user.name"], timeout=30)
-    rc2, email, _ = run_tool([git, "config", "--global", "--get", "user.email"], timeout=30)
-    if rc == 0 and rc2 == 0 and name and email:
-        return True
-    if not gh:
-        log("git identity не задан. Выполните: git config --global user.name / user.email")
-        return False
-    login = gh_login()
-    if not login:
-        log("не удалось получить логин GitHub — проверьте gh auth login")
-        return False
-    rc, full_name, _ = run_tool([gh, "api", "user", "-q", ".name"], timeout=30)
-    display = full_name if rc == 0 and full_name else login
-    run_tool([git, "config", "--global", "user.name", display], timeout=30)
-    run_tool([git, "config", "--global", "user.email", f"{login}@users.noreply.github.com"], timeout=30)
-    log(f"git identity: {display} <{login}@users.noreply.github.com>")
-    return True
-
-
-def _push_with_retry(folder: str, args: list[str], log, retries: int = 3) -> tuple[int, str, str]:
-    git = find_tool("git")
-    result = (1, "", "")
-    for attempt in range(1, retries + 1):
-        result = run_tool([git, "push", *args], cwd=folder, timeout=600)
-        if result[0] == 0:
-            return result
-        message = (result[2] or result[1]).lower()
-        if not any(key in message for key in (
-            "timeout", "408", "disconnect", "hung up", "timed out", "reset",
-            "connection", "rpc failed",
-        )):
-            return result
-        log(f"↻ повтор пуша ({attempt}/{retries}) из-за сети…")
-    return result
-
-
-def push_folder_to_github(folder: str, repo: str, public: bool, log) -> bool:
-    git = find_tool("git")
-    gh = find_tool("gh")
-    if not git:
-        log("git не найден — установите Git for Windows")
-        return False
-    if not gh:
-        log("gh не найден — установите GitHub CLI")
-        return False
-    if not gh_authed():
-        log("не выполнен вход: gh auth login")
-        return False
-    if not Path(folder).is_dir():
-        log(f"папка не найдена: {folder}")
-        return False
-    if not ensure_git_identity(log):
-        return False
-
-    log(f"=== {Path(folder).name} → github.com/{repo} ===")
-    inside = run_tool([git, "rev-parse", "--is-inside-work-tree"], cwd=folder, timeout=30)[0] == 0
-    if not inside:
-        rc, _out, err = run_tool([git, "init"], cwd=folder, timeout=60)
-        if rc != 0:
-            log(f"ОШИБКА git init: {err}")
-            return False
-        run_tool([git, "branch", "-M", "main"], cwd=folder, timeout=30)
-        log("git init (main)")
-
-    ensure_gitignore(folder, log)
-    rc, _out, err = run_tool([git, "add", "-A"], cwd=folder, timeout=600)
-    if rc != 0:
-        log(f"ОШИБКА git add: {err}")
-        return False
-    rc, status, _err = run_tool([git, "status", "--porcelain"], cwd=folder, timeout=120)
-    if rc == 0 and status:
-        rc, out, err = run_tool(
-            [git, "commit", "-m", f"backup: {Path(folder).name} (Мои инструменты)"],
-            cwd=folder, timeout=600,
-        )
-        if rc != 0:
-            log(f"ОШИБКА git commit: {err or out}")
-            return False
-        log("коммит создан")
-    else:
-        log("изменений для коммита нет")
-
-    login = gh_login()
-    token = gh_token()
-    visibility = "--public" if public else "--private"
-
-    rc, _out, _err = run_tool([gh, "repo", "view", repo, "--json", "url"], cwd=folder, timeout=60)
-    if rc == 0:
-        log(f"репозиторий {repo} уже есть — обновляю")
-        url = f"https://github.com/{login}/{repo}.git"
-        push_url = f"https://{token}@github.com/{login}/{repo}.git" if token else url
-        run_tool([git, "remote", "remove", "origin"], cwd=folder, timeout=30)
-        run_tool([git, "remote", "add", "origin", push_url], cwd=folder, timeout=30)
-    else:
-        run_tool([git, "remote", "remove", "origin"], cwd=folder, timeout=30)
-        created = False
-        last_error = ""
-        for attempt in range(1, 4):
-            rc, out, err = run_tool(
-                [gh, "repo", "create", repo, visibility, "--source", ".", "--remote", "origin",
-                 "--push", "--description", f"Backup of {Path(folder).name}"],
-                cwd=folder, timeout=600,
-            )
-            if rc == 0:
-                log("репозиторий создан и запушен")
-                return True
-            last_error = err or out
-            if "already exists" in last_error.lower():
-                created = True
-                break
-            if any(key in last_error.lower() for key in (
-                "timeout", "408", "disconnect", "hung up", "timed out", "reset",
-                "connection", "rpc failed",
-            )):
-                log(f"↻ повтор создания ({attempt}/3) из-за сети…")
-                continue
-            break
-        if not created:
-            log(f"ОШИБКА gh repo create: {last_error}")
-            return False
-        url = f"https://{token}@github.com/{login}/{repo}.git" if token else f"https://github.com/{login}/{repo}.git"
-        run_tool([git, "remote", "remove", "origin"], cwd=folder, timeout=30)
-        run_tool([git, "remote", "add", "origin", url], cwd=folder, timeout=30)
-
-    rc, out, err = _push_with_retry(folder, ["-u", "origin", "main"], log)
-    if rc != 0:
-        rc, out, err = _push_with_retry(folder, ["-u", "origin", "--all"], log)
-    if rc != 0:
-        log(f"ОШИБКА git push: {err or out}")
-        return False
-    log("✅ запушено")
-    return True
-
-
-def update_local_repo(folder: str, name: str, log) -> bool:
-    git = find_tool("git")
-    if not git:
-        log("git не найден")
-        return False
-    rc, out, err = run_tool([git, "add", "-A"], cwd=folder, timeout=600)
-    # игнорируем «invalid path» — зарезервированные имена Windows (NUL, CON и т.п.)
-    if rc != 0:
-        bad = "\n".join(l for l in err.splitlines() if "invalid path" not in l)
-        if bad:
-            log(f"ОШИБКА git add: {bad}")
-            return False
-        log(f"git add пропущены зарезервированные имена: {err}")
-    rc, status, _err = run_tool([git, "status", "--porcelain"], cwd=folder, timeout=120)
-    if rc == 0 and status:
-        rc, out, err = run_tool(
-            [git, "commit", "-m", f"backup: {name} (Мои инструменты)"], cwd=folder, timeout=600,
-        )
-        if rc != 0:
-            log(f"ОШИБКА git commit: {err or out}")
-            return False
-    rc, out, err = _push_with_retry(folder, ["-u", "origin", "main"], log)
-    if rc != 0:
-        rc, out, err = _push_with_retry(folder, ["-u", "origin", "--all"], log)
-    if rc != 0:
-        log(f"ОШИБКА git push: {err or out}")
-        return False
-    log("✅ обновлено")
-    return True
-
 
 # --------------------------------------------------------------------------- #
 #  Панель: GitHub
@@ -4882,15 +3625,19 @@ except Exception as exc:  # noqa: BLE001
     LEADS_OK = False
     LEADS_ERROR = str(exc)
 
-LEADS_DIR = (
-    Path(sys.executable).parent if getattr(sys, "frozen", False)
-    else Path(__file__).resolve().parent
-)
+# Пути лидов живут в хозяине leads_pool (frozen-aware): LEADS_DIR, POOL_FILE,
+# MAIL_SETTINGS_PATH, MAIL_STATE_PATH. Здесь — живая переадресация (PEP 562),
+# а не снимок значений: тесты патчат атрибут этого модуля, панели читают
+# через хозяина.
+_LEADS_PATH_NAMES = ("LEADS_DIR", "POOL_FILE", "MAIL_SETTINGS_PATH", "MAIL_STATE_PATH")
 
-# Единственный файл данных — пул горячих. Настройки и журнал рассылки лежат рядом.
-POOL_FILE = LEADS_DIR / "hot_pool.csv"
-MAIL_SETTINGS_PATH = LEADS_DIR / "leads_mail_settings.json"
-MAIL_STATE_PATH = LEADS_DIR / "leads_mail_state.json"
+
+def __getattr__(name: str):
+    if name in _LEADS_PATH_NAMES:
+        import leads_pool
+
+        return getattr(leads_pool, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 try:
     import leads_mail
@@ -7979,8 +6726,7 @@ class NavItem(tk.Frame):
 class Hub(tk.Tk):
     def __init__(self, initial_tab: str = "autoclicker") -> None:
         super().__init__()
-        global SCALE
-        SCALE = max(1.0, self.winfo_fpixels("1i") / 96.0)
+        set_scale(self.winfo_fpixels("1i") / 96.0)
         self.title("Мои инструменты")
         width = min(px(1180), self.winfo_screenwidth() - px(40))
         height = min(px(820), self.winfo_screenheight() - px(90))

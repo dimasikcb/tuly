@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import os
 import re
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -28,6 +29,22 @@ from leads_contacts import (
     pick_contact as _pick_contact,
     to_link as _to_link,
 )
+
+# Папка приложения: в frozen-сборке (Tools.exe) — рядом с exe, при запуске из
+# исходников — рядом с этим модулем. Хозяин путей лидов — этот файл: LEADS_DIR
+# и POOL_FILE отсюда импортируют leads_mail, leads2gis и tools.pyw
+# (правило «импортируй из модуля-хозяина», README).
+LEADS_DIR = (
+    Path(sys.executable).parent if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+
+# Единственный файл данных — пул горячих. Настройки и журнал рассылки лежат
+# рядом; их пути тоже здесь, чтобы быть доступными без тяжёлого leads_mail
+# (telethon) — например, при старте GUI без модуля рассылки.
+POOL_FILE = LEADS_DIR / "hot_pool.csv"
+MAIL_SETTINGS_PATH = LEADS_DIR / "leads_mail_settings.json"
+MAIL_STATE_PATH = LEADS_DIR / "leads_mail_state.json"
 
 # --------------------------------------------------------------------------- #
 #  Схема файла

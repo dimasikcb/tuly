@@ -159,3 +159,29 @@ def run_tool(args: list[str], cwd: str | None = None, timeout: int = 300) -> tup
         creationflags=NO_WINDOW,
     )
     return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+
+
+def pythonw_executable() -> str:
+    exe = Path(sys.executable)
+    if exe.name.lower() == "python.exe":
+        candidate = exe.with_name("pythonw.exe")
+        if candidate.exists():
+            return str(candidate)
+    return str(exe)
+
+
+def relaunch_as_admin(tab: str) -> bool:
+    """Перезапускает приложение с правами администратора на нужной вкладке."""
+    if getattr(sys, "frozen", False):
+        executable = str(APP_FILE)
+        params = f"--tab {tab}"
+    else:
+        executable = pythonw_executable()
+        params = '"{}" --tab {}'.format(APP_FILE, tab)
+    try:
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", executable, params, str(APP_DIR), 1
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return int(result) > 32

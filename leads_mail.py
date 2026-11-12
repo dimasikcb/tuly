@@ -96,6 +96,7 @@ from leads_pool import (  # noqa: F401 - реэкспорт: GUI и тесты �
     pool_sync,
     row_id,
 )
+from leads_pool import LEADS_DIR, MAIL_SETTINGS_PATH, MAIL_STATE_PATH  # хозяин путей — leads_pool (README)
 
 PRIORITY = ("max", "telegram", "vk", "email")
 DAY = 86400.0
@@ -182,6 +183,20 @@ def save_settings(path, settings: dict) -> None:
         p.write_text(text, encoding="utf-8")
     except OSError:
         pass
+
+
+def _mail_settings() -> dict:
+    """Настройки рассылки одним местом: без кэша, но и без четырёх try/except.
+
+    Хозяин функции — этот модуль: перенос из tools.pyw, где она заменяла
+    одинаковые блоки чтения leads_mail.load_settings(MAIL_SETTINGS_PATH)
+    в _pool_days, _show_lead, _generate_message и MailWindow.__init__.
+    При битом файле настроек — пустой словарь (дефолты DEFAULT_SETTINGS).
+    """
+    try:
+        return load_settings(MAIL_SETTINGS_PATH)
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 class MailState:
