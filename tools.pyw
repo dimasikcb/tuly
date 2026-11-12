@@ -87,11 +87,12 @@ from winbase import (
 
 from leads_contacts import format_phone as _fmt_phone  # noqa: F401
 from leads_contacts import short as _short_link  # noqa: F401
+from leads_pool import INSPECTOR_FIELDS, inspector_fields
 
 from scroll_settings import steps_per_wheel as _scroll_step
 
 # --------------------------------------------------------------------------- #
-#  Единая тема: HEX-цвета живут ТОЛЬКО в theme/tokens.py (см. DESIGN.md).
+#  Единая тема: HEX-цвета живут ТОЛЬКО в theme/tokens.py (см. README.md, раздел «Дизайн-система theme/»).
 #  Здесь тонкая прослойка: старые имена констант сохранены, чтобы не
 #  переписывать сотни упоминаний по всему хабу. Смена темы вызывает
 #  _refresh_palette() и apple_tk.recolor() — см. Hub._apply_theme_mode().
@@ -4901,174 +4902,36 @@ except Exception as exc:  # noqa: BLE001
     MAIL_OK = False
     MAIL_ERROR = str(exc)
 
-_leads_local = threading.local()
 
+def _mail_settings() -> dict:
+    """Настройки рассылки одним местом: без кэша, но и без четырёх try/except.
 
-def _leads_client():
-    """Свой HTTP-клиент на поток: requests.Session не потокобезопасен."""
-    client = getattr(_leads_local, "client", None)
-    if client is None:
-        client = leads_engine.TwoGisClient(timeout=30, delay=0.4)
-        _leads_local.client = client
-    return client
+    Заменила одинаковые блоки чтения leads_mail.load_settings(MAIL_SETTINGS_PATH)
+    в _pool_days, _show_lead, _generate_message и MailWindow.__init__.
+    Без модуля рассылки или при битом файле — пустой словарь (дефолты).
+    """
+    if not MAIL_OK or leads_mail is None:
+        return {}
+    try:
+        return leads_mail.load_settings(MAIL_SETTINGS_PATH)
+    except Exception:  # noqa: BLE001
+        return {}
 
-
-def _city_list(city: str) -> list[str]:
-    """Разбирает строку городов; «russia/вся россия» → список RU_CITIES."""
-    if city.strip().lower() in ("russia", "вся россия", "всяроссия", "ru"):
-        try:
-            return list(leads_mail.RU_CITIES)
-        except AttributeError:
-            return ["moscow"]
-    return [c.strip() for c in city.split(",") if c.strip()]
 
 def leads_collect(city: str, queries: list[str], cards: int, only_no_site: bool,
                   min_reviews: int | None, on_progress, on_log, stop,
                   limit: int | None = None) -> dict:
-    """Обходит выдачу и карточки по каждой нише, горячих кладёт в пул.
+    """Тонкий совместимый слой: сам сбор живёт в leads2gis.collect_leads.
 
-    `queries` — список поисковых запросов (ниш): обходятся по очереди,
-    карточки дедуплицируются по id, итоговая выдача ограничивается `limit`.
+    GUI (start()) и тесты зовут функцию с прежними аргументами; движок
+    получает путь к пулу горячих из этого модуля.
     """
     if not LEADS_OK:
         raise RuntimeError(LEADS_ERROR or "нет requests/selectolax")
-    if not MAIL_OK:
-        raise RuntimeError("нет модуля leads_mail — сохранять некуда")
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    client = leads_engine.TwoGisClient(timeout=30, delay=0.4)
-
-    try:
-        want = max(1, int(cards))
-    except (TypeError, ValueError):
-        want = leads_engine.CARDS_PER_PAGE * 5
-
-    uniq: dict[str, str] = {}
-    for q in queries:
-        q = str(q or "").strip()
-        if q:
-            uniq.setdefault(q.lower(), q)
-    queries = list(uniq.values())
-    if not queries:
-        return {"checked": 0, "found": 0, "hot": 0, "pooled": 0,
-                "total": len(leads_mail.pool_load(POOL_FILE)), "rows": []}
-
-    cities = _city_list(city)
-    if not cities:
-        cities = [city.strip() or "moscow"]
-    want_share = max(1, want // (len(cities) * len(queries)))
-
-    all_cards: list[dict] = []
-    seen: set[str] = set()
-    for qi, q in enumerate(queries, 1):
-        if stop.is_set():
-            break
-        on_log(f"ниша «{q}»: обход {len(cities)} город(ов)")
-        for ci, cur_city in enumerate(cities, 1):
-            if stop.is_set():
-                break
-            pages = leads_engine.pages_for(want_share)
-            city_cards: list[dict] = []
-            for page in range(1, pages + 1):
-                if stop.is_set() or len(city_cards) >= want_share:
-                    break
-                try:
-                    found, _last_page = client.search_page(cur_city, q, page)
-                except Exception as exc:
-                    on_log(f"{cur_city}: ошибка поиска ({exc})")
-                    break
-                fresh = [c for c in found if c["id"] not in seen]
-                for c in fresh:
-                    seen.add(c["id"])
-                    c["query"] = q  # ниша, нашедшая карточку, — на саму карточку
-                city_cards.extend(fresh)
-                on_progress(f"ниша {qi}/{len(queries)} «{q}» · город {ci}/{len(cities)} "
-                            f"{cur_city} стр.{page}/{pages} · {len(city_cards)}/{want_share}")
-                if not fresh:
-                    break
-            city_cards = city_cards[:want_share]
-            all_cards.extend(city_cards)
-            on_log(f"{cur_city} / {q}: карточек {len(city_cards)}")
-
-    if not all_cards:
-        return {"checked": 0, "found": 0, "hot": 0, "pooled": 0,
-                "total": len(leads_mail.pool_load(POOL_FILE)), "rows": []}
-
-    def one(card_info: tuple) -> dict | None:
-        cur_city, firm_id, q = card_info
-        try:
-            html = _leads_client().firm_html(cur_city, firm_id)
-        except Exception:  # noqa: BLE001 - битая карточка не рушит прогон
-            return None
-        lead = leads_engine.parse_firm(html, cur_city, firm_id, q)
-        if lead is not None:
-            # Запрос фиксируется на карточке, а не берётся из переменной цикла —
-            # иначе потоки ThreadPoolExecutor получили бы последнюю нишу.
-            lead["topic"] = q
-        return lead
-
-    # parse_search уже кладёт city в каждую карточку — восстанавливать не нужно.
-    # Третий элемент — ниша: одна фирма может попасться в нескольких запросах.
-    card_infos = [(c.get("city") or cities[0], c["id"], c.get("query") or queries[0])
-                  for c in all_cards]
-
-    parsed: list[dict] = []
-    total = len(card_infos)
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = [pool.submit(one, ci) for ci in card_infos]
-        for index, future in enumerate(as_completed(futures), 1):
-            if stop.is_set():
-                break
-            lead = future.result()
-            if lead:
-                parsed.append(lead)
-            on_progress(f"карточки {index}/{total} · собрано {len(parsed)}")
-
-    # Страховка от повторов между нишами: seen уже фильтрует карточки по id,
-    # но дедуплицируем и разобранные лиды (порядок сохраняется).
-    parsed = leads_engine.dedup_by_id(parsed)
-
-    ratings = client.ratings(lead["id"] for lead in parsed)
-    for lead in parsed:
-        if ratings.get(lead["id"]) is not None:
-            lead["rating"] = ratings[lead["id"]]
-        lead["score"], lead["reason"] = leads_engine.score(lead)
-
-    dropped = leads_engine.drop_boilerplate_domains(parsed)
-    if dropped:
-        on_log(f"убрано общих доменов-заглушек: {dropped}")
-
-    filters = leads_engine.Filters(
-        no_website=only_no_site,
-        has_phone=True,
-        min_reviews=min_reviews,
+    return leads_engine.collect_leads(
+        city, queries, cards, only_no_site, min_reviews,
+        on_progress, on_log, stop, limit=limit, pool_file=POOL_FILE,
     )
-    selected = sorted(
-        (lead for lead in parsed if filters.accepts(lead)),
-        key=lambda lead: lead["score"],
-        reverse=True,
-    )
-    if limit:
-        # Итоговый лимит: лучшие N по скору, ДО добавления в пул горячих.
-        selected = selected[:max(1, int(limit))]
-
-    pooled = 0
-    if MAIL_OK:
-        try:
-            pooled = leads_mail.pool_add(POOL_FILE, selected)
-        except Exception as exc:  # noqa: BLE001 - пул не должен валить сбор
-            on_log(f"пул горячих: {exc}")
-
-    if pooled:
-        on_log(f"в пул горячих добавлено: {pooled}")
-    else:
-        on_log("горячих новых нет — всё уже в пуле")
-    return {
-        "checked": len(parsed), "pooled": pooled,
-        "total": len(leads_mail.pool_load(POOL_FILE)),
-        "top": selected[:5], "rows": selected[:300],
-    }
 
 
 class LeadsPanel(Panel):
@@ -5166,44 +5029,168 @@ class LeadsPanel(Panel):
             side="left", padx=(px(8), 0))
         flat_button(actions, "Написал вручную", self.mark_manual, kind="ghost").pack(
             side="left", padx=(px(8), 0))
+        self.inspector_toggle_btn = flat_button(
+            actions, "Скрыть карточку", self._toggle_inspector, kind="ghost")
+        self.inspector_toggle_btn.pack(side="left", padx=(px(8), 0))
         flat_button(actions, "Рассылка ИИ", self.open_mail, kind="primary").pack(
             side="left", padx=(px(8), 0))
         self.status_var = tk.StringVar(value="Готово")
         ttk.Label(actions, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
 
-        table_frame = ttk.Frame(self)
-        table_frame.pack(fill="both", expand=True, pady=(px(10), 0))
+        # -- двухпанельная компоновка: таблица слева, карточка справа ------- #
+        self.split = ttk.PanedWindow(self, orient="horizontal")
+        self.split.pack(fill="both", expand=True, pady=(px(10), 0))
+
+        self.table_side = ttk.Frame(self.split)
         cols = ("name", "topic", "contact", "gis")
         self.result_tree = ttk.Treeview(
-            table_frame, columns=cols, show="headings", height=9)
+            self.table_side, columns=cols, show="headings", height=9)
         for col, title, width in (
             ("name", "Название", 220), ("topic", "Тема", 150),
             ("contact", "Контакты", 230), ("gis", "2ГИС", 120),
         ):
             self.result_tree.heading(col, text=title)
             self.result_tree.column(col, width=px(width), anchor="w")
-        rscroll = ttk.Scrollbar(table_frame, orient="vertical",
+        rscroll = ttk.Scrollbar(self.table_side, orient="vertical",
                                 command=self.result_tree.yview)
         self.result_tree.configure(yscrollcommand=rscroll.set)
         self.result_tree.grid(row=0, column=0, sticky="nsew")
         rscroll.grid(row=0, column=1, sticky="ns")
-        table_frame.rowconfigure(0, weight=1)
-        table_frame.columnconfigure(0, weight=1)
+        self.table_side.rowconfigure(0, weight=1)
+        self.table_side.columnconfigure(0, weight=1)
         self.result_tree.bind("<ButtonRelease-1>", self._on_single_click)
         self.result_tree.bind("<Double-1>", self._open_row_link)
         self.result_tree.bind("<Button-3>", self._row_menu)
+        self.result_tree.bind("<<TreeviewSelect>>", self._on_select)
         self._row_links: dict[str, list[tuple[str, str]]] = {}
         self._row_urls: dict[str, str] = {}
         self._row_phones: dict[str, str] = {}
+        self._rows: dict[str, dict] = {}
+        # Написанным лидам (есть sent_at или статус «написан») место не в выдаче.
+        self._hidden_contacted = 0
+
+        self.inspector = tk.Frame(
+            self.split, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        ins_canvas = tk.Canvas(self.inspector, bg=CARD, highlightthickness=0, bd=0)
+        ins_scroll = ttk.Scrollbar(self.inspector, orient="vertical", command=ins_canvas.yview)
+        ins_canvas.configure(yscrollcommand=ins_scroll.set)
+        ins_canvas.pack(side="left", fill="both", expand=True)
+        ins_scroll.pack(side="right", fill="y")
+
+        ins_wrap = tk.Frame(ins_canvas, bg=CARD)
+        ins_id = ins_canvas.create_window((0, 0), window=ins_wrap, anchor="nw")
+
+        def _fit_ins(_event=None) -> None:
+            ins_canvas.configure(scrollregion=ins_canvas.bbox("all"))
+            ins_canvas.itemconfigure(ins_id, width=ins_canvas.winfo_width())
+
+        ins_wrap.bind("<Configure>", _fit_ins)
+        ins_canvas.bind("<Configure>", _fit_ins)
+
+        def _ins_wheel(event):
+            if event.widget in (self.msg_text, self.prompt_text):
+                return None
+            ins_canvas.yview_scroll(int(-event.delta / 120) * _scroll_step(), "units")
+            return "break"
+
+        ins_canvas.bind("<MouseWheel>", _ins_wheel)
+        ins_wrap.bind("<MouseWheel>", _ins_wheel)
+
+        ins = tk.Frame(ins_wrap, bg=CARD)
+        ins.pack(fill="both", expand=True, padx=px(14), pady=px(12))
+        ins.bind("<MouseWheel>", _ins_wheel)
+        tk.Label(ins, text="Карточка лида", bg=CARD, fg=FG,
+                 font=ui_font(11, "bold")).pack(anchor="w", pady=(0, px(10)))
+
+        self.detail_vars: dict[str, tk.StringVar] = {
+            key: tk.StringVar(value="") for key in INSPECTOR_FIELDS
+        }
+        labels = {
+            "name": "Название", "topic": "Ниша", "address": "Адрес",
+            "rating": "Рейтинг", "phone": "Телефон",
+            "messengers": "Мессенджеры",
+        }
+        for key in INSPECTOR_FIELDS:
+            label = labels[key]
+            line = tk.Frame(ins, bg=CARD)
+            line.pack(fill="x", pady=px(2))
+            tk.Label(line, text=label, bg=CARD, fg=MUTED, font=ui_font(9),
+                     width=12, anchor="w").pack(side="left")
+            tk.Label(line, textvariable=self.detail_vars[key], bg=CARD, fg=FG,
+                     font=ui_font(9), anchor="w", justify="left",
+                     wraplength=px(220)).pack(side="left", fill="x", expand=True)
+
+        tk.Label(ins, text="Текст сообщения", bg=CARD, fg=MUTED,
+                 font=ui_font(9)).pack(anchor="w", pady=(px(10), px(2)))
+        msg_box = tk.Frame(ins, bg=CARD)
+        msg_box.pack(fill="x")
+        msg_box.rowconfigure(0, weight=1)
+        msg_box.columnconfigure(0, weight=1)
+        self.msg_text = dark_text(msg_box, height=5)
+        msg_scroll = ttk.Scrollbar(msg_box, orient="vertical",
+                                   command=self.msg_text.yview)
+        self.msg_text.configure(yscrollcommand=msg_scroll.set)
+        self.msg_text.grid(row=0, column=0, sticky="nsew")
+        msg_scroll.grid(row=0, column=1, sticky="ns")
+        flat_button(ins, "Сгенерировать ИИ", self._generate_message,
+                    kind="ghost").pack(anchor="w", pady=(px(6), 0))
+
+        tk.Label(ins, text="Промпт для сайта", bg=CARD, fg=MUTED,
+                 font=ui_font(9)).pack(anchor="w", pady=(px(10), px(2)))
+        prompt_box = tk.Frame(ins, bg=CARD)
+        prompt_box.pack(fill="x")
+        prompt_box.rowconfigure(0, weight=1)
+        prompt_box.columnconfigure(0, weight=1)
+        self.prompt_text = dark_text(prompt_box, height=6)
+        prompt_scroll = ttk.Scrollbar(prompt_box, orient="vertical",
+                                      command=self.prompt_text.yview)
+        self.prompt_text.configure(yscrollcommand=prompt_scroll.set)
+        self.prompt_text.grid(row=0, column=0, sticky="nsew")
+        prompt_scroll.grid(row=0, column=1, sticky="ns")
+        prompt_actions = tk.Frame(ins, bg=CARD)
+        prompt_actions.pack(fill="x", pady=(px(6), 0))
+        flat_button(prompt_actions, "📋 Скопировать промпт", self._copy_prompt,
+                    kind="primary").pack(side="left")
+        flat_button(prompt_actions, "Сгенерировать промпт ИИ",
+                    self._generate_site_prompt, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        self.prompt_path_var = tk.StringVar(value="")
+        tk.Label(ins, textvariable=self.prompt_path_var, bg=CARD, fg=MUTED,
+                 font=ui_font(8), wraplength=px(260), anchor="w",
+                 justify="left").pack(anchor="w", fill="x", pady=(px(6), 0))
+
+        # -- ручное подтверждение: канал и одиночная отправка ---------------- #
+        self.channel_var = tk.StringVar(value="")
+        self._channel_map: dict[str, str] = {}  # подпись канала → канал
+        self._sending = False
+        channel_line = tk.Frame(ins, bg=CARD)
+        channel_line.pack(fill="x", pady=(px(10), 0))
+        tk.Label(channel_line, text="Канал", bg=CARD, fg=MUTED, font=ui_font(9),
+                 width=12, anchor="w").pack(side="left")
+        self.channel_box = ttk.Combobox(
+            channel_line, textvariable=self.channel_var, state="readonly", width=14)
+        self.channel_box.pack(side="left")
+        send_row = tk.Frame(ins, bg=CARD)
+        send_row.pack(fill="x", pady=(px(8), 0))
+        flat_button(send_row, "Отправить", self._send_one, kind="primary").pack(side="left")
+        flat_button(send_row, "Пропустить", self._skip_lead, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+        flat_button(send_row, "Удалить из пула", self._remove_lead, kind="ghost").pack(
+            side="left", padx=(px(8), 0))
+
+        self._inspector_visible = True
+        self.split.add(self.table_side, weight=3)
+        self.split.add(self.inspector, weight=2)
 
         log_frame, self.log_box = self.make_log(self, height=6)
-        log_frame.pack(fill="both", expand=True, pady=(px(10), 0))
+        log_frame.pack(fill="x", pady=(px(10), 0))
         self.append_log(
             self.log_box,
-            "Город — слаг 2GIS: moscow, spb, kazan, ekb, nsk. "
+            "Город — слаг 2GIS: moscow, spb, kazan, ekaterinburg, novosibirsk. "
             "Главный сигнал лида — отсутствие сайта. Горячие копятся в пуле на 5 дней.",
         )
         self._set_buttons(running=False)
+        self._clear_inspector()
         self.refresh()
 
     # -- действия ---------------------------------------------------------- #
@@ -5294,7 +5281,7 @@ class LeadsPanel(Panel):
 
     # -- данные ------------------------------------------------------------ #
     def _pool_days(self) -> float:
-        settings = leads_mail.load_settings(MAIL_SETTINGS_PATH)
+        settings = _mail_settings()
         try:
             return max(1.0, float(str(settings.get("pool_days", "5")).replace(",", ".")))
         except (TypeError, ValueError):
@@ -5359,13 +5346,20 @@ class LeadsPanel(Panel):
         except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
             busy = str(exc)
         self._fill_pool()
-        stats = leads_mail.pool_stats(POOL_FILE, days)
-        tail = f" · {busy}" if busy else ""
-        self.status_var.set(
-            f"в пуле: {stats['total']} · истекают сегодня: {stats['expiring']} · "
-            f"срок {days:g} дн.{tail}")
+        self._update_status(busy)
 
     on_show = refresh
+
+    def _update_status(self, busy: str = "") -> None:
+        """Статусная строка: объём пула и сколько написанных скрыто из выдачи."""
+        days = self._pool_days()
+        stats = leads_mail.pool_stats(POOL_FILE, days)
+        tail = f" · {busy}" if busy else ""
+        hidden = (f" · написанных скрыто: {self._hidden_contacted}"
+                  if self._hidden_contacted else "")
+        self.status_var.set(
+            f"в пуле: {stats['total']} · истекают сегодня: {stats['expiring']} · "
+            f"срок {days:g} дн.{hidden}{tail}")
 
     def _fill_pool(self) -> None:
         for item in self.result_tree.get_children():
@@ -5373,9 +5367,19 @@ class LeadsPanel(Panel):
         self._row_links.clear()
         self._row_urls.clear()
         self._row_phones.clear()
+        self._rows.clear()
+        self._hidden_contacted = 0
         rows = leads_mail.pool_load(POOL_FILE)
-        for index, row in enumerate(rows):
+        index = 0
+        for row in rows:
+            if leads_mail.is_contacted(row):
+                # Лиду уже писали — в выдаче ему не место (из пула не удаляем:
+                # очередь рассылки в MailWindow продолжает его видеть).
+                self._hidden_contacted += 1
+                continue
             iid = f"r{index}"
+            index += 1
+            self._rows[iid] = row
             self._row_links[iid] = self._contact_links(row)
             self._row_urls[iid] = str(row.get("card") or "").strip()
             self._row_phones[iid] = str(row.get("phone") or "").strip()
@@ -5384,6 +5388,199 @@ class LeadsPanel(Panel):
             self.result_tree.insert("", "end", iid=iid, values=(
                 row.get("name", ""), topic, self._contact_primary(row), gis,
             ))
+        # Сразу заполняем карточку первым лидом, чтобы инспектор не был пустым.
+        children = self.result_tree.get_children()
+        if children:
+            first = children[0]
+            self.result_tree.selection_set(first)
+            self.result_tree.focus(first)
+            self._show_lead(first)
+        else:
+            self._clear_inspector()
+
+    # -- инспектор лида ---------------------------------------------------- #
+    @staticmethod
+    def _set_text(widget: tk.Text, text: str) -> None:
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+
+    def _current_lead(self) -> tuple:
+        """Текущий лид: из карточки, либо из выделения таблицы."""
+        sel = self.result_tree.selection()
+        iid = self._current_iid or (sel[0] if sel else None)
+        row = self._current_row or (self._rows.get(iid, {}) if iid else {})
+        return iid, row
+
+    def _toggle_inspector(self) -> None:
+        if self._inspector_visible:
+            self.split.forget(self.inspector)
+            self._inspector_visible = False
+            self.inspector_toggle_btn.configure(text="Показать карточку")
+        else:
+            self.split.add(self.inspector, weight=2)
+            self._inspector_visible = True
+            self.inspector_toggle_btn.configure(text="Скрыть карточку")
+
+    def _on_select(self, event=None) -> None:
+        sel = self.result_tree.selection()
+        if sel:
+            self._show_lead(sel[0])
+        else:
+            self._clear_inspector()
+
+    def _show_lead(self, iid: str) -> None:
+        row = self._rows.get(iid, {})
+        if not row:
+            self._clear_inspector()
+            return
+        self._current_iid = iid
+        self._current_row = row
+
+        try:
+            details = inspector_fields(row)
+        except Exception:  # noqa: BLE001 - a broken pool row must not crash the card
+            details = {key: "—" for key in INSPECTOR_FIELDS}
+        for key in INSPECTOR_FIELDS:
+            self.detail_vars[key].set(details.get(key, "—"))
+
+        # GUI fallback: the logic layer found no messengers - use links from the row.
+        if details.get("messengers") in ("—", "не найдены"):
+            try:
+                links = self._contact_links(row)
+            except Exception:  # noqa: BLE001
+                links = []
+            fallback = ", ".join(f"{title}: {url}" for title, url in links)
+            self.detail_vars["messengers"].set(fallback or "—")
+
+        settings = _mail_settings()
+        idea = str(settings.get("idea", "") or "")
+
+        message = prompt = prompt_path = ""
+        if leads_mail is not None:
+            try:
+                # Если текст для лида уже генерили (карточка или очередь рассылки) —
+                # показываем сохранённый, иначе свежую заготовку.
+                st = leads_mail.MailState(MAIL_STATE_PATH).get(leads_mail.row_id(row))
+                message = str(st.get("text") or "").strip()
+            except Exception:  # noqa: BLE001 - пустой журнал не должен ломать карточку
+                message = ""
+            if not message:
+                try:
+                    message = leads_mail.fallback_text(row, idea, settings)
+                except Exception:
+                    message = ""
+            try:
+                prompt, path = leads_mail.read_or_create_site_prompt(row, settings)
+                prompt_path = str(path)
+            except Exception:
+                prompt = ""
+                prompt_path = ""
+
+        self._set_text(self.msg_text, message or "—")
+        self._set_text(self.prompt_text, prompt or "—")
+        self.prompt_path_var.set(prompt_path or "—")
+
+        # Каналы отправки: только те, где у лида есть контакт, по приоритету.
+        avail = leads_mail.channels_of(row) if leads_mail is not None else {}
+        order = leads_mail.PRIORITY if leads_mail is not None else ()
+        self._channel_map = {
+            leads_mail.channel_label(ch): ch for ch in order if ch in avail
+        }
+        labels = list(self._channel_map)
+        self.channel_box["values"] = labels
+        self.channel_var.set(labels[0] if labels else "")
+
+    def _clear_inspector(self) -> None:
+        for var in self.detail_vars.values():
+            var.set("")
+        self._set_text(self.msg_text, "")
+        self._set_text(self.prompt_text, "")
+        self.prompt_path_var.set("")
+        self.channel_var.set("")
+        self.channel_box["values"] = []
+        self._channel_map = {}
+        self._current_iid = None
+        self._current_row = {}
+
+    def _generate_message(self) -> None:
+        iid, row = self._current_lead()
+        if not iid or not row:
+            self.hub.toast("выбери лида в таблице")
+            return
+        self._current_iid = iid
+        self._current_row = row
+        settings = _mail_settings()
+        idea = str(settings.get("idea", "") or "")
+
+        def work() -> str:
+            if leads_mail is None:
+                return ""
+            if not leads_mail._ai_configured(settings):
+                return leads_mail.fallback_text(row, idea, settings)
+            return (leads_mail.ai_generate(settings, row, idea)
+                    or leads_mail.fallback_text(row, idea, settings))
+
+        def on_done(text: str) -> None:
+            if self._current_iid != iid:
+                return  # за время запроса выделение успели переключить
+            self._set_text(self.msg_text, text)
+
+        def on_error(exc: Exception) -> None:
+            self.append_log(self.log_box, f"ИИ: {exc}", "error")
+
+        self.hub.run_bg(work, on_done, on_error)
+
+    def _generate_site_prompt(self) -> None:
+        """Перегенерировать промпт для сайта через ИИ (или по шаблону) и сохранить в файл."""
+        iid, row = self._current_lead()
+        if not iid or not row:
+            self.hub.toast("выбери лида в таблице")
+            return
+        self._current_iid = iid
+        self._current_row = row
+        settings = _mail_settings()
+
+        def work() -> tuple[str, str]:
+            if leads_mail is None:
+                return "", ""
+            text = leads_mail.ai_generate_site_prompt(settings, row, save=True)
+            path_str = str(leads_mail.site_prompt_file(row))
+            return text, path_str
+
+        def on_done(res: tuple[str, str]) -> None:
+            if self._current_iid != iid:
+                return
+            text, path_str = res
+            self._set_text(self.prompt_text, text or "—")
+            if path_str:
+                self.prompt_path_var.set(path_str)
+            self.append_log(self.log_box, f"промпт для сайта обновлён · {path_str}", "ok")
+            self.hub.toast("промпт обновлён")
+
+        def on_error(exc: Exception) -> None:
+            self.append_log(self.log_box, f"ИИ промпт: {exc}", "error")
+
+        self.hub.run_bg(work, on_done, on_error)
+
+    def _copy_prompt(self) -> None:
+        iid, row = self._current_lead()
+        if not iid or not row:
+            self.hub.toast("выбери лида в таблице")
+            return
+        text = self.prompt_text.get("1.0", "end-1c")
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        path = None
+        if leads_mail is not None:
+            try:
+                path = leads_mail.save_site_prompt(text, row)
+            except (OSError, AttributeError):
+                pass
+        path_str = str(path) if path is not None else ""
+        self.prompt_path_var.set(path_str)
+        self.append_log(self.log_box, f"промпт скопирован · {path_str}", "ok")
+        self.hub.toast("промпт скопирован")
 
     # -- результат сбора --------------------------------------------------- #
     def _done(self, result: dict) -> None:
@@ -5508,6 +5705,130 @@ class LeadsPanel(Panel):
         self.refresh()
         self.hub.toast("лид удалён из пула")
 
+    # -- ручное подтверждение и одиночная отправка --------------------------- #
+    def _next_iid(self) -> str | None:
+        """Iid следующей строки после текущего выделения; None, если её нет."""
+        children = self.result_tree.get_children()
+        iid = self._current_iid
+        if not iid:
+            sel = self.result_tree.selection()
+            iid = sel[0] if sel else None
+        if iid not in children:
+            return None
+        index = children.index(iid)
+        if index + 1 >= len(children):
+            return None
+        return children[index + 1]
+
+    def _select_next(self) -> bool:
+        """Перевести выделение на следующую строку таблицы; False, если её нет."""
+        nxt = self._next_iid()
+        if not nxt:
+            return False
+        # <<TreeviewSelect>> сам обновит карточку через _on_select.
+        self.result_tree.selection_set(nxt)
+        self.result_tree.focus(nxt)
+        self.result_tree.see(nxt)
+        return True
+
+    def _skip_lead(self) -> None:
+        """Пропустить лида: статусы не меняем, просто переходим к следующему."""
+        iid, row = self._current_lead()
+        if not iid or not row:
+            self.hub.toast("выбери лида в таблице")
+            return
+        if not self._select_next():
+            self.hub.toast("это последний лид в таблице")
+
+    def _remove_lead(self) -> None:
+        iid, row = self._current_lead()
+        if not iid or not row:
+            self.hub.toast("выбери лида в таблице")
+            return
+        if not MAIL_OK:
+            self.hub.toast("модуль рассылки недоступен")
+            return
+        key = leads_mail.pool_key(row)
+        if not messagebox.askyesno(
+                "Лиды 2GIS", f"Удалить «{row.get('name', '')}» из пула?", parent=self):
+            return
+        try:
+            leads_mail.pool_remove(POOL_FILE, key)
+        except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
+            self.append_log(self.log_box, f"пул: {exc}", "warn")
+            return
+        self.refresh()
+        self.hub.toast("лид удалён из пула")
+
+    def _send_one(self) -> None:
+        """Одиночная отправка текущему лиду — без очередей и фоновых циклов."""
+        iid, row = self._current_lead()
+        if not iid or not row:
+            self.hub.toast("выбери лида в таблице")
+            return
+        if not MAIL_OK:
+            self.hub.toast("модуль рассылки недоступен")
+            return
+        if self._sending:
+            self.hub.toast("отправка уже идёт")
+            return
+        text = self.msg_text.get("1.0", "end-1c").strip()
+        if not text:
+            self.hub.toast("текст сообщения пустой")
+            return
+        channel = self._channel_map.get(self.channel_var.get())
+        contact = leads_mail.channels_of(row).get(channel) if channel else None
+        if not channel or not contact:
+            self.hub.toast("у лида нет контакта для этого канала")
+            return
+        settings = _mail_settings()
+        dry = bool(settings.get("dry_run"))
+
+        def work() -> dict:
+            return leads_mail.dispatch(channel, settings, contact[0], contact[1], text)
+
+        def on_done(info: dict) -> None:
+            self._sending = False
+            # Отметки как в Mailer._try_send, но журнал читаем свежим.
+            state = leads_mail.MailState(MAIL_STATE_PATH)
+            leads_mail.record_send(state, row, channel, contact[0], info, text)
+            try:
+                leads_mail.pool_mark_sent(POOL_FILE, leads_mail.pool_key(row), channel)
+            except getattr(leads_mail, "PoolBusy", RuntimeError) as exc:
+                self.append_log(self.log_box, f"пул: {exc}", "warn")
+            self.append_log(
+                self.log_box,
+                f"→ {row.get('name', '')} · {leads_mail.channel_label(channel)} · {contact[0]}"
+                + (" · тестовый режим" if dry else ""),
+                "ok",
+            )
+            self.hub.toast("отправлено (тестовый режим)" if dry else "отправлено")
+            if self._current_iid != iid:
+                return  # пользователь уже смотрит другого лида — выдачу не дёргаем
+            # Написанному лиду не место в выдаче: убираем строку точечно
+            # (из пула не удаляем — очередь MailWindow продолжает его видеть).
+            nxt = self._next_iid()
+            if self.result_tree.exists(iid):
+                self.result_tree.delete(iid)
+                self._rows.pop(iid, None)
+                self._hidden_contacted += 1
+                self._update_status()
+            if nxt and self.result_tree.exists(nxt):
+                # <<TreeviewSelect>> сам обновит карточку через _on_select.
+                self.result_tree.selection_set(nxt)
+                self.result_tree.focus(nxt)
+                self.result_tree.see(nxt)
+            else:
+                self.hub.toast("это был последний лид")
+
+        def on_error(exc: Exception) -> None:
+            self._sending = False
+            self.append_log(self.log_box, f"отправка: {exc}", "error")
+            self.hub.toast("ошибка отправки")
+
+        self._sending = True
+        self.hub.run_bg(work, on_done, on_error)
+
 
 class MailWindow(tk.Toplevel):
     """Рассылка ИИ по горячим лидам: настройки, генерация, очередь, отправка."""
@@ -5528,7 +5849,7 @@ class MailWindow(tk.Toplevel):
         self.option_add("*Font", ui_font(9))
         apply_dark_theme(self)
 
-        self.settings = leads_mail.load_settings(self.settings_path)
+        self.settings = _mail_settings()
         self.state = leads_mail.MailState(self.state_path)
         self.leads: list[dict] = []
         self.stop_event = threading.Event()
@@ -5614,8 +5935,10 @@ class MailWindow(tk.Toplevel):
         field(left, 1, "API URL", "ai_url")
         field(left, 2, "Модель", "ai_model")
         field(left, 3, "API-ключ", "ai_key", show="*")
-        area(left, 4, "Идея предложения (что продаём)", "idea", 3)
+        field(left, 4, "GitHub Base URL (ссылка; можно {slug})", "github_base_url")
+        area(left, 5, "Идея предложения (что продаём)", "idea", 3)
         area(left, 8, "Как писать (обучение ИИ)", "style", 3)
+        area(left, 11, "Шаблон промпта для сайта (пусто = стандартный)\nПоля: {name}, {rubric}, {city}, {address}, {phone}, {messengers}, {rating}, {reviews}, {github_base_url}", "site_prompt_template", 4)
         left.columnconfigure(1, weight=1)
 
         # Каналы
@@ -5654,9 +5977,9 @@ class MailWindow(tk.Toplevel):
 
         rules = ttk.Frame(cfg)
         rules.grid(row=1, column=0, columnspan=2, sticky="w", padx=px(6), pady=(0, px(8)))
-        ttk.Label(rules, text="Дней до смены канала", style="Muted.TLabel").pack(side="left")
+        ttk.Label(rules, text="Дней до повторного (0 = выкл)", style="Muted.TLabel").pack(side="left")
         ttk.Entry(rules, textvariable=self.vars.setdefault(
-            "followup_days", tk.StringVar(value=str(self.settings.get("followup_days", "5")))),
+            "followup_days", tk.StringVar(value=str(self.settings.get("followup_days", "0")))),
             width=6).pack(side="left", padx=(px(6), px(20)))
         ttk.Label(rules, text="Дней в пуле горячих", style="Muted.TLabel").pack(side="left")
         ttk.Entry(rules, textvariable=self.vars.setdefault(

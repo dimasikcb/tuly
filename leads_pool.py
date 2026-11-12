@@ -21,7 +21,9 @@ from pathlib import Path
 _POOL_LOCK = threading.RLock()
 
 from leads_contacts import (
+    format_phone as _format_phone,
     from_link as _from_link,
+    messenger_summary,
     num as _num,
     pick_contact as _pick_contact,
     to_link as _to_link,
@@ -42,8 +44,18 @@ POOL_NAME = "hot_pool.csv"
 POOL_COLUMNS = (
     "name", "telegram", "max", "vk", "email", "phone", "city",
     "topic", "card", "found_at", "sent_at", "channel", "status",
+    # Карточка-инспектор (ШАГ 3): без этих полей в UI были бы одни «—».
+    # Старые CSV без колонок читаются как пустые значения — схема расширяемая.
+    "address", "rating", "reviews", "rubric",
 )
 POOL_KEEP_STATUS = ("replied", "seen", "awaiting", "manual")
+# Статусы «лиду уже писали»: такие строки не показываются в выдаче вкладки «Лиды».
+CONTACTED_STATUSES = ("awaiting", "manual", "replied", "seen")
+
+# Детали карточки 2ГИС, дозаполняемые в пуле из свежего сбора/leads.csv.
+POOL_DETAIL_FIELDS = ("address", "rating", "reviews", "rubric")
+# Поля карточки-инспектора в GUI: ровно эти ключи отдаёт inspector_fields.
+INSPECTOR_FIELDS = ("name", "topic", "address", "rating", "phone", "messengers")
 
 # 2ГИС-слаги крупных городов для режима «вся Россия».
 RU_CITIES = (
@@ -93,6 +105,72 @@ def _pool_value(channel: str, value) -> str:
     if not raw:
         return ""
     return _to_link(channel, raw) or raw
+
+
+def inspector_fields(row: dict) -> dict[str, str]:
+    """Поля карточки-инспектора: ровно INSPECTOR_FIELDS, строки, «—» если пусто.
+
+    Чистая функция без tkinter/файлов/сети: логика прежнего tools.pyw._show_lead.
+    """
+    def text(key: str) -> str:
+        return str(row.get(key) or "").strip() or "—"
+
+    rating = str(row.get("rating") or "").strip()
+    reviews = str(row.get("reviews") or "").strip()
+    if rating and reviews:
+        rating_text = f"{rating} · {reviews} отзывов"
+    elif rating:
+        rating_text = rating
+    elif reviews:
+        rating_text = f"{reviews} отзывов"
+    else:
+        rating_text = "—"
+
+    phone = _format_phone(row.get("phone"))
+    messengers = messenger_summary(row)
+    return {
+        "name": text("name"),
+        "topic": str(row.get("topic") or row.get("rubric") or "").strip() or "—",
+        "address": text("address"),
+        "rating": rating_text,
+        "phone": phone or "—",
+        "messengers": "—" if messengers == "не найдены" else messengers,
+    }
+
+
+def backfill_fields(target: dict, source: dict) -> int:
+    """Дозаполняет ТОЛЬКО пустые поля target из source; возвращает число правок.
+
+    source — строка старого leads.csv (значения str) либо dict парсера 2ГИС
+    (rating/reviews бывают числами). Непустое в target не перезаписывается.
+    """
+    changed = 0
+    for ch in ("telegram", "max", "vk", "email"):
+        if (target.get(ch) or "").strip():
+            continue
+        value = _pool_value(ch, _pick_contact(source, ch))
+        if value:
+            target[ch] = value
+            changed += 1
+    if not (target.get("topic") or "").strip():
+        value = str(source.get("query") or source.get("topic") or "").strip()
+        if value:
+            target["topic"] = value
+            changed += 1
+    if not (target.get("card") or "").strip():
+        value = str(source.get("url") or source.get("card") or "").strip()
+        if value:
+            target["card"] = value
+            changed += 1
+    for field in POOL_DETAIL_FIELDS:
+        if (target.get(field) or "").strip():
+            continue
+        raw = source.get(field)
+        value = "" if raw is None else str(raw).strip()
+        if value:
+            target[field] = value
+            changed += 1
+    return changed
 
 
 def pool_key(row: dict) -> str:
@@ -230,7 +308,7 @@ def _pool_save(pool_file, rows: list[dict]) -> None:
 
 
 def _lead_to_pool_row(lead: dict, found_at: str) -> dict:
-    return {
+    row = {
         "name": lead.get("name", ""),
         "telegram": _pool_value("telegram", _pick_contact(lead, "telegram")),
         "max": _pool_value("max", _pick_contact(lead, "max")),
@@ -245,6 +323,10 @@ def _lead_to_pool_row(lead: dict, found_at: str) -> dict:
         "channel": "",
         "status": "",
     }
+    for field in POOL_DETAIL_FIELDS:
+        value = lead.get(field)
+        row[field] = "" if value is None else str(value).strip()
+    return row
 
 
 def pool_sync(csv_file) -> int:
@@ -265,19 +347,7 @@ def pool_refresh(pool_file) -> int:
         src = csv_rows.get(key)
         if not src:
             continue
-        for channel in ("telegram", "max", "vk", "email"):
-            if not (row.get(channel) or "").strip():
-                value = _pool_value(channel, _pick_contact(src, channel))
-                if value:
-                    row[channel] = value
-                    updated += 1
-        # Дозаполнить тему и карточку 2ГИС
-        if not (row.get("topic") or "").strip() and (src.get("query") or src.get("topic")):
-            row["topic"] = str(src.get("query") or src.get("topic")).strip()
-            updated += 1
-        if not (row.get("card") or "").strip() and (src.get("url") or src.get("card")):
-            row["card"] = str(src.get("url") or src.get("card")).strip()
-            updated += 1
+        updated += backfill_fields(row, src)
     if updated:
         _pool_save(pool_file, pool_rows)
     return updated
@@ -299,22 +369,8 @@ def pool_add(pool_file, leads: list[dict]) -> int:
         if not key:
             continue
         if key in by_key:
-            existing = by_key[key]
-            # Дозаполняем card, topic или контакты, если в существующей записи они пустые
-            new_card = str(lead.get("url") or lead.get("card") or "").strip()
-            if not (existing.get("card") or "").strip() and new_card:
-                existing["card"] = new_card
-                changed += 1
-            new_topic = str(lead.get("topic") or lead.get("query") or "").strip()
-            if not (existing.get("topic") or "").strip() and new_topic:
-                existing["topic"] = new_topic
-                changed += 1
-            for ch in ("telegram", "max", "vk", "email"):
-                if not (existing.get(ch) or "").strip():
-                    val = _pool_value(ch, _pick_contact(lead, ch))
-                    if val:
-                        existing[ch] = val
-                        changed += 1
+            # Дозаполняем только пустые поля: контакты, тему, карточку, детали.
+            changed += backfill_fields(by_key[key], lead)
             continue
         new_row = _lead_to_pool_row(lead, stamp)
         rows.append(new_row)
@@ -422,23 +478,7 @@ def migrate_legacy(dir_path) -> dict:
         src = source.get(pool_key(row))
         if not src:
             continue
-        for channel in ("telegram", "max", "vk", "email"):
-            if not (row.get(channel) or "").strip():
-                value = _pool_value(channel, _pick_contact(src, channel))
-                if value:
-                    row[channel] = value
-                    out["filled"] += 1
-        # Перенести тему и ссылку на карточку 2ГИС из leads.csv
-        if not (row.get("topic") or "").strip():
-            val = str(src.get("query") or src.get("topic") or "").strip()
-            if val:
-                row["topic"] = val
-                out["filled"] += 1
-        if not (row.get("card") or "").strip():
-            val = str(src.get("url") or src.get("card") or "").strip()
-            if val:
-                row["card"] = val
-                out["filled"] += 1
+        out["filled"] += backfill_fields(row, src)
     if out["filled"]:
         _pool_save(pool_file, current)
 
@@ -491,6 +531,17 @@ def load_hot_leads(csv_file) -> list[dict]:
                 rows.append(item)
     rows.sort(key=lambda r: str(r.get("found_at") or ""), reverse=True)
     return rows
+
+
+def is_contacted(row: dict) -> bool:
+    """Лид уже получил сообщение: была отправка (sent_at) или статус «написан/отвечен».
+
+    Статус "stopped" («Остановить лид») контактом не считается — сообщение
+    могло и не уйти. Именно такие строки скрывает выдача вкладки «Лиды».
+    """
+    if str(row.get("sent_at") or "").strip():
+        return True
+    return str(row.get("status") or "").strip().lower() in CONTACTED_STATUSES
 
 
 def is_hot(lead) -> bool:

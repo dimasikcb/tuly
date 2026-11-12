@@ -31,6 +31,9 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 from leads_contacts import messenger_links as _contact_links
+# Парсер (слой 3) импортирует вниз только leads_contacts и leads_pool;
+# НИКОГДА не импортирует leads_mail и tools — это инверсия слоёв.
+from leads_pool import RU_CITIES, pool_add, pool_load
 
 
 def _load_deps(install: bool = False) -> bool:
@@ -992,6 +995,173 @@ class Store:
             "id": lead.get("id", ""),
             "reason": lead.get("reason", ""),
         }
+
+
+# --- оркестрация сбора (GUI tools.pyw зовёт collect_leads) -------------------
+
+_leads_local = threading.local()
+
+
+def _leads_client() -> TwoGisClient:
+    """Свой HTTP-клиент на поток: requests.Session не потокобезопасен."""
+    client = getattr(_leads_local, "client", None)
+    if client is None:
+        client = TwoGisClient(timeout=30, delay=0.4)
+        _leads_local.client = client
+    return client
+
+
+def _city_list(city: str) -> list[str]:
+    """Разбирает строку городов; «russia/вся россия» → список RU_CITIES."""
+    if city.strip().lower() in ("russia", "вся россия", "всяроссия", "ru"):
+        return list(RU_CITIES)
+    return [c.strip() for c in city.split(",") if c.strip()]
+
+
+def collect_leads(city: str, queries: list[str], cards: int, only_no_site: bool,
+                  min_reviews: int | None, on_progress, on_log, stop,
+                  limit: int | None = None, pool_file=None) -> dict:
+    """Обходит выдачу и карточки по каждой нише, горячих кладёт в пул.
+
+    `queries` — список поисковых запросов (ниш): обходятся по очереди,
+    карточки дедуплицируются по id, итоговая выдача ограничивается `limit`.
+    `pool_file` — путь к пулу горячих (hot_pool.csv), обязателен для
+    pool_add/pool_load из leads_pool: парсер не зависит от почтового слоя.
+    """
+    if pool_file is None:
+        raise ValueError("pool_file обязателен: куда класть горячих лидов")
+
+    client = TwoGisClient(timeout=30, delay=0.4)
+
+    try:
+        want = max(1, int(cards))
+    except (TypeError, ValueError):
+        want = CARDS_PER_PAGE * 5
+
+    uniq: dict[str, str] = {}
+    for q in queries:
+        q = str(q or "").strip()
+        if q:
+            uniq.setdefault(q.lower(), q)
+    queries = list(uniq.values())
+    if not queries:
+        return {"checked": 0, "found": 0, "hot": 0, "pooled": 0,
+                "total": len(pool_load(pool_file)), "rows": []}
+
+    cities = _city_list(city)
+    if not cities:
+        cities = [city.strip() or "moscow"]
+    want_share = max(1, want // (len(cities) * len(queries)))
+
+    all_cards: list[dict] = []
+    seen: set[str] = set()
+    for qi, q in enumerate(queries, 1):
+        if stop.is_set():
+            break
+        on_log(f"ниша «{q}»: обход {len(cities)} город(ов)")
+        for ci, cur_city in enumerate(cities, 1):
+            if stop.is_set():
+                break
+            pages = pages_for(want_share)
+            city_cards: list[dict] = []
+            for page in range(1, pages + 1):
+                if stop.is_set() or len(city_cards) >= want_share:
+                    break
+                try:
+                    found, _last_page = client.search_page(cur_city, q, page)
+                except Exception as exc:
+                    on_log(f"{cur_city}: ошибка поиска ({exc})")
+                    break
+                fresh = [c for c in found if c["id"] not in seen]
+                for c in fresh:
+                    seen.add(c["id"])
+                    c["query"] = q  # ниша, нашедшая карточку, — на саму карточку
+                city_cards.extend(fresh)
+                on_progress(f"ниша {qi}/{len(queries)} «{q}» · город {ci}/{len(cities)} "
+                            f"{cur_city} стр.{page}/{pages} · {len(city_cards)}/{want_share}")
+                if not fresh:
+                    break
+            city_cards = city_cards[:want_share]
+            all_cards.extend(city_cards)
+            on_log(f"{cur_city} / {q}: карточек {len(city_cards)}")
+
+    if not all_cards:
+        return {"checked": 0, "found": 0, "hot": 0, "pooled": 0,
+                "total": len(pool_load(pool_file)), "rows": []}
+
+    def one(card_info: tuple) -> dict | None:
+        cur_city, firm_id, q = card_info
+        try:
+            html = _leads_client().firm_html(cur_city, firm_id)
+        except Exception:  # noqa: BLE001 - битая карточка не рушит прогон
+            return None
+        lead = parse_firm(html, cur_city, firm_id, q)
+        if lead is not None:
+            # Запрос фиксируется на карточке, а не берётся из переменной цикла —
+            # иначе потоки ThreadPoolExecutor получили бы последнюю нишу.
+            lead["topic"] = q
+        return lead
+
+    # parse_search уже кладёт city в каждую карточку — восстанавливать не нужно.
+    # Третий элемент — ниша: одна фирма может попасться в нескольких запросах.
+    card_infos = [(c.get("city") or cities[0], c["id"], c.get("query") or queries[0])
+                  for c in all_cards]
+
+    parsed: list[dict] = []
+    total = len(card_infos)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(one, ci) for ci in card_infos]
+        for index, future in enumerate(as_completed(futures), 1):
+            if stop.is_set():
+                break
+            lead = future.result()
+            if lead:
+                parsed.append(lead)
+            on_progress(f"карточки {index}/{total} · собрано {len(parsed)}")
+
+    # Страховка от повторов между нишами: seen уже фильтрует карточки по id,
+    # но дедуплицируем и разобранные лиды (порядок сохраняется).
+    parsed = dedup_by_id(parsed)
+
+    ratings = client.ratings(lead["id"] for lead in parsed)
+    for lead in parsed:
+        if ratings.get(lead["id"]) is not None:
+            lead["rating"] = ratings[lead["id"]]
+        lead["score"], lead["reason"] = score(lead)
+
+    dropped = drop_boilerplate_domains(parsed)
+    if dropped:
+        on_log(f"убрано общих доменов-заглушек: {dropped}")
+
+    filters = Filters(
+        no_website=only_no_site,
+        has_phone=True,
+        min_reviews=min_reviews,
+    )
+    selected = sorted(
+        (lead for lead in parsed if filters.accepts(lead)),
+        key=lambda lead: lead["score"],
+        reverse=True,
+    )
+    if limit:
+        # Итоговый лимит: лучшие N по скору, ДО добавления в пул горячих.
+        selected = selected[:max(1, int(limit))]
+
+    pooled = 0
+    try:
+        pooled = pool_add(pool_file, selected)
+    except Exception as exc:  # noqa: BLE001 - пул не должен валить сбор
+        on_log(f"пул горячих: {exc}")
+
+    if pooled:
+        on_log(f"в пул горячих добавлено: {pooled}")
+    else:
+        on_log("горячих новых нет — всё уже в пуле")
+    return {
+        "checked": len(parsed), "pooled": pooled,
+        "total": len(pool_load(pool_file)),
+        "top": selected[:5], "rows": selected[:300],
+    }
 
 
 # --- CLI --------------------------------------------------------------------

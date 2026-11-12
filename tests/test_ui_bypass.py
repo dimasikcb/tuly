@@ -19,7 +19,7 @@ ROOT_DIR = TESTS_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from helpers import TempConfig, load_app
+from helpers import TempConfig, load_app, new_tk
 
 app = load_app()
 
@@ -95,7 +95,7 @@ class BypassPanelTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-        self.root = tk.Tk()
+        self.root = new_tk(tk.Tk)
         self.root.withdraw()
         self.addCleanup(self.root.destroy)
         self.hub = FakeHub()

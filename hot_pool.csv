@@ -1,1 +1,5 @@
-﻿name,telegram,max,vk,email,phone,city,topic,card,found_at,sent_at,channel,status
+﻿name,telegram,max,vk,email,phone,city,topic,card,found_at,sent_at,channel,status,address,rating,reviews,rubric
+Dental Center,https://t.me/dental_center,,https://vk.com/dentalcenterkazan,mailto:center_dental@mail.ru,+79297201700,kazan,стоматология,https://2gis.ru/kazan/firm/70000001063612943,2026-11-12T17:21:08,,,,"Улица Академика Губкина, 5",5.0,564,Стоматология
+Dentalroom,https://t.me/dentalroomnn,,https://vk.com/dentalroomstom,mailto:1@dentalroom.me,+78312661165,n_novgorod,стоматология,https://2gis.ru/n_novgorod/firm/70000001038449604,2026-11-12T17:21:08,,,,"Площадь Свободы, 7",5.0,169,Семейный стоматологический центр
+DENTAL STUDIO PRO,https://t.me/dentalstudiopro,,https://vk.com/dentalstudiopro,mailto:clinic@dentals.ru,+78312180222,n_novgorod,стоматология,https://2gis.ru/n_novgorod/firm/2674540559797738,2026-11-12T17:21:08,,,,"Сенная площадь, 6",5.0,383,​
+О2,https://t.me/+79102810022,,,mailto:o2stom@yandex.ru,+79950360022,voronezh,стоматология,https://2gis.ru/voronezh/firm/70000001102717673,2026-11-12T17:21:08,,,,"Улица Генерала Лизюкова, 61",5.0,100,Стоматология

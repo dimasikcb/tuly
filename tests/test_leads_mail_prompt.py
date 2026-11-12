@@ -196,5 +196,57 @@ class AiGenerateOfflineTest(unittest.TestCase):
         self._assert_offline_fallback(settings, "предложу простой сайт")
 
 
+class GithubSlugAndAiPromptTest(unittest.TestCase):
+    def test_github_base_url_slug_substitution(self) -> None:
+        """{slug} в github_base_url подставляется в сообщение и в промпт."""
+        settings = {**M.DEFAULT_SETTINGS, "github_base_url": "https://u.github.io/demo/{slug}/"}
+        msg = M.fallback_text(FULL_ROW, "сайт под ключ", settings)
+        self.assertIn("https://u.github.io/demo/barbershop-boroda-moskva/", msg)
+        prompt = M.generate_site_prompt(FULL_ROW, settings, save=False)
+        self.assertIn("https://u.github.io/demo/barbershop-boroda-moskva/", prompt)
+
+    def test_ai_generate_site_prompt_offline_fallback_and_ai_mock(self) -> None:
+        """Без ключа — быстрый фолбэк; с ключом — вызов _ai_chat и сохранение файла."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            offline = M.ai_generate_site_prompt(
+                {**M.DEFAULT_SETTINGS, "ai_key": ""}, FULL_ROW, out_dir=out, save=True
+            )
+            self.assertIn("Барбершоп Борода", offline)
+            self.assertIn("2-4", offline)
+            self.assertEqual(len(list(out.glob("*.txt"))), 1)
+
+            cfg = {**M.DEFAULT_SETTINGS, "ai_key": "k-test"}
+            with mock.patch.object(M, "_ai_chat", return_value="ИИ ПРОМПТ: задай 2-4 вопроса") as chat:
+                online = M.ai_generate_site_prompt(cfg, FULL_ROW, out_dir=out, save=True)
+            self.assertTrue(chat.called)
+            self.assertEqual(online, "ИИ ПРОМПТ: задай 2-4 вопроса")
+            saved = next(out.glob("*.txt")).read_text(encoding="utf-8")
+            self.assertEqual(saved, "ИИ ПРОМПТ: задай 2-4 вопроса")
+
+    def test_mailer_step_skips_followup_when_disabled(self) -> None:
+        """При followup_days=0 повторное сообщение на другой канал не отправляется."""
+        from datetime import datetime, timedelta
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = M.MailState(Path(tmp) / "state.json")
+            row = {**FULL_ROW, "vk": "club1"}
+            st = state.get(M.row_id(row))
+            st["status"] = "awaiting"
+            st["sent_at"] = (datetime.now() - timedelta(days=10)).isoformat(timespec="seconds")
+            st["attempts"] = [{"channel": "telegram", "target": "barber_boroda",
+                               "at": st["sent_at"], "ok": True}]
+            st["text"] = "первое сообщение"
+            settings = {**M.DEFAULT_SETTINGS, "followup_days": "0", "dry_run": True}
+            mailer = M.Mailer([row], settings, state, lambda *_: None, lambda *_: None)
+            with mock.patch.object(M, "dispatch") as disp:
+                sent = mailer.step()
+            self.assertFalse(sent)
+            self.assertFalse(disp.called)
+
+
 if __name__ == "__main__":
     unittest.main()

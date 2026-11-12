@@ -37,6 +37,27 @@ def load_app():
     return module
 
 
+def new_tk(factory, attempts: int = 5):
+    """Создать Tk-корень с ретраем на гонку Tcl 8.6 (Windows, Python 3.13).
+
+    При десятках Tk()/destroy() в одном процессе pytest изредка ловит
+    `Can't find a usable tk.tcl ... couldn't read file icons.tcl`, хотя файл
+    на месте. Повтор через короткую паузу снимает ложный FAIL полного прогона.
+    `tkinter` импортируется лениво: helpers грузят и тесты логики без GUI.
+    """
+    import time
+    import tkinter as tk
+
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return factory()
+        except tk.TclError as exc:
+            last_exc = exc
+            time.sleep(0.05 * (attempt + 1))
+    raise last_exc
+
+
 class TempConfig:
     """Подменяет CONFIG_PATH на временный файл.
 

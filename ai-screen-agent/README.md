@@ -6,9 +6,8 @@
 
 ## ⚡ Быстрый запуск
 
-1. Перейдите в папку:
-   `C:\Users\admin\.gemini\antigravity\scratch\ai_screen_agent\`
-2. Запустите файл **`start.bat`** (двойным кликом).
+1. Перейдите в папку `ai-screen-agent` рядом с хабом (`C:\Users\admin\Documents\тулы\ai-screen-agent\`).
+2. Запустите файл **`run.bat`** (двойным кликом).
 3. В открывшемся окне:
    - Вставьте ваш **Gemini API Key** (получить бесплатно можно на [Google AI Studio](https://aistudio.google.com/apikey)) и нажмите **«Сохранить»**.
    - Нажмите кнопку **«🎯 Выделить область мышкой»** и выделите рамку вокруг теста / браузера.

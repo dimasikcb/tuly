@@ -47,19 +47,31 @@ def is_admin() -> bool:
         return False
 
 
-def config_read() -> dict:
+def read_json_dict(path: str | Path, default: dict | None = None) -> dict:
+    """Читает JSON-словарь; при ошибке или не-dict возвращает default (или {})."""
+    fallback = default if default is not None else {}
     try:
-        data = json.loads(CONFIG_PATH.read_text("utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return fallback
+    return data if isinstance(data, dict) else fallback
+
+
+def write_json_dict(path: str | Path, data: dict) -> None:
+    """Атомарно записывает JSON-словарь (utf-8, ensure_ascii=False, indent=2)."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def config_read() -> dict:
+    return read_json_dict(CONFIG_PATH)
 
 
 def config_write(data: dict) -> None:
-    temp_path = CONFIG_PATH.with_suffix(".tmp")
-    temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
     try:
-        temp_path.replace(CONFIG_PATH)
+        write_json_dict(CONFIG_PATH, data)
     except OSError:
         CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
 

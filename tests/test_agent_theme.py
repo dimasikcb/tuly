@@ -23,6 +23,11 @@ for path in (str(PROJECT_ROOT), str(AGENT_ROOT)):
 import theme  # noqa: E402
 import screen_agent  # noqa: E402
 
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+from helpers import new_tk  # noqa: E402
+
 SOURCE = AGENT_ROOT / "screen_agent.py"
 
 
@@ -66,7 +71,7 @@ class AgentThemeTests(unittest.TestCase):
 
     def _make_app(self, mode_name: str):
         theme.set_mode(mode_name)
-        root = tk.Tk()
+        root = new_tk(tk.Tk)
         root.withdraw()
         app = screen_agent.AIScreenAgentApp(root)
         root.update_idletasks()

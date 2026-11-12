@@ -49,6 +49,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import winbase
 from apps_catalog import expand_companions, normalize_apps, running_processes
 from winbase import NO_WINDOW, config_read, config_update, is_admin, ps_run, run_tool
 
@@ -143,33 +144,22 @@ def bypass_cfg_save(**updates) -> None:
 
 
 def bypass_admin() -> bool:
-    """Проверяет, запущен ли процесс с правами администратора Windows."""
-    try:
-        shell32 = ctypes.windll.shell32
-        shell32.IsUserAnAdmin.restype = ctypes.c_int
-        shell32.IsUserAnAdmin.argtypes = []
-        return bool(shell32.IsUserAnAdmin())
-    except Exception:  # noqa: BLE001
-        return False
+    """Проверяет, запущен ли процесс с правами администратора Windows.
+
+    Это алиас winbase.is_admin: реализация живёт в нижнем слое в одном месте.
+    """
+    return winbase.is_admin()
 
 
 def _bypass_track() -> dict:
     """Читает state.json с PID запущенных нами процессов."""
-    try:
-        data = json.loads(BYPASS_STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except Exception:  # noqa: BLE001
-        pass
-    return {}
+    return winbase.read_json_dict(BYPASS_STATE_FILE)
 
 
 def _track_save(data: dict) -> None:
     """Атомарно записывает state.json."""
     BYPASS_DIR.mkdir(parents=True, exist_ok=True)
-    BYPASS_STATE_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
-    )
+    winbase.write_json_dict(BYPASS_STATE_FILE, data)
 
 
 def _image_pids(image: str) -> list[int]:

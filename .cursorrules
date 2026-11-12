@@ -26,9 +26,9 @@
 
 # 🚫 ПРАВИЛО: СБОРКА В EXE ОТКЛЮЧЕНА И ЗАПРЕЩЕНА
 > **НЕ СОБИРАТЬ ПРОЕКТ В EXE.**
-> Проект развивается и запускается напрямую из исходного кода Python (`python tools.pyw`, `python app.pyw`, `run.bat`).
+> Проект развивается и запускается напрямую из исходного кода Python (`python tools.pyw`, `python diary-grades/app.py`, `run.bat`).
 > Никаких вызовов PyInstaller или `build_exe.bat`. Все изменения сразу работают в `.py` / `.pyw` файлах.
 
 ---
 
-Инструкции для Cursor / AI Assistant: следуйте правилам выше и описанию в AI_GUIDE.md.
+Инструкции для Cursor / AI Assistant: следуйте правилам выше и описанию в README.md.

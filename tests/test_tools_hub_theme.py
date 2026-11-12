@@ -18,10 +18,13 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+TESTS_DIR = Path(__file__).resolve().parent
+for _path in (str(ROOT), str(TESTS_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 import theme  # noqa: E402
+from helpers import new_tk as _new_tk  # noqa: E402 — общий ретрай гонки Tcl 8.6
 
 TOOLS_PATH = ROOT / "tools.pyw"
 
@@ -65,7 +68,7 @@ class ToolsHubThemeTests(unittest.TestCase):
         self.assertEqual(tuple(self.tools.AVATAR_COLORS), theme.AVATARS)
 
     def test_widgets_use_theme_colors(self) -> None:
-        root = tk.Tk()
+        root = _new_tk(tk.Tk)
         root.withdraw()
         try:
             self.tools.apply_dark_theme(root)
@@ -97,7 +100,7 @@ class ToolsHubThemeTests(unittest.TestCase):
 
         for mode_name in ("dark", "light"):
             theme.set_mode(mode_name)
-            hub = self.tools.Hub(initial_tab="clean")
+            hub = _new_tk(lambda: self.tools.Hub(initial_tab="clean"))
             hub.withdraw()
             hub.update_idletasks()
             try:
@@ -137,7 +140,7 @@ class ToolsHubThemeTests(unittest.TestCase):
 
     def test_hub_switches_theme_live(self) -> None:
         theme.set_mode("auto")  # предыдущий тест мог оставить light/dark
-        hub = self.tools.Hub(initial_tab="clean")
+        hub = _new_tk(lambda: self.tools.Hub(initial_tab="clean"))
         hub.withdraw()
         try:
             self.assertEqual(theme.raw_mode(), "auto")

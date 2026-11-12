@@ -14,6 +14,9 @@ import re
 CHANNEL_TITLE = {"max": "MAX", "telegram": "Telegram", "vk": "ВК", "email": "Почта"}
 TARGET_TITLE = {**CHANNEL_TITLE, "phone": "Телефон"}
 CHANNELS = ("telegram", "max", "vk", "email")
+# Подписи каналов в карточке лида: порядок и регистр фиксированы контрактом.
+MESSENGER_LABELS = (("telegram", "Telegram"), ("max", "MAX"),
+                    ("vk", "VK"), ("email", "Email"))
 
 
 def num(value, default: float = 0.0) -> float:
@@ -181,6 +184,36 @@ def contact_link(channel: str, contact: tuple[str, str]) -> str:
     if channel == "email":
         return "mailto:" + value
     return ""
+
+
+def messenger_summary(row: dict) -> str:
+    """Контакты лида строкой: «Telegram: ..., MAX: ..., VK: ..., Email: ...».
+
+    Побайтно повторяет прежний leads_mail._lead_messengers: сначала прямые
+    поля каналов, иначе разбор messengers (строка с «;» или список/кортеж).
+    """
+    parts = []
+    for key, title in MESSENGER_LABELS:
+        value = str(row.get(key) or "").strip()
+        if value:
+            parts.append(f"{title}: {value}")
+    if not parts:
+        raw = row.get("messengers")
+        if isinstance(raw, str):
+            items = raw.split(";")
+        elif isinstance(raw, (list, tuple)):
+            items = list(raw)
+        else:
+            items = []
+        for item in items:
+            value = str(item or "").strip()
+            if not value:
+                continue
+            if ":" in value:
+                platform, _, handle = value.partition(":")
+                value = f"{platform.strip().capitalize()}: {handle.strip()}"
+            parts.append(value)
+    return ", ".join(parts) if parts else "не найдены"
 
 
 def messenger_links(lead: dict) -> dict[str, str]:

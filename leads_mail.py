@@ -49,6 +49,7 @@ from leads_contacts import (  # noqa: F401 - часть публичного API
     contact_link,
     format_phone,
     messenger_links,
+    messenger_summary,
     targets_of,
 )
 from leads_contacts import from_link as _from_link
@@ -57,10 +58,13 @@ from leads_contacts import pick_contact as _pick_contact
 from leads_contacts import short as _short
 from leads_contacts import to_link as _to_link
 from leads_pool import (  # noqa: F401 - реэкспорт: GUI и тесты зовут leads_mail.*
+    CONTACTED_STATUSES,
+    INSPECTOR_FIELDS,
     LEGACY_EXTRAS,
     LEGACY_NAME,
     LEGACY_SUFFIX,
     POOL_COLUMNS,
+    POOL_DETAIL_FIELDS,
     POOL_KEEP_STATUS,
     POOL_NAME,
     RU_CITIES,
@@ -72,7 +76,10 @@ from leads_pool import (  # noqa: F401 - реэкспорт: GUI и тесты �
     _pool_value,
     _read_csv,
     _tier_of,
+    backfill_fields,
     default_pool_path,
+    inspector_fields,
+    is_contacted,
     is_hot,
     load_hot_leads,
     migrate_legacy,
@@ -128,7 +135,7 @@ DEFAULT_SETTINGS = {
     "smtp_pass": "",
     "smtp_from": "",
     "mail_subject": "Предложение по сайту",
-    "followup_days": "5",
+    "followup_days": "0",
     "pool_days": "5",
     "pacing": "60",
     "dry_run": False,
@@ -279,10 +286,8 @@ def _translit(text: str) -> str:
     return slug[:60].strip("-")
 
 
-def site_prompt_file(row: dict, out_dir=None) -> Path:
-    """Путь файла промпта лида: leads_prompts/<имя_транслитом_или_id>.txt."""
-    folder = (Path(out_dir) if out_dir is not None
-              else Path(__file__).resolve().parent / "leads_prompts")
+def _lead_slug(row: dict) -> str:
+    """Безопасный слаг для имени файла и URL GitHub Pages: <имя>-<город>."""
     stem = _translit(row.get("name") or "")
     if not stem:
         # row_id может вернуть pool_key с "|" — в именах файлов Windows его быть не должно
@@ -290,34 +295,43 @@ def site_prompt_file(row: dict, out_dir=None) -> Path:
         stem = re.sub(r"-+", "-", raw)[:60].strip("-")
     if not stem:
         stem = "lead"
-    return folder / f"{stem}.txt"
+    city = _translit(str(row.get("city") or ""))
+    parts = [stem] + ([city] if city else [])
+    slug = "-".join(parts)
+    slug = re.sub(r"[^a-z0-9-]", "-", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")[:80].strip("-")
+    return slug or "lead"
+
+
+def site_prompt_file(row: dict, out_dir=None) -> Path:
+    """Путь файла промпта: leads_prompts/<имя>-<город>.txt.
+
+    Суффикс города снимает коллизию одноимённых фирм из разных городов.
+    """
+    folder = (Path(out_dir) if out_dir is not None
+              else Path(__file__).resolve().parent / "leads_prompts")
+    return folder / f"{_lead_slug(row)}.txt"
+
+
+def _github_demo_url(row: dict, settings: dict | None) -> str:
+    """Целевая ссылка на пример сайта; подставляет {slug}, если он есть в шаблоне."""
+    raw = str((settings or {}).get("github_base_url") or "").strip()
+    if "{slug}" in raw:
+        return raw.replace("{slug}", _lead_slug(row))
+    return raw
+
+
+def save_site_prompt(text: str, row: dict, out_dir=None) -> Path:
+    """Пишет текст промпта в файл лида и возвращает путь. OSError пробрасывает."""
+    path = site_prompt_file(row, out_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def _lead_messengers(row: dict) -> str:
-    """Контакты лида строкой: «Telegram: ..., MAX: ..., VK: ..., Email: ...»."""
-    parts = []
-    for key, title in (("telegram", "Telegram"), ("max", "MAX"),
-                       ("vk", "VK"), ("email", "Email")):
-        value = str(row.get(key) or "").strip()
-        if value:
-            parts.append(f"{title}: {value}")
-    if not parts:
-        raw = row.get("messengers")
-        if isinstance(raw, str):
-            items = raw.split(";")
-        elif isinstance(raw, (list, tuple)):
-            items = list(raw)
-        else:
-            items = []
-        for item in items:
-            value = str(item or "").strip()
-            if not value:
-                continue
-            if ":" in value:
-                platform, _, handle = value.partition(":")
-                value = f"{platform.strip().capitalize()}: {handle.strip()}"
-            parts.append(value)
-    return ", ".join(parts) if parts else "не найдены"
+    """Контакты лида строкой: тонкий делегат к leads_contacts.messenger_summary."""
+    return messenger_summary(row)
 
 
 class _PromptFields(dict):
@@ -336,7 +350,7 @@ def _default_site_prompt(row: dict, settings: dict) -> str:
     phone = str(row.get("phone") or "").strip() or "—"
     rating = str(row.get("rating") or "").strip() or "нет данных"
     reviews = str(row.get("reviews") or "").strip() or "нет данных"
-    base_url = str(settings.get("github_base_url") or "").strip() or "https://username.github.io/demo/"
+    base_url = _github_demo_url(row, settings) or "https://username.github.io/demo/"
     return (
         "Ты — опытный веб-разработчик. Создай одностраничный сайт-визитку "
         "для небольшого бизнеса и подготовь его к публикации на GitHub Pages.\n"
@@ -372,7 +386,8 @@ def generate_site_prompt(row: dict, settings: dict, out_dir=None, save: bool = T
     Шаблон берётся из settings["site_prompt_template"] (плейсхолдеры {name}
     {rubric} {city} {address} {phone} {messengers} {rating} {reviews}
     {github_base_url}); при пустом или битом шаблоне — встроенный текст.
-    С save=True пишет файл leads_prompts/<slug>.txt, ошибки диска глушит.
+    С save=True пишет файл leads_prompts/<slug>-<город>.txt через save_site_prompt,
+    ошибки диска глушит.
     """
     settings = settings or {}
     text = ""
@@ -387,7 +402,7 @@ def generate_site_prompt(row: dict, settings: dict, out_dir=None, save: bool = T
             "messengers": _lead_messengers(row),
             "rating": str(row.get("rating") or ""),
             "reviews": str(row.get("reviews") or ""),
-            "github_base_url": str(settings.get("github_base_url") or ""),
+            "github_base_url": _github_demo_url(row, settings),
         })
         try:
             text = template.format_map(fields)
@@ -397,12 +412,30 @@ def generate_site_prompt(row: dict, settings: dict, out_dir=None, save: bool = T
         text = _default_site_prompt(row, settings)
     if save:
         try:
-            path = site_prompt_file(row, out_dir)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
+            save_site_prompt(text, row, out_dir)
         except OSError:
             pass  # проблемы диска не мешают вернуть текст промпта
     return text
+
+
+def read_or_create_site_prompt(row: dict, settings: dict, out_dir=None) -> tuple[str, Path]:
+    """Возвращает (текст, путь): существующий непустой файл не перетирает (ручные правки).
+
+    Иначе генерирует и сохраняет промпт; ошибка диска не мешает вернуть текст.
+    """
+    path = site_prompt_file(row, out_dir)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    if text.strip():
+        return (text, path)
+    text = generate_site_prompt(row, settings, out_dir=out_dir, save=False)
+    try:
+        save_site_prompt(text, row, out_dir)
+    except OSError:
+        pass
+    return (text, path)
 
 
 def fallback_text(row: dict, idea: str, settings: dict | None = None) -> str:
@@ -417,7 +450,7 @@ def fallback_text(row: dict, idea: str, settings: dict | None = None) -> str:
     idea = idea[:1].upper() + idea[1:]
     if not idea.endswith((".", "!", "?")):
         idea += "."
-    url = str(settings.get("github_base_url") or "").strip()
+    url = _github_demo_url(row, settings)
     if url:
         link = f"Посмотреть пример можно по ссылке: {url}"
     else:
@@ -432,41 +465,28 @@ def fallback_text(row: dict, idea: str, settings: dict | None = None) -> str:
     )
 
 
-def ai_generate(settings: dict, row: dict, idea: str) -> str:
-    """Один запрос к OpenAI-совместимому API (OpenRouter / Groq / Ollama и т.п.)."""
+def _ai_configured(settings: dict) -> bool:
+    """True, если заданы endpoint/model и (ключ или локальный URL вроде Ollama)."""
+    base = (settings.get("ai_url") or "").strip().lower()
+    model = (settings.get("ai_model") or "").strip()
+    key = (settings.get("ai_key") or "").strip()
+    local = "localhost" in base or "127.0.0.1" in base
+    return bool(base and model and (key or local))
+
+
+def _ai_chat(settings: dict, system: str, user: str, *, max_tokens: int = 600) -> str:
+    """Один запрос к OpenAI-совместимому /chat/completions."""
     import urllib.error
     import urllib.request
 
     base = (settings.get("ai_url") or "").rstrip("/")
     key = settings.get("ai_key") or ""
     model = settings.get("ai_model") or ""
-    if not base or not model:
-        return fallback_text(row, idea, settings)
-
-    system = (
-        "Напиши вежливое сообщение потенциальному клиенту на «вы», 4-6 предложений, "
-        "без официоза. Структура: увидели его бизнес без сайта → подготовили рабочий "
-        "пример сайта на GitHub Pages → предложили перейти посмотреть по ссылке → "
-        "открытый вопрос в конце. Цены «в лоб» не называть. Пиши на русском."
-    )
-    style = (settings.get("style") or "").strip()
-    if style:
-        system += "\nПравила пользователя:\n" + style
-
-    user = (
-        f"Организация: {row.get('name', '')}\n"
-        f"Ниша: {row.get('rubric') or row.get('topic') or ''}\n"
-        f"Город: {row.get('city', '')}\n"
-        f"Адрес: {row.get('address', '')}\n"
-        f"Телефон: {row.get('phone', '')}\n"
-        f"Ссылка на пример сайта: {settings.get('github_base_url') or ''}\n"
-        f"Идея предложения: {idea}"
-    )
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": 0.7,
-        "max_tokens": 600,
+        "max_tokens": max_tokens,
     }
     req = urllib.request.Request(
         base + "/chat/completions",
@@ -492,6 +512,82 @@ def ai_generate(settings: dict, row: dict, idea: str) -> str:
         msg = data.get("error", {}).get("message") if isinstance(data.get("error"), dict) else "пустой ответ модели"
         raise RuntimeError(f"ИИ API: {msg}")
     return (choices[0].get("message", {}).get("content") or "").strip()
+
+
+def ai_generate(settings: dict, row: dict, idea: str) -> str:
+    """Один запрос к OpenAI-совместимому API (OpenRouter / Groq / Ollama и т.п.)."""
+    base = (settings.get("ai_url") or "").rstrip("/")
+    model = settings.get("ai_model") or ""
+    if not base or not model:
+        return fallback_text(row, idea, settings)
+
+    system = (
+        "Напиши вежливое сообщение потенциальному клиенту на «вы», 4-6 предложений, "
+        "без официоза. Структура: увидели его бизнес без сайта → подготовили рабочий "
+        "пример сайта на GitHub Pages → предложили перейти посмотреть по ссылке → "
+        "открытый вопрос в конце. Цены «в лоб» не называть. Пиши на русском."
+    )
+    style = (settings.get("style") or "").strip()
+    if style:
+        system += "\nПравила пользователя:\n" + style
+
+    user = (
+        f"Организация: {row.get('name', '')}\n"
+        f"Ниша: {row.get('rubric') or row.get('topic') or ''}\n"
+        f"Город: {row.get('city', '')}\n"
+        f"Адрес: {row.get('address', '')}\n"
+        f"Телефон: {row.get('phone', '')}\n"
+        f"Ссылка на пример сайта: {_github_demo_url(row, settings)}\n"
+        f"Идея предложения: {idea}"
+    )
+    return _ai_chat(settings, system, user, max_tokens=600)
+
+
+def ai_generate_site_prompt(settings: dict, row: dict, out_dir=None, save: bool = True) -> str:
+    """Генерирует персональный промпт для сайта через ИИ (фолбэк — шаблон).
+
+    Без настроенного API не ходит в сеть, а сразу отдаёт шаблонный промпт.
+    При save=True сохраняет результат в leads_prompts/<slug>.txt.
+    """
+    settings = settings or {}
+    if not _ai_configured(settings):
+        return generate_site_prompt(row, settings, out_dir=out_dir, save=save)
+
+    demo_url = _github_demo_url(row, settings) or "https://username.github.io/demo/"
+    system = (
+        "Составь подробный и чёткий промпт (ТЗ) для ИИ-разработчика, который создаст "
+        "одностраничный сайт-визитку (или лендинг) для конкретного бизнеса на GitHub Pages.\n"
+        "Обязательные требования, которые должны быть в промпте:\n"
+        "1. Чистый статический HTML/CSS/JS (index.html, style.css, script.js) — БЕЗ сервера и бэкенда.\n"
+        "2. Адаптивный современный дизайн под нишу бизнеса, весь текст на русском.\n"
+        "3. Подходящие секции (герой-блок, услуги и цены-заглушки, преимущества, отзывы, контакты).\n"
+        "4. В конце промпта обязательно добавь правило для ИИ-разработчика: "
+        "«Сначала проанализируй данные бизнеса, задай мне 2-4 конкретных уточняющих вопроса "
+        "по недостающим деталям и жди моих ответов перед написанием кода»."
+    )
+    custom = (settings.get("site_prompt_template") or "").strip()
+    if custom:
+        system += "\nДополнительный шаблон/пожелания пользователя:\n" + custom
+
+    user = (
+        f"Название: {row.get('name', '')}\n"
+        f"Ниша: {row.get('rubric') or row.get('topic') or ''}\n"
+        f"Город: {row.get('city', '')}\n"
+        f"Адрес: {row.get('address', '')}\n"
+        f"Телефон: {row.get('phone', '')}\n"
+        f"Мессенджеры: {_lead_messengers(row)}\n"
+        f"Рейтинг: {row.get('rating', '')} · Отзывов: {row.get('reviews', '')}\n"
+        f"Целевая ссылка GitHub Pages: {demo_url}"
+    )
+    text = _ai_chat(settings, system, user, max_tokens=900)
+    if not text:
+        text = generate_site_prompt(row, settings, out_dir=out_dir, save=False)
+    if save:
+        try:
+            save_site_prompt(text, row, out_dir)
+        except OSError:
+            pass
+    return text
 
 
 def _send_email(settings: dict, to: str, text: str) -> None:
@@ -839,6 +935,33 @@ def dispatch(channel: str, settings: dict, contact: str, kind: str, text: str) -
     raise RuntimeError(f"неизвестный канал: {channel}")
 
 
+def record_send(state: MailState, row: dict, channel: str, contact: str,
+                info: dict, text: str | None = None) -> None:
+    """Отметка успешной отправки в журнале MailState (очередь и ручная кнопка).
+
+    Один и тот же код для Mailer._try_send и одиночной отправки из карточки
+    лида: попытка в историю, статус «awaiting», sent_id/peer из ответа канала.
+    text=None текст не трогает — повторная отметка не стирает сохранённое сообщение.
+    """
+    st = state.get(row_id(row))
+    at = datetime.now().isoformat(timespec="seconds")
+    st.setdefault("attempts", []).append({
+        "channel": channel, "target": contact, "at": at, "ok": True,
+    })
+    st.update({
+        "channel": channel,
+        "target": contact,
+        "sent_id": info.get("msg_id"),
+        "peer": info.get("peer"),
+        "sent_at": at,
+        "status": "awaiting",
+    })
+    st.pop("seen_at", None)
+    if text is not None:
+        st["text"] = text
+    state.save()
+
+
 def generate_texts(leads: list[dict], settings: dict, state: MailState,
                    on_log, on_progress, stop_event) -> int:
     idea = settings.get("idea") or ""
@@ -874,7 +997,8 @@ class Mailer:
 
     # -- один шаг: максимум одно сообщение -------------------------------- #
     def step(self) -> bool:
-        followup = timedelta(days=_num(self.settings.get("followup_days"), 5))
+        followup_days = _num(self.settings.get("followup_days"), 0)
+        followup = timedelta(days=followup_days)
         now = datetime.now()
 
         for row in self.leads:
@@ -899,7 +1023,8 @@ class Mailer:
                 for ch in PRIORITY:
                     if ch not in avail:
                         continue
-                    text = st.get("text") or fallback_text(row, self.settings.get("idea") or "")
+                    text = st.get("text") or fallback_text(
+                        row, self.settings.get("idea") or "", self.settings)
                     if self._try_send(row, st, ch, avail[ch], text):
                         return True
                 st["status"] = "failed"
@@ -907,6 +1032,8 @@ class Mailer:
                 continue
 
             if status in ("awaiting", "seen", "read"):
+                if followup_days <= 0:
+                    continue
                 sent_at = _parse_dt(st.get("sent_at"))
                 if sent_at is None or now - sent_at < followup:
                     continue
@@ -939,21 +1066,7 @@ class Mailer:
             self.state.save()
             return False
 
-        attempts = st.setdefault("attempts", [])
-        attempts.append({
-            "channel": ch, "target": contact[0],
-            "at": datetime.now().isoformat(timespec="seconds"), "ok": True,
-        })
-        st.update({
-            "channel": ch,
-            "target": contact[0],
-            "sent_id": info.get("msg_id"),
-            "peer": info.get("peer"),
-            "sent_at": datetime.now().isoformat(timespec="seconds"),
-            "status": "awaiting",
-        })
-        st.pop("seen_at", None)
-        self.state.save()
+        record_send(self.state, row, ch, contact[0], info)
         if self.pool_file:
             try:
                 pool_mark_sent(self.pool_file, lead_id, ch)

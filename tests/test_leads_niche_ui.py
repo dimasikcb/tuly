@@ -24,7 +24,7 @@ ROOT_DIR = TESTS_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from helpers import load_app
+from helpers import load_app, new_tk
 
 app = load_app()
 
@@ -60,7 +60,7 @@ class FakeHub:
 class LeadsNichePanelTest(unittest.TestCase):
     def setUp(self) -> None:
         try:
-            self.root = tk.Tk()
+            self.root = new_tk(tk.Tk)
         except tk.TclError as exc:  # нет дисплея — GUI-тест не запустить
             raise unittest.SkipTest(f"Tk недоступен: {exc}") from exc
         self.root.withdraw()
