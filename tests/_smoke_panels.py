@@ -55,6 +55,10 @@ PANELS = (
 
 
 def main() -> int:
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
     app = load_app()
     # мокаем сетевые/процессные вызовы, которые панели делают в __init__
     app.bypass_status = lambda *a, **k: {}
@@ -63,7 +67,9 @@ def main() -> int:
     app.bypass_auto_heal_if_leak = lambda *a, **k: None
 
     failures = 0
-    root = new_tk()
+    import tkinter as tk
+
+    root = new_tk(tk.Tk)
     root.withdraw()
     hub = FakeHub()
     for name in PANELS:
