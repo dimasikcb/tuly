@@ -19,17 +19,21 @@ ROOT_DIR = TESTS_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+import apps_catalog
+import bypass_core
+from bypass_panel import BypassPanel  # importlib с ROOT в sys.path (см. helpers)
+
 from helpers import TempConfig, load_app, new_tk
 
-app = load_app()
+app = load_app()  # нужен только для реэкспорта uibase-токенов (app.OK) и TempConfig
 
 CATALOG = [
-    app.AppEntry(exe="Discord.exe", name="Discord", path=r"C:\Discord\Discord.exe",
-                 running=True),
-    app.AppEntry(exe="chrome.exe", name="Google Chrome",
-                 path=r"C:\Chrome\chrome.exe"),
-    app.AppEntry(exe="telegram.exe", name="Telegram",
-                 path=r"C:\Telegram\telegram.exe"),
+    apps_catalog.AppEntry(exe="Discord.exe", name="Discord",
+                          path=r"C:\Discord\Discord.exe", running=True),
+    apps_catalog.AppEntry(exe="chrome.exe", name="Google Chrome",
+                          path=r"C:\Chrome\chrome.exe"),
+    apps_catalog.AppEntry(exe="telegram.exe", name="Telegram",
+                          path=r"C:\Telegram\telegram.exe"),
 ]
 
 STATE = {
@@ -84,12 +88,16 @@ class BypassPanelTest(unittest.TestCase):
             self.saved.update(kwargs)
 
         self.patches = [
-            mock.patch.object(app, "bypass_status", lambda *a, **k: dict(STATE)),
-            mock.patch.object(app, "app_catalog", lambda *a, **k: list(CATALOG)),
-            mock.patch.object(app, "bypass_apply", fake_apply),
-            mock.patch.object(app, "bypass_stop",
+            # Панель читает движок и каталог через модулей-хозяев (bypass_core /
+            # apps_catalog), поэтому патчим именно их.
+            mock.patch.object(bypass_core, "bypass_status",
+                              lambda *a, **k: dict(STATE)),
+            mock.patch.object(apps_catalog, "app_catalog",
+                              lambda *a, **k: list(CATALOG)),
+            mock.patch.object(bypass_core, "bypass_apply", fake_apply),
+            mock.patch.object(bypass_core, "bypass_stop",
                               lambda key: self.stopped.append(key) or {"detail": key}),
-            mock.patch.object(app, "bypass_cfg_save", fake_save),
+            mock.patch.object(bypass_core, "bypass_cfg_save", fake_save),
         ]
         for patch in self.patches:
             patch.start()
@@ -99,7 +107,7 @@ class BypassPanelTest(unittest.TestCase):
         self.root.withdraw()
         self.addCleanup(self.root.destroy)
         self.hub = FakeHub()
-        self.panel = app.BypassPanel(self.root, self.hub)
+        self.panel = BypassPanel(self.root, self.hub)
 
     def _packed(self) -> list[str]:
         return [row.entry.exe for row in self.panel.rows.values()

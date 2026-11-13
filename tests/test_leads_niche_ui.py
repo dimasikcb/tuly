@@ -24,12 +24,17 @@ ROOT_DIR = TESTS_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from helpers import load_app, new_tk
+from helpers import load_app, load_module, new_tk
 
-app = load_app()
+app = load_app()  # для app._iter_widgets (общий обходчик виджетов из uibase)
 
-if not app.LEADS_OK:
-    raise unittest.SkipTest(f"leads2gis недоступен: {app.LEADS_ERROR}")
+leads_panel = load_module("leads_panel")
+import leads2gis  # хозяин NICHES: панель читает ниши по атрибуту движка
+
+from leads_panel import LeadsPanel
+
+if not leads_panel.LEADS_OK:
+    raise unittest.SkipTest(f"leads2gis недоступен: {leads_panel.LEADS_ERROR}")
 
 
 class FakeHub:
@@ -66,11 +71,11 @@ class LeadsNichePanelTest(unittest.TestCase):
         self.root.withdraw()
         self.addCleanup(self.root.destroy)
         # MAIL_OK=False: refresh() выходит рано и не трогает настоящий hot_pool.csv
-        patcher = mock.patch.object(app, "MAIL_OK", False)
+        patcher = mock.patch.object(leads_panel, "MAIL_OK", False)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.hub = FakeHub()
-        self.panel = app.LeadsPanel(self.root, self.hub)
+        self.panel = LeadsPanel(self.root, self.hub)
 
     def _checkbuttons(self) -> list[tk.Checkbutton]:
         return [w for w in app._iter_widgets(self.panel)
@@ -78,7 +83,7 @@ class LeadsNichePanelTest(unittest.TestCase):
 
     def test_twelve_niche_checkboxes_first_checked(self) -> None:
         """12 чекбоксов ниш, первый («Барбершоп») отмечен, остальные нет."""
-        niches = list(app.leads_engine.NICHES)
+        niches = list(leads2gis.NICHES)
         self.assertEqual(len(niches), 12)
         self.assertEqual(len(self.panel.niche_vars), 12)
         # niche_vars хранит (query, var) в том же порядке, что и NICHES

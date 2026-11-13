@@ -14,7 +14,8 @@ if str(ROOT) not in sys.path:
 APP_FILE = ROOT / "tools.pyw"
 
 LOGIC_MODULES = ("winbase", "apps_catalog", "bypass_core",
-                 "leads_contacts", "leads_pool", "leads_mail", "leads2gis")
+                 "leads_contacts", "leads_pool", "leads_mail", "leads2gis",
+                 "github_core", "dns_core", "cleanup_core", "clicker_core")
 
 
 def _tree(path: Path) -> ast.Module:
@@ -144,6 +145,10 @@ class ArchitectureInvariantsTest(unittest.TestCase):
         "leads_pool": {"leads_contacts"},
         "leads_mail": {"leads_contacts", "leads_pool"},
         "leads2gis": {"leads_contacts", "leads_pool"},
+        "github_core": {"winbase"},
+        "dns_core": {"winbase"},
+        "cleanup_core": set(),
+        "clicker_core": set(),
     }
 
     def test_leads_layers_no_upward_imports(self) -> None:

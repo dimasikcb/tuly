@@ -34,14 +34,18 @@ ROOT_DIR = TESTS_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from helpers import load_app, new_tk
+from helpers import load_module, new_tk
 
-app = load_app()
+leads_panel = load_module("leads_panel")
+import leads_pool  # хозяин путей: тесты патчат атрибуты модуля, а не снимок имён
+import uibase
 
-import leads_mail as real_mail  # реальный модуль (sys.modules совпадает с app.leads_mail)
+from leads_panel import LeadsPanel
 
-if not app.LEADS_OK:
-    raise unittest.SkipTest(f"leads2gis недоступен: {app.LEADS_ERROR}")
+import leads_mail as real_mail  # реальный модуль (sys.modules совпадает с leads_panel.leads_mail)
+
+if not leads_panel.LEADS_OK:
+    raise unittest.SkipTest(f"leads2gis недоступен: {leads_panel.LEADS_ERROR}")
 
 
 class FakeHub:
@@ -118,17 +122,17 @@ class LeadsStep4PanelTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         tmp_path = Path(self.tmp.name)
 
-        p_pool = mock.patch.object(app, "POOL_FILE", tmp_path / "hot_pool.csv")
+        p_pool = mock.patch.object(leads_pool, "POOL_FILE", tmp_path / "hot_pool.csv")
         p_pool.start()
         self.addCleanup(p_pool.stop)
 
         p_state = mock.patch.object(
-            app, "MAIL_STATE_PATH", tmp_path / "leads_mail_state.json")
+            leads_pool, "MAIL_STATE_PATH", tmp_path / "leads_mail_state.json")
         p_state.start()
         self.addCleanup(p_state.stop)
 
         p_settings = mock.patch.object(
-            app, "MAIL_SETTINGS_PATH", tmp_path / "leads_mail_settings.json")
+            leads_pool, "MAIL_SETTINGS_PATH", tmp_path / "leads_mail_settings.json")
         p_settings.start()
         self.addCleanup(p_settings.stop)
 
@@ -147,20 +151,20 @@ class LeadsStep4PanelTest(unittest.TestCase):
         self.addCleanup(p_prompt.stop)
 
         # MAIL_OK=False: refresh() при сборке панели выходит рано и не читает пул.
-        p_mail_ok = mock.patch.object(app, "MAIL_OK", False)
+        p_mail_ok = mock.patch.object(leads_panel, "MAIL_OK", False)
         p_mail_ok.start()
         self.addCleanup(p_mail_ok.stop)
 
         self.hub = FakeHub()
-        self.panel = app.LeadsPanel(self.root, self.hub)
+        self.panel = LeadsPanel(self.root, self.hub)
 
     # -- helpers ----------------------------------------------------------- #
     def _enable_mail(self) -> None:
         """После создания панели включаем MAIL_OK и реальный модуль рассылки."""
-        p_ok = mock.patch.object(app, "MAIL_OK", True)
+        p_ok = mock.patch.object(leads_panel, "MAIL_OK", True)
         p_ok.start()
         self.addCleanup(p_ok.stop)
-        p_mod = mock.patch.object(app, "leads_mail", real_mail)
+        p_mod = mock.patch.object(leads_panel, "leads_mail", real_mail)
         p_mod.start()
         self.addCleanup(p_mod.stop)
 
@@ -178,7 +182,7 @@ class LeadsStep4PanelTest(unittest.TestCase):
 
     def _journal(self) -> dict:
         """Свежий журнал отправок с диска (tmp MAIL_STATE_PATH)."""
-        path = Path(app.MAIL_STATE_PATH)
+        path = Path(leads_pool.MAIL_STATE_PATH)
         self.assertTrue(path.is_file(), f"журнал не создан: {path}")
         return json.loads(path.read_text(encoding="utf-8"))
 
@@ -218,14 +222,14 @@ class LeadsStep4PanelTest(unittest.TestCase):
         self._seed_row("r0", ROW)
         self._seed_row("r1", ROW_B)
         # Лид заранее в пуле — после отправки проверяем sent_at/channel в CSV.
-        real_mail.pool_add(app.POOL_FILE, [ROW])
+        real_mail.pool_add(leads_pool.POOL_FILE, [ROW])
         panel._show_lead("r0")
 
         panel.msg_text.delete("1.0", "end")
         panel.msg_text.insert("1.0", MSG)
 
         contact = real_mail.channels_of(ROW)["telegram"]  # («boroda», «username»)
-        with mock.patch.object(app.leads_mail, "dispatch",
+        with mock.patch.object(real_mail, "dispatch",
                                return_value={"msg_id": 7, "peer": 9}) as captured:
             panel._send_one()
 
@@ -252,7 +256,7 @@ class LeadsStep4PanelTest(unittest.TestCase):
 
         # Пул: строка помечена отправленной.
         key = real_mail.pool_key(ROW)
-        pool_row = next(r for r in real_mail.pool_load(app.POOL_FILE)
+        pool_row = next(r for r in real_mail.pool_load(leads_pool.POOL_FILE)
                         if real_mail.pool_key(r) == key)
         self.assertNotEqual(pool_row["sent_at"], "")
         self.assertEqual(pool_row["channel"], "telegram")
@@ -265,7 +269,7 @@ class LeadsStep4PanelTest(unittest.TestCase):
     # -- 3. dry_run без сети ------------------------------------------------- #
     def test_send_one_dry_run_no_network(self) -> None:
         """dry_run=true: настоящий dispatch выходит рано, отметка и лог на месте."""
-        real_mail.save_settings(app.MAIL_SETTINGS_PATH,
+        real_mail.save_settings(leads_pool.MAIL_SETTINGS_PATH,
                                 {**real_mail.DEFAULT_SETTINGS, "dry_run": True})
         self._enable_mail()
         panel = self.panel
@@ -296,7 +300,7 @@ class LeadsStep4PanelTest(unittest.TestCase):
         self.assertEqual(panel.result_tree.get_children(), (),
                          "панель должна собраться пустой (MAIL_OK=False)")
 
-        with mock.patch.object(app.leads_mail, "dispatch") as captured:
+        with mock.patch.object(real_mail, "dispatch") as captured:
             panel._send_one()
 
         self.assertTrue(self.hub.toasts, "без выбранного лида должен появиться toast")
@@ -326,34 +330,34 @@ class LeadsStep4PanelTest(unittest.TestCase):
         """Удаление лида: «Да» чистит таблицу и пул, «Нет» оставляет строку."""
         self._enable_mail()
         panel = self.panel
-        real_mail.pool_add(app.POOL_FILE, [ROW])
+        real_mail.pool_add(leads_pool.POOL_FILE, [ROW])
         self._seed_row("r0", ROW)
         panel.result_tree.selection_set("r0")
 
-        with mock.patch.object(app.messagebox, "askyesno", return_value=True) as ask:
+        with mock.patch.object(uibase.messagebox, "askyesno", return_value=True) as ask:
             panel._remove_lead()
         self.assertTrue(ask.called, "удаление должно спрашивать подтверждение")
         self.assertNotIn("r0", panel.result_tree.get_children(),
                          "после подтверждения строка уходит из таблицы")
-        self.assertEqual(real_mail.pool_load(app.POOL_FILE), [],
+        self.assertEqual(real_mail.pool_load(leads_pool.POOL_FILE), [],
                          "после подтверждения пул пуст")
 
         # Вариант «Нет»: строка остаётся и в таблице, и в пуле.
-        real_mail.pool_add(app.POOL_FILE, [ROW])
+        real_mail.pool_add(leads_pool.POOL_FILE, [ROW])
         panel.refresh()  # перечитывает tmp-пул и снова выделяет r0
         self.assertIn("r0", panel.result_tree.get_children())
-        with mock.patch.object(app.messagebox, "askyesno", return_value=False):
+        with mock.patch.object(uibase.messagebox, "askyesno", return_value=False):
             panel._remove_lead()
         self.assertIn("r0", panel.result_tree.get_children(),
                       "без подтверждения строка должна остаться")
-        self.assertEqual(len(real_mail.pool_load(app.POOL_FILE)), 1)
+        self.assertEqual(len(real_mail.pool_load(leads_pool.POOL_FILE)), 1)
 
     # -- 6b. скрытие написанных лидов из выдачи -------------------------------- #
     def test_sent_lead_disappears_from_table(self) -> None:
         """После «Отправить» лид исчезает из выдачи, но остаётся в пуле."""
         self._enable_mail()
         panel = self.panel
-        real_mail.pool_add(app.POOL_FILE, [ROW, ROW_B])
+        real_mail.pool_add(leads_pool.POOL_FILE, [ROW, ROW_B])
         panel.refresh()
         tree = panel.result_tree
 
@@ -370,7 +374,7 @@ class LeadsStep4PanelTest(unittest.TestCase):
         panel.msg_text.delete("1.0", "end")
         panel.msg_text.insert("1.0", MSG)
 
-        with mock.patch.object(app.leads_mail, "dispatch",
+        with mock.patch.object(real_mail, "dispatch",
                                return_value={"msg_id": 7, "peer": 9}):
             panel._send_one()
 
@@ -393,7 +397,7 @@ class LeadsStep4PanelTest(unittest.TestCase):
         self.assertEqual(panel._current_row.get("name"), ROW_B["name"])
 
         # Скрытие ≠ удаление: в пуле обе строки, у написанного sent_at проставлен.
-        rows = real_mail.pool_load(app.POOL_FILE)
+        rows = real_mail.pool_load(leads_pool.POOL_FILE)
         self.assertEqual(len(rows), 2, "скрытие не должно удалять лид из пула")
         sent = next(r for r in rows if r["name"] == ROW["name"])
         self.assertTrue(sent["sent_at"])
@@ -408,14 +412,14 @@ class LeadsStep4PanelTest(unittest.TestCase):
         """«Остановить лид» — это не «написал»: строка остаётся в выдаче."""
         self._enable_mail()
         panel = self.panel
-        real_mail.pool_add(app.POOL_FILE, [ROW])
+        real_mail.pool_add(leads_pool.POOL_FILE, [ROW])
         panel.refresh()
         tree = panel.result_tree
         self.assertTrue(any(tree.set(i, "name") == ROW["name"]
                             for i in tree.get_children()))
 
         real_mail.pool_mark_status(
-            app.POOL_FILE, real_mail.pool_key(ROW), "stopped")
+            leads_pool.POOL_FILE, real_mail.pool_key(ROW), "stopped")
         panel.refresh()
         self.assertTrue(any(tree.set(i, "name") == ROW["name"]
                             for i in tree.get_children()),

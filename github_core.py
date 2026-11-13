@@ -58,6 +58,8 @@ output/
 *.so
 *.dylib
 ffmpeg*/
+*.session
+*.session-journal
 """
 
 

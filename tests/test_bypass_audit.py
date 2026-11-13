@@ -25,8 +25,10 @@ for path in (TESTS_DIR, ROOT_DIR):
 from helpers import load_module
 
 app = load_module("bypass_core")
+# Панель Bypass переехала из tools.pyw в bypass_panel.py: AST-проверки GUI
+# читают её собственный модуль; tools.pyw остаётся в списке для других аудитов.
 ROOT_FILES = {name: (ROOT_DIR / name).read_text(encoding="utf-8")
-              for name in ("bypass_core.py", "tools.pyw")}
+              for name in ("bypass_core.py", "bypass_panel.py", "tools.pyw")}
 
 
 class Socks5Server:
@@ -214,19 +216,39 @@ class AutoHealSafetyTest(unittest.TestCase):
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
         self.assertNotIn("CloseHandle", attrs)
 
+    @staticmethod
+    def core_alias(tree) -> str:
+        """Alias, под которым bypass_panel импортирует bypass_core."""
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "bypass_core":
+                        return alias.asname or alias.name
+        return "bypass_core"
+
     def test_gui_runs_heal_in_background_only(self) -> None:
-        tree = ast.parse(ROOT_FILES["tools.pyw"])
+        tree = ast.parse(ROOT_FILES["bypass_panel.py"])
         cls = next(n for n in tree.body
                    if isinstance(n, ast.ClassDef) and n.name == "BypassPanel")
         methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
         self.assertIn("_poll_state", methods)
+        alias = self.core_alias(tree)
 
         def calls(node):
-            return {n.func.id for n in ast.walk(node)
+            # Панель зовёт движок только через хозяина (bypass_core.X — это
+            # ast.Attribute); bare-имена остаются у методов хаба.
+            bare = {n.func.id for n in ast.walk(node)
                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            core = {f"bypass_core.{n.func.attr}" for n in ast.walk(node)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == alias}
+            return bare | core
 
         self.assertNotIn("bypass_auto_heal_if_leak", calls(methods["_tick"]))
-        self.assertIn("bypass_auto_heal_if_leak", calls(methods["_poll_state"]))
+        self.assertNotIn("bypass_auto_heal_if_leak", calls(methods["_poll_state"]))
+        self.assertIn("bypass_core.bypass_auto_heal_if_leak",
+                      calls(methods["_poll_state"]))
         # Тик сам не трогает сеть: он ставит задачу через _start_poll,
         # а run_bg живёт уже в _start_poll.
         self.assertIn("_start_poll", [
@@ -380,7 +402,7 @@ class GuiAuditRegressionTest(unittest.TestCase):
 
     @staticmethod
     def methods() -> dict:
-        tree = ast.parse(ROOT_FILES["tools.pyw"])
+        tree = ast.parse(ROOT_FILES["bypass_panel.py"])
         cls = next(n for n in tree.body
                    if isinstance(n, ast.ClassDef) and n.name == "BypassPanel")
         return {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
@@ -429,7 +451,7 @@ class GuiAuditRegressionTest(unittest.TestCase):
 
     def test_heal_failure_is_logged(self) -> None:
         fn = self.methods()["_state_ok"]
-        source = ast.get_source_segment(ROOT_FILES["tools.pyw"], fn) or ""
+        source = ast.get_source_segment(ROOT_FILES["bypass_panel.py"], fn) or ""
         self.assertIn("failed", source)
         self.assertIn("error", source)
 

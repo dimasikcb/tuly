@@ -67,8 +67,9 @@ class Agent:
     mode: str = "idle"       # idle | process | marker
     exe: str = ""            # имя exe для idle/process
     marker: str = ""         # путь к файлу-маркеру (для mode=marker)
-    idle_min: float = 15.0   # сколько минут ждать «простоя» в режиме idle
-    hold_min: float = 2.0    # сколько держать DONE до голосования
+    idle_min: float = 5.0    # сколько минут ждать «простоя» в режиме idle
+    hold_min: float = 1.0    # сколько держать DONE до голосования
+    busy_threshold: float | None = None  # порог CPU % для режима idle (None = дефолт стража)
 
     def __init__(
         self,
@@ -78,23 +79,24 @@ class Agent:
         marker: str = None,
         idle_min: float = None,
         hold_min: float = None,
+        busy_threshold: float = None,
     ) -> None:
         self.name = name if name is not None else getattr(self.__class__, "name", "")
         self.mode = mode if mode is not None else getattr(self.__class__, "mode", "idle")
         self.exe = exe if exe is not None else getattr(self.__class__, "exe", "")
         self.marker = marker if marker is not None else getattr(self.__class__, "marker", "")
-        self.idle_min = float(idle_min) if idle_min is not None else getattr(self.__class__, "idle_min", 15.0)
-        self.hold_min = float(hold_min) if hold_min is not None else getattr(self.__class__, "hold_min", 2.0)
+        self.idle_min = float(idle_min) if idle_min is not None else getattr(self.__class__, "idle_min", 5.0)
+        self.hold_min = float(hold_min) if hold_min is not None else getattr(self.__class__, "hold_min", 1.0)
+        self.busy_threshold = float(busy_threshold) if busy_threshold is not None else getattr(self.__class__, "busy_threshold", None)
 
 
 # AI-агенты пользователя: IDE-агенты живут в своих процессах (режим idle —
 # ждём простоя), консольные могут завершиться сами (режим process).
 DEFAULT_AGENTS: list[dict] = [
-    {"name": "WorkBuddy AI", "mode": "process", "exe": "workbuddyai.exe"},
-    {"name": "Antigravity",  "mode": "idle",    "exe": "antigravity.exe", "idle_min": 10.0},
-    {"name": "ZCode",        "mode": "idle",    "exe": "zcode.exe",       "idle_min": 10.0},
+    {"name": "WorkBuddy AI", "mode": "idle",    "exe": "workbuddyai.exe", "idle_min": 3.0},
+    {"name": "Antigravity",  "mode": "idle",    "exe": "antigravity.exe", "idle_min": 3.0},
+    {"name": "ZCode",        "mode": "idle",    "exe": "zcode.exe",       "idle_min": 3.0},
     {"name": "OpenCode",     "mode": "process", "exe": "opencode.exe"},
-    {"name": "Cursor",       "mode": "idle",    "exe": "cursor.exe",      "idle_min": 10.0},
 ]
 
 
@@ -141,6 +143,17 @@ def _snapshot_processes() -> list[dict]:
     return out
 
 
+class _FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", ctypes.wintypes.DWORD),
+        ("dwHighDateTime", ctypes.wintypes.DWORD),
+    ]
+
+    @property
+    def value(self) -> int:
+        return (self.dwHighDateTime << 32) | self.dwLowDateTime
+
+
 def _process_cpu_ms(pid: int) -> int:
     """Время CPU процесса за всю жизнь, мс (0 — недоступен)."""
     h = ctypes.windll.kernel32.OpenProcess(
@@ -148,14 +161,22 @@ def _process_cpu_ms(pid: int) -> int:
     if not h:
         return 0
     try:
-        create = ctypes.c_uint(0)
-        exit = ctypes.c_uint(0)
-        kernel = ctypes.c_uint(0)
-        user = ctypes.c_uint(0)
+        create = _FILETIME()
+        exit_time = _FILETIME()
+        kernel = _FILETIME()
+        user = _FILETIME()
         ok = ctypes.windll.kernel32.GetProcessTimes(
-            h, ctypes.byref(create), ctypes.byref(exit),
-            ctypes.byref(kernel), ctypes.byref(user))
-        return int(kernel.value + user.value) if ok else 0
+            h,
+            ctypes.byref(create),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
+            return 0
+        # 100-нс интервалы -> миллисекунды: делим на 10 000
+        total_100ns = kernel.value + user.value
+        return int(total_100ns // 10000)
     finally:
         ctypes.windll.kernel32.CloseHandle(h)
 
@@ -277,11 +298,17 @@ class Watcher:
         interval: float = 5.0,
         notifier: TelegramNotifier | None = None,
         chat_tracker: WorkBuddyChatTracker | None = None,
-        grace_min: float = 5.0,
+        grace_min: float = 1.5,
+        hold_min: float = 1.0,
+        shutdown_delay: int = 60,
+        busy_threshold: float = 3.0,
     ) -> None:
         self.agents: list[Agent] = list(agents) if agents else []
         self.interval = max(2.0, interval)
         self.grace_min = float(grace_min)
+        self.hold_min = float(hold_min)
+        self.shutdown_delay = int(shutdown_delay)
+        self.busy_threshold = float(busy_threshold)
         self._started = time.monotonic()
         self.notifier = notifier
         self.chat_tracker = chat_tracker
@@ -290,9 +317,13 @@ class Watcher:
         self._seen: dict[str, bool] = {}
         self._idle_since: dict[str, float] = {}
         self._done_since: dict[str, float] = {}
+        self._busy_consecutive: dict[str, int] = {}
         self._notified_agents: set[str] = set()
+        self._last_logged_status: dict[str, tuple] = {}
         self._procs: list[dict] = []
         self._last_cpu: dict[int, int] = {}
+        self._last_snap_time: float = 0.0
+        self._dt: float = self.interval
         self.lines: list[str] = []
         self.armed = False
         self.armed_until = 0.0
@@ -304,13 +335,13 @@ class Watcher:
             self.lines.append(f"{datetime.now():%H:%M:%S} | {text}")
 
     # -- разовые проверки -------------------------------------------------- #
-    def _done(self, agent: Agent, note: str) -> AgentResult:
+    def _done(self, agent: Agent, note: str, immediate: bool = False) -> AgentResult:
         now = time.monotonic()
         if agent.name not in self._done_since:
             self._done_since[agent.name] = now
         held_sec = now - self._done_since[agent.name]
         hold_target_sec = max(0.0, agent.hold_min * 60.0)
-        hold_ok = held_sec >= hold_target_sec
+        hold_ok = immediate or (held_sec >= hold_target_sec)
         return AgentResult(agent.name, Status.DONE, note, hold_ok)
 
     def check_agent(self, agent: Agent) -> AgentResult:
@@ -322,29 +353,36 @@ class Watcher:
             self._seen[agent.name] = True
             self._idle_since.pop(agent.name, None)
             self._done_since.pop(agent.name, None)
+            self._busy_consecutive[agent.name] = 0
             return AgentResult(agent.name, Status.WORKING, "ждём маркер", False)
         if exe not in {p["exe"] for p in self._procs}:
             self._idle_since.pop(agent.name, None)
+            self._busy_consecutive[agent.name] = 0
             if not self._seen.get(agent.name):
                 # grace-период: даём агенту время стартовать; после — не блокируем
                 if time.monotonic() - self._started < self.grace_min * 60.0:
                     return AgentResult(agent.name, Status.NOT_SEEN,
                                        f"{exe} не видно", False)
-                return self._done(agent, "не запускался — пропущен")
+                return self._done(agent, "не запускался — пропущен", immediate=True)
             return self._done(agent, "процесс завершился")
         if agent.mode == "process":
             self._seen[agent.name] = True
             self._idle_since.pop(agent.name, None)
             self._done_since.pop(agent.name, None)
+            self._busy_consecutive[agent.name] = 0
             return AgentResult(agent.name, Status.WORKING, exe, False)
         # idle: считаем активность по приращению CPU за интервал
         self._seen[agent.name] = True
         busy = self._any_busy_percent(exe)
-        if busy >= 0.3:
+        busy_thresh = getattr(agent, "busy_threshold", None)
+        if busy_thresh is None:
+            busy_thresh = self.busy_threshold
+        if busy >= busy_thresh:
             self._idle_since.pop(agent.name, None)
             self._done_since.pop(agent.name, None)
             return AgentResult(agent.name, Status.WORKING,
                                f"{exe} занят ({busy:.0f}%)", False)
+
         now = time.monotonic()
         if agent.name not in self._idle_since:
             self._idle_since[agent.name] = now
@@ -357,15 +395,18 @@ class Watcher:
 
     def _any_busy_percent(self, exe: str) -> float:
         max_pct = 0.0
+        dt = max(0.5, self._dt)
         for proc in self._procs:
             if proc["exe"] != exe:
                 continue
             prev_cpu = self._last_cpu.get(proc["pid"])
             if prev_cpu is None:
-                delta = proc["cpu_ms"]
-            else:
-                delta = proc["cpu_ms"] - prev_cpu
-            pct = (delta / (self.interval * 1000.0)) * 100.0
+                # Первый снимок PID — базовый замер, дельта 0
+                continue
+            delta = proc["cpu_ms"] - prev_cpu
+            if delta <= 0:
+                continue
+            pct = (delta / (dt * 1000.0)) * 100.0
             max_pct = max(max_pct, pct)
         return max_pct
 
@@ -373,11 +414,10 @@ class Watcher:
         """True, если все агенты в DONE, держат hold_min и нет активных чатов."""
         if not self.agents:
             return False, []
-        if self.chat_tracker and self.chat_tracker.has_active_chats():
-            results = [self.check_agent(a) for a in self.agents]
-            return False, results
         results = [self.check_agent(a) for a in self.agents]
-        if not results or any(r.status != Status.DONE or not r.hold_ok for r in results):
+        if self.chat_tracker and self.chat_tracker.has_active_chats():
+            return False, results
+        if any(r.status != Status.DONE or not r.hold_ok for r in results):
             return False, results
         return True, results
 
@@ -389,10 +429,13 @@ class Watcher:
         self._seen.clear()
         self._idle_since.clear()
         self._done_since.clear()
+        self._busy_consecutive.clear()
         self._notified_agents.clear()
+        self._last_logged_status.clear()
         self.armed = False
         self.armed_until = 0.0
         self._started = time.monotonic()
+        self._last_snap_time = 0.0
         self._stop.clear()
         self._snap()
         self._log(f"страж запущен, наблюдаем {len(self.agents)} агента(ов)")
@@ -428,22 +471,35 @@ class Watcher:
                 # 2. Проверяем состояние процессов агентов
                 ok, results = self.can_stop_pc()
                 for r in results:
+                    last_logged = self._last_logged_status.get(r.name)
+                    current_key = (r.status.value, r.note, r.hold_ok)
+
                     if r.status == Status.NOT_SEEN:
-                        self._log(f"{r.name}: {r.note}")
+                        if last_logged != current_key:
+                            self._last_logged_status[r.name] = current_key
+                            self._log(f"{r.name}: {r.note}")
                     elif r.status == Status.DONE and not r.hold_ok:
-                        self._log(f"{r.name}: завершено, ждём стабилизации")
+                        if last_logged != current_key:
+                            self._last_logged_status[r.name] = current_key
+                            self._log(f"{r.name}: завершено, ждём стабилизации")
                     elif r.status == Status.DONE and r.hold_ok:
                         if r.name not in self._notified_agents:
                             self._notified_agents.add(r.name)
+                            self._last_logged_status[r.name] = current_key
                             msg = f"🔔 Агент «{r.name}» завершил работу! ({r.note})"
                             self._log(msg)
                             if self.notifier:
                                 self.notifier.send(msg)
 
-                # 3. Если все агенты и чаты готовы — выключаем ПК
+                # 3. Если страж взведён, но снова появилась активность — отменяем выключение
+                if self.armed and not ok:
+                    self.cancel_shutdown()
+                    self._log("⚠ Обнаружена активность агентов! Выключение отменено.")
+
+                # 4. Если все агенты и чаты готовы — выключаем ПК
                 if ok and not self.armed:
-                    self.order_shutdown(seconds=60)
-                    msg = "🔌 Все агенты и чаты завершили работу! Компьютер выключится через 60 с."
+                    self.order_shutdown(seconds=self.shutdown_delay)
+                    msg = f"🔌 Все агенты и чаты завершили работу! Компьютер выключится через {self.shutdown_delay} с."
                     self._log(msg)
                     if self.notifier:
                         self.notifier.send(msg)
@@ -457,6 +513,12 @@ class Watcher:
             self._log("страж остановлен")
 
     def _snap(self) -> None:
+        now = time.monotonic()
+        if self._last_snap_time > 0:
+            self._dt = max(0.5, now - self._last_snap_time)
+        else:
+            self._dt = self.interval
+        self._last_snap_time = now
         self._last_cpu = {p["pid"]: p["cpu_ms"] for p in self._procs}
         self._procs = _snapshot_processes()
 
@@ -465,6 +527,7 @@ class Watcher:
         """Запланирует выключение. False — если команда отклонена."""
         sec = _secs_clamp(seconds)
         try:
+            subprocess.run(["shutdown", "/a"], capture_output=True, text=True, timeout=5)
             proc = subprocess.run(
                 ["shutdown", "/s", "/t", str(sec)],
                 capture_output=True, text=True, timeout=10)
@@ -546,6 +609,9 @@ def main() -> None:
     parser.add_argument("--no-chats", action="store_true", help="Отключить мониторинг чатов WorkBuddy")
     parser.add_argument("--test-tg", action="store_true", help="Отправить тестовое сообщение в Telegram и выйти")
 
+    parser.add_argument("--busy-threshold", type=float, default=watcher_cfg.get("busy_threshold", 3.0), help="Порог CPU %% активности (по умолчанию 3.0)")
+    parser.add_argument("--grace-min", type=float, default=watcher_cfg.get("grace_min", 1.5), help="Минут ожидания запуска агента (по умолчанию 1.5)")
+
     args = parser.parse_args()
 
     tg_enabled = not args.no_tg and tg_cfg.get("enabled", True)
@@ -579,6 +645,10 @@ def main() -> None:
         interval=args.interval,
         notifier=notifier,
         chat_tracker=chat_tracker,
+        grace_min=args.grace_min,
+        hold_min=args.hold,
+        shutdown_delay=args.shutdown_delay,
+        busy_threshold=args.busy_threshold,
     )
 
     print(f"=== Страж выключения ПК запущен ===")

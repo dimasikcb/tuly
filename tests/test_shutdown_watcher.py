@@ -242,6 +242,43 @@ class WorkBuddyChatTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.poll(), [])
         self.assertFalse(tracker.has_active_chats())
 
+    def test_new_pid_does_not_spike_cpu(self):
+        """Новый подпроцесс (prev_cpu is None) не должен давать ложный всплеск CPU."""
+        w = W.Watcher([], interval=5.0)
+        w._dt = 5.0
+        w._last_cpu = {}  # PID 10 ещё не было в базе
+        w._procs = [_proc("zcode.exe", 10, 500_000)]
+        pct = w._any_busy_percent("zcode.exe")
+        self.assertEqual(pct, 0.0)
+
+    def test_low_idle_cpu_not_considered_busy(self):
+        """Фоновый шум Electron (1% CPU) не считается 'занят' при пороге 3%."""
+        w = W.Watcher([], interval=5.0, busy_threshold=3.0)
+        w._dt = 5.0
+        w._last_cpu = {10: 1000}
+        # 50 мс за 5 секунд = 1.0% CPU
+        w._procs = [_proc("zcode.exe", 10, 1050)]
+        agent = W.Agent("ZCode", mode="idle", exe="zcode.exe", idle_min=5)
+        r = w.check_agent(agent)
+        self.assertNotIn("занят", r.note)
+
+    def test_unstarted_agent_skipped_hold_immediately(self):
+        """Не запускавшийся агент пропускается и сразу получает hold_ok=True."""
+        w = W.Watcher([], interval=5.0)
+        agent = W.Agent("Тест", mode="idle", exe="test_unstarted.exe")
+        w._procs = []
+        w._started = time.monotonic() - 300  # grace прошёл
+        r = w.check_agent(agent)
+        self.assertEqual(r.status, W.Status.DONE)
+        self.assertTrue(r.hold_ok)
+        self.assertIn("не запускался — пропущен", r.note)
+
+    def test_no_cursor_in_default_agents(self):
+        """Cursor не должен присутствовать в дефолтных агентах."""
+        default_names = [a["name"] for a in W.DEFAULT_AGENTS]
+        self.assertNotIn("Cursor", default_names)
+        self.assertNotIn("cursor.exe", [a.get("exe", "") for a in W.DEFAULT_AGENTS])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

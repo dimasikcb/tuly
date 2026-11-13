@@ -30,14 +30,17 @@ ROOT_DIR = TESTS_DIR.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from helpers import load_app, new_tk
+from helpers import load_module, new_tk
 
-app = load_app()
+leads_panel = load_module("leads_panel")
+import leads_pool  # хозяин путей: тесты патчат атрибуты модуля, а не снимок имён
 
-import leads_mail as real_mail  # реальный модуль (sys.modules совпадает с app.leads_mail)
+from leads_panel import LeadsPanel, MailWindow
 
-if not app.LEADS_OK:
-    raise unittest.SkipTest(f"leads2gis недоступен: {app.LEADS_ERROR}")
+import leads_mail as real_mail  # реальный модуль (sys.modules совпадает с leads_panel.leads_mail)
+
+if not leads_panel.LEADS_OK:
+    raise unittest.SkipTest(f"leads2gis недоступен: {leads_panel.LEADS_ERROR}")
 
 
 class FakeHub:
@@ -98,12 +101,12 @@ class LeadsStep3PanelTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         tmp_path = Path(self.tmp.name)
 
-        p_pool = mock.patch.object(app, "POOL_FILE", tmp_path / "hot_pool.csv")
+        p_pool = mock.patch.object(leads_pool, "POOL_FILE", tmp_path / "hot_pool.csv")
         p_pool.start()
         self.addCleanup(p_pool.stop)
 
         p_settings = mock.patch.object(
-            app, "MAIL_SETTINGS_PATH", tmp_path / "leads_mail_settings.json")
+            leads_pool, "MAIL_SETTINGS_PATH", tmp_path / "leads_mail_settings.json")
         p_settings.start()
         self.addCleanup(p_settings.stop)
 
@@ -122,20 +125,20 @@ class LeadsStep3PanelTest(unittest.TestCase):
         self.addCleanup(p_prompt.stop)
 
         # MAIL_OK=False: refresh() при сборке панели выходит рано и не читает пул.
-        p_mail_ok = mock.patch.object(app, "MAIL_OK", False)
+        p_mail_ok = mock.patch.object(leads_panel, "MAIL_OK", False)
         p_mail_ok.start()
         self.addCleanup(p_mail_ok.stop)
 
         self.hub = FakeHub()
-        self.panel = app.LeadsPanel(self.root, self.hub)
+        self.panel = LeadsPanel(self.root, self.hub)
 
     # -- helpers ----------------------------------------------------------- #
     def _enable_mail(self) -> None:
         """После создания панели включаем MAIL_OK и реальный модуль рассылки."""
-        p_ok = mock.patch.object(app, "MAIL_OK", True)
+        p_ok = mock.patch.object(leads_panel, "MAIL_OK", True)
         p_ok.start()
         self.addCleanup(p_ok.stop)
-        p_mod = mock.patch.object(app, "leads_mail", real_mail)
+        p_mod = mock.patch.object(leads_panel, "leads_mail", real_mail)
         p_mod.start()
         self.addCleanup(p_mod.stop)
 
@@ -341,7 +344,7 @@ class LeadsStep3PanelTest(unittest.TestCase):
         panel.result_tree.selection_set("r0")
         panel._show_lead("r0")
         fixed = "ФИКСИРОВАННЫЙ ТЕКСТ ОТ ИИ: Здравствуйте!"
-        p_ai = mock.patch.object(app.leads_mail, "ai_generate", return_value=fixed)
+        p_ai = mock.patch.object(real_mail, "ai_generate", return_value=fixed)
         ai_mock = p_ai.start()
         self.addCleanup(p_ai.stop)
         # Ключ задан — облачный провайдер должен реально вызываться.
@@ -379,7 +382,7 @@ class LeadsStep3PanelTest(unittest.TestCase):
         panel.result_tree.selection_set("r0")
         panel._show_lead("r0")
 
-        with mock.patch.object(app.leads_mail, "ai_generate_site_prompt",
+        with mock.patch.object(real_mail, "ai_generate_site_prompt",
                                return_value="НОВЫЙ ИИ ПРОМПТ: задай 2-4 вопроса") as gen:
             panel._generate_site_prompt()
         self.assertTrue(gen.called)
@@ -396,14 +399,14 @@ class LeadsStep3PanelTest(unittest.TestCase):
                     return getattr(self._hub, name)
                 return getattr(self._root, name)
 
-        with mock.patch.object(app, "LEADS_DIR", Path(self.tmp.name)), \
-             mock.patch.object(app, "MAIL_SETTINGS_PATH",
+        with mock.patch.object(leads_pool, "LEADS_DIR", Path(self.tmp.name)), \
+             mock.patch.object(leads_pool, "MAIL_SETTINGS_PATH",
                                Path(self.tmp.name) / "leads_mail_settings.json"), \
-             mock.patch.object(app, "MAIL_STATE_PATH",
+             mock.patch.object(leads_pool, "MAIL_STATE_PATH",
                                Path(self.tmp.name) / "leads_mail_state.json"), \
-             mock.patch.object(app, "POOL_FILE",
+             mock.patch.object(leads_pool, "POOL_FILE",
                                Path(self.tmp.name) / "hot_pool.csv"):
-            win = app.MailWindow(_MailHub(self.root, self.hub))
+            win = MailWindow(_MailHub(self.root, self.hub))
             win.withdraw()
             self.addCleanup(win.destroy)
             self.assertIn("site_prompt_template", win.texts)

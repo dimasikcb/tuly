@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """Offline tests for the 'Дневник МО' (diary) tab integration in the hub.
 
-These tests never import tools.pyw (a .pyw GUI module) and never touch the
-network or a browser. Everything is checked by parsing the source with `ast`,
-by plain text / regex searches, by filesystem checks, and by loading the
-diary-grades math core in an isolated namespace.
+These tests never import tools.pyw / diary_panel.py (GUI modules) and never
+touch the network or a browser. Everything is checked by parsing the sources
+with `ast`, by plain text / regex searches, by filesystem checks, and by
+loading the diary-grades math core in an isolated namespace.
+
+Two sources are parsed:
+  * tools.pyw     — NAV / HEADERS / self.factories / Ctrl-hint (they stay there);
+  * diary_panel.py — class DiaryGradesPanel, diary_grades_core() and the
+    _DIARY_* bridge literals (moved out of tools.pyw by the refactor).
 """
 import ast
 import importlib.util
@@ -18,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 APP_FILE = ROOT / "tools.pyw"
+PANEL_FILE = ROOT / "diary_panel.py"
 DIARY = ROOT / "diary-grades"
 ELLIPSIS = "\u2026"          # U+2026 HORIZONTAL ELLIPSIS
 _MISSING = object()
@@ -31,9 +37,20 @@ COLUMN_HEADERS = (
 
 
 def _load_source():
-    """Read tools.pyw afresh (the main agent may still be editing it)."""
+    """Read tools.pyw afresh (NAV / HEADERS / factories / Ctrl-hint live there)."""
     source = APP_FILE.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(APP_FILE))
+    return source, tree
+
+
+def _load_panel_source():
+    """Read diary_panel.py afresh — the DiaryGradesPanel refactor target.
+
+    The panel class, diary_grades_core() and the _DIARY_* bridge literals
+    moved there; NAV / HEADERS / self.factories checks stay on tools.pyw.
+    """
+    source = PANEL_FILE.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(PANEL_FILE))
     return source, tree
 
 
@@ -107,7 +124,11 @@ def _load_module(name, path):
 
 
 class ToolsPywDiaryTabTest(unittest.TestCase):
-    """Checks 1-6 and 9 against tools.pyw (AST + text, no import)."""
+    """Checks 1-6 and 9 (AST + text, no import).
+
+    NAV / HEADERS / self.factories / Ctrl-hint checks still read tools.pyw;
+    DiaryGradesPanel checks read diary_panel.py (the class moved there).
+    """
 
     def test_nav_has_diary_between_other_programs(self):
         _, tree = _load_source()
@@ -155,9 +176,9 @@ class ToolsPywDiaryTabTest(unittest.TestCase):
                       "DiaryGradesPanel must appear in class Hub source")
 
     def test_diary_panel_class_inherits_panel_and_has_methods(self):
-        _, tree = _load_source()
+        _, tree = _load_panel_source()
         cls = _find_class(tree, "DiaryGradesPanel")
-        self.assertIsNotNone(cls, "class DiaryGradesPanel not found in tools.pyw")
+        self.assertIsNotNone(cls, "class DiaryGradesPanel not found in diary_panel.py")
         base_names = set()
         for base in cls.bases:
             if isinstance(base, ast.Name):
@@ -173,9 +194,9 @@ class ToolsPywDiaryTabTest(unittest.TestCase):
                          "DiaryGradesPanel is missing methods: %s" % sorted(missing))
 
     def test_diary_panel_has_five_column_headers(self):
-        source, tree = _load_source()
+        source, tree = _load_panel_source()
         cls = _find_class(tree, "DiaryGradesPanel")
-        self.assertIsNotNone(cls, "class DiaryGradesPanel not found in tools.pyw")
+        self.assertIsNotNone(cls, "class DiaryGradesPanel not found in diary_panel.py")
         body = _node_source(source, cls)
         for header in COLUMN_HEADERS:
             with self.subTest(header=header):
@@ -259,7 +280,7 @@ class DiaryRefreshAllSubjectsTest(unittest.TestCase):
     def test_bridge_save_keeps_all_subjects(self):
         import json
         import subprocess
-        source, tree = _load_source()
+        _, tree = _load_panel_source()
         preamble = ast.literal_eval(_module_assign(tree, "_DIARY_BRIDGE_PREAMBLE").value)
         code = preamble + """
 import tempfile
@@ -285,7 +306,7 @@ print(json.dumps({'cache': json.loads(config.CACHE_FILE.read_text(encoding='utf-
         self.assertEqual(sum(1 for s in cache["subjects"] if s["marks"]), 1)
 
     def test_auto_refresh_is_session_gated(self):
-        source, tree = _load_source()
+        source, tree = _load_panel_source()
         cls = _find_class(tree, "DiaryGradesPanel")
         body = "".join(source.splitlines(keepends=True)[cls.lineno - 1:cls.end_lineno])
         for marker in ("_maybe_auto_refresh", "auto_refresh_min", "session_exists",
@@ -302,7 +323,7 @@ class DiaryPendingSubjectsTest(unittest.TestCase):
     """Пустые предметы не должны молча исчезать и превращать таблицу в «одну оценку»."""
 
     def test_import_bridge_keeps_empty_subjects(self):
-        source, tree = _load_source()
+        _, tree = _load_panel_source()
         node = _module_assign(tree, "_DIARY_IMPORT_CODE")
         self.assertIsNotNone(node)
         code = ast.literal_eval(node.value)
@@ -312,7 +333,7 @@ class DiaryPendingSubjectsTest(unittest.TestCase):
                 self.assertIn(marker, code)
 
     def test_panel_marks_empty_rows(self):
-        source, tree = _load_source()
+        source, tree = _load_panel_source()
         cls = _find_class(tree, "DiaryGradesPanel")
         self.assertIsNotNone(cls)
         body = "".join(source.splitlines(keepends=True)[cls.lineno - 1:cls.end_lineno])
@@ -367,7 +388,7 @@ class DiaryProfileSubjectsTest(unittest.TestCase):
         self.assertEqual(cache["source"], "live")
 
     def test_gap_detection_ignores_known_empty(self):
-        source, tree = _load_source()
+        source, tree = _load_panel_source()
         cls = _find_class(tree, "DiaryGradesPanel")
         body = "".join(source.splitlines(keepends=True)[cls.lineno - 1:cls.end_lineno])
         for marker in ("SUBJECTS_FILE", "known_empty", "нет оценок в периоде"):
